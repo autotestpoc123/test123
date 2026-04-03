@@ -1,39 +1,34 @@
 ```mermaid
 flowchart TD
-    A[Start] --> B[dateParametersProvided = ParameterSetName == DateRange]
-    B --> C{Resolve analysis summary path}
-    C -->|AnalysisSummaryPath provided| C1[resolutionMode = AnalysisSummaryPath]
-    C -->|else if RunId provided| C2[resolutionMode = RunId]
-    C -->|else if dateParametersProvided| C3[resolutionMode = DateRangeAutoDiscovery]
-    C -->|else| C4[Try LatestRunPointer then AutoDiscovery]
+    A[Start] --> B[Invoke-AuditLog.ps1]
+    B --> C[Load config by -ConfigPath or env vars]
+    C --> D[Import wecom_analysis_comm.psm1]
+    D --> E[Validate dates and runtime settings]
+    E --> F[Filter tasks by Enabled, RunMode, IncludeBU]
+    F --> G{Any task to run?}
+    G -- No --> H[Write run-summary json/txt and latest-run pointer]
+    G -- Yes --> I[Loop tasks]
 
-    C1 --> D[resolvedAnalysisSummaryPath]
-    C2 --> D
-    C3 --> D
-    C4 --> D
+    I --> J[Resolve input file path by template tokens]
+    J --> K[Backup input file]
+    K --> L{Task type}
+    L -- mail --> M[Run wecom_mail_analysis.ps1]
+    L -- device --> N[Run Setup_DeviceAnalysis_Env.ps1 -> wecom_devicelog_analysis.ps1]
+    M --> O[Collect task result: completed/failed/skipped]
+    N --> O
+    O --> P{More tasks?}
+    P -- Yes --> I
+    P -- No --> Q[Write run-summary json/txt and latest-run pointer]
 
-    D --> E{resolvedAnalysisSummaryPath exists?}
-    E -->|Yes| F[Load analysisSummary and taskSummaries]
-    E -->|No| G[Create standalone validation run folder]
-    F --> H[Compute dynamicSummaryTaskNames]
-    G --> H
-
-    H --> I[relatedRuns = Get-RelatedAnalysisRuns by startDate/endDate]
-    I --> J{dynamicSummaryTaskNames count gt 0 and relatedRuns count gt 0}
-    J -->|Yes| K[mergedSummaryData = Get-MergedTaskSummaries]
-    J -->|No| L[mergedSummaryData = taskSummaries + empty TaskSources]
-
-    K --> M[usedRunIds = unique RunId from mergedSummaryData.TaskSources]
-    L --> M
-    M --> N[selectedRunId from analysisSummary RunId or run folder name]
-
-    N --> O{usedRunIds count gt 1}
-    O -->|Yes| P[validationMode = aggregated]
-    O -->|No| Q{usedRunIds count eq 1 and selectedRunId exists and first usedRunId differs}
-    Q -->|Yes| P
-    Q -->|No| R[validationMode = single-run]
-
-    P --> S[Write summary and validation artifacts]
-    R --> S
+    Q --> R[Optional: Invoke-AuditValidate.ps1]
+    R --> S[Resolve analysis summary source: path/runId/date/pointer]
+    S --> T[Load summary and related runs]
+    T --> U[Merge task summaries when needed]
+    U --> V[Build expected backup file list]
+    V --> W[Test backup folder content]
+    W --> X[Write validation json/txt/summary]
+    X --> Y{Pass?}
+    Y -- Yes --> Z[Exit 0]
+    Y -- No --> Z1[Warn or throw by FailOnDifference/Config]
 
 ```
