@@ -19,3 +19,33 @@
             }
         }
     }
+
+
+function Export-AnalysisReport {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LogFilePath
+    )
+
+    if ($TaskOutputDirectory) {
+        if (-not (Test-Path -LiteralPath $TaskOutputDirectory -PathType Container)) {
+            New-Item -Path $TaskOutputDirectory -ItemType Directory -Force | Out-Null
+        }
+
+        $reportFolder = Join-Path $TaskOutputDirectory 'AnalysisReport'
+        if (-not (Test-Path -LiteralPath $reportFolder -PathType Container)) {
+            New-Item -Path $reportFolder -ItemType Directory -Force | Out-Null
+        }
+        return $reportFolder
+    }
+
+    if ($SummaryOutputPath) {
+        $taskFolder = Split-Path -Parent $SummaryOutputPath
+        if ($taskFolder -and (Test-Path -LiteralPath $taskFolder -PathType Container)) {
+            $reportFolder = Join-Path $taskFolder 'AnalysisReport'
+            if (-not (Test-Path -LiteralPath $reportFolder -PathType Container)) {
+                New-Item -Path $reportFolder -ItemType Directory -Force | Out-Null
+            }
+            return $reportFolder
+        }
+    }
