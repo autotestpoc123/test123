@@ -49,3 +49,36 @@ function Export-AnalysisReport {
             return $reportFolder
         }
     }
+
+
+    # Generate Export Folder
+function Export-AnalysisReport {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LogFilePath,
+        [string]$SubFolder = "analyzed"
+    )
+
+    if ($TaskOutputDirectory) {
+        if (-not (Test-Path $TaskOutputDirectory)) {
+            New-Item -Path $TaskOutputDirectory -ItemType Directory -Force | Out-Null
+        }
+        return $TaskOutputDirectory
+    }
+
+    $datedFolder = $null
+    $timestamp = $null
+    try {
+        $timestamp = Get-Date -Format "yyyy_MM_dd"
+        $parentFolder = Split-Path $LogFilePath -Parent
+        $targetFolder = Join-Path $parentFolder $SubFolder
+        $datedFolder = Join-Path $targetFolder $timestamp
+        if (-not (Test-Path $datedFolder)) {
+            New-Item -Path $datedFolder -ItemType Directory -Force | Out-Null
+        }
+        return $datedFolder
+    }
+    catch {
+        Write-Error "Failed to create destination folder: $_"
+    }
+}
