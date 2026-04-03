@@ -1,630 +1,301 @@
-[CmdletBinding()]
 param(
+    [Parameter(Mandatory = $true)]
+    [string]$deviceLogFilePath,
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^\d{8}$')]
     [string]$startDate,
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^\d{8}$')]
     [string]$endDate,
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('MSMS', 'MSBIC')]
+    [string]$BU,
     [ValidateSet('PROD', 'QA')]
-    [string]$env = 'QA',
-    [string]$ConfigPath,
-    [ValidateSet('all', 'mail', 'device')]
-    [string]$RunMode = 'all',
-    [string[]]$IncludeBU,
-    [string]$OutputRoot,
-    [string]$PythonScriptPath,
-    [ValidateSet('FailFast', 'ContinueOnError')]
-    [string]$ExecutionMode
+    [string]$env = 'PROD',
+    [switch]$DeleteInputAfterAnalysis,
+    [string]$SummaryOutputPath,
+    [string]$TaskOutputDirectory
 )
 
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
+$parentFolderPath = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$importModulePath = Join-Path $parentFolderPath "wecom_analysis_comm.psm1"
 
-$scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-$modulePath = Join-Path $scriptRoot 'wecom_analysis_comm.psm1'
-$mailScriptPath = Join-Path $scriptRoot 'wecom_mail_analysis.ps1'
-$deviceBootstrapScriptPath = Join-Path $scriptRoot 'Setup_DeviceAnalysis_Env.ps1'
-$pythonConverterScriptPath = if ($PythonScriptPath) { $PythonScriptPath } else { Join-Path $scriptRoot 'convertxlsx.py' }
-$supportedDeviceBUs = @('MSMS', 'MSBIC')
-
-if (-not $ConfigPath) {
-    if ($env:WECOM_AUDIT_CONFIG_PATH) {
-        $ConfigPath = $env:WECOM_AUDIT_CONFIG_PATH
-    }
-    else {
-        $ConfigPath = Join-Path $scriptRoot 'analysis_task.config.psd1'
-    }
+if (-not (Test-Path $importModulePath)) {
+    throw "Module load path not found, please double check!"
 }
 
-if (-not $ConfigPath) {
-    throw "No config file could be resolved. Provide -ConfigPath or set WECOM_AUDIT_CONFIG_PATH."
-}
+Import-Module $importModulePath
 
-if (-not (Test-Path $ConfigPath -PathType Leaf)) {
-    throw "Config file not found: $ConfigPath"
-}
-if (-not (Test-Path $modulePath -PathType Leaf)) {
-    throw "Required module not found: $modulePath"
-}
-if (-not (Test-Path $mailScriptPath -PathType Leaf)) {
-    throw "Mail analysis script not found: $mailScriptPath"
-}
-if (-not (Test-Path $deviceBootstrapScriptPath -PathType Leaf)) {
-    throw "Device analysis bootstrap script not found: $deviceBootstrapScriptPath"
-}
-if (-not (Test-Path $pythonConverterScriptPath -PathType Leaf)) {
-    throw "Python converter script not found: $pythonConverterScriptPath"
-}
-
-Import-Module $modulePath -Force
-
-$null = Convert-ExactDate $startDate
-$null = Convert-ExactDate $endDate
-
-$config = Import-PowerShellDataFile -Path $ConfigPath
-if (-not $config.Tasks -or $config.Tasks.Count -eq 0) {
-    throw "No tasks were found in config: $ConfigPath"
-}
-
-$effectiveExecutionMode = if ($ExecutionMode) { $ExecutionMode } elseif ($config.ExecutionMode) { [string]$config.ExecutionMode } else { 'FailFast' }
-if ($effectiveExecutionMode -notin @('FailFast', 'ContinueOnError')) {
-    throw "Unsupported ExecutionMode '$effectiveExecutionMode'."
-}
-
-$resolvedOutputRoot = if ($OutputRoot) {
-    $OutputRoot
-}
-else {
-    Split-Path $ConfigPath -Parent
-}
-
-if (-not (Test-Path $resolvedOutputRoot)) {
-    New-Item -Path $resolvedOutputRoot -ItemType Directory -Force | Out-Null
-}
-
-$runsRoot = Join-Path $resolvedOutputRoot 'runs'
-New-Item -Path $runsRoot -ItemType Directory -Force | Out-Null
-$runId = Get-Date -Format 'yyyyMMdd_HHmmss'
-$runFolder = Join-Path $runsRoot $runId
-$tasksRoot = Join-Path $runFolder 'tasks'
-$backupFolder = Join-Path $resolvedOutputRoot $endDate
-New-Item -Path $runFolder -ItemType Directory -Force | Out-Null
-New-Item -Path $tasksRoot -ItemType Directory -Force | Out-Null
-New-Item -Path $backupFolder -ItemType Directory -Force | Out-Null
-
-$logFilePath = Join-Path $runFolder 'workflow.log'
-$runSummaryPath = Join-Path $runFolder 'run-summary.json'
-$runSummaryTextPath = Join-Path $runFolder 'run-summary.txt'
-$latestRunPointerPath = Join-Path $runsRoot 'latest-run.json'
-$normalizedIncludeBU = @()
-if ($IncludeBU) {
-    $normalizedIncludeBU = @(
-        $IncludeBU |
-            Where-Object { $_ } |
-            ForEach-Object { $_.Trim().ToUpperInvariant() } |
-            Where-Object { $_ }
-    )
-}
-
-$backupIndex = @{}
-$dateTokens = New-DateTokenMap -StartDate $startDate -EndDate $endDate
-$configuredInputRoot = if ($env:WECOM_AUDIT_INPUT_ROOT) {
-    [string]$env:WECOM_AUDIT_INPUT_ROOT
-}
-elseif ($config.ContainsKey('InputRoot') -and $config.InputRoot) {
-    [string]$config.InputRoot
-}
-else {
-    'C:\addin_deploy_cert'
-}
-$dateTokens.InputRoot = $configuredInputRoot
-
-<#
-.SYNOPSIS
-English code-review note for function 'Get-TaskTypeSelected'.
-.DESCRIPTION
-Retrieves computed or existing values required by the audit pipeline.
-#>
-function Get-TaskTypeSelected {
+# Generate Export Folder
+function Export-AnalysisReport {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$TaskType,
-        [Parameter(Mandatory = $true)]
-        [string]$SelectedMode
+        [string]$LogFilePath,
+        [string]$SubFolder = "analyzed"
     )
 
-    switch ($SelectedMode) {
-        'all' { return $true }
-        'mail' { return $TaskType -eq 'mail' }
-        'device' { return $TaskType -eq 'device' }
-        default { return $false }
-    }
-}
-
-<#
-.SYNOPSIS
-English code-review note for function 'New-TaskResult'.
-.DESCRIPTION
-Creates a new object or structure used by subsequent processing steps.
-#>
-function New-TaskResult {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Name,
-        [Parameter(Mandatory = $true)]
-        [string]$Type,
-        [string]$BU,
-        [Parameter(Mandatory = $true)]
-        [string]$Status,
-        [string]$InputFilePath,
-        [string]$TaskFolder = $null,
-        [string]$TaskLogPath = $null,
-        [string]$ReportPath = $null,
-        [string]$SummaryPath = $null,
-        [string]$Message
-    )
-
-    return [PSCustomObject]@{
-        Name          = $Name
-        Type          = $Type
-        BU            = $BU
-        Status        = $Status
-        InputFilePath = $InputFilePath
-        TaskFolder    = $TaskFolder
-        TaskLogPath   = $TaskLogPath
-        ReportPath    = $ReportPath
-        SummaryPath   = $SummaryPath
-        Message       = $Message
-    }
-}
-
-<#
-.SYNOPSIS
-English code-review note for function 'Get-SafeTaskToken'.
-.DESCRIPTION
-Retrieves computed or existing values required by the audit pipeline.
-#>
-function Get-SafeTaskToken {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Text
-    )
-
-    return (($Text -replace '[^a-zA-Z0-9_-]', '_').Trim('_'))
-}
-
-<#
-.SYNOPSIS
-English code-review note for function 'Resolve-TaskInputPath'.
-.DESCRIPTION
-Resolves runtime values from configuration, tokens, and current execution context.
-#>
-function Resolve-TaskInputPath {
-    param(
-        [Parameter(Mandatory = $true)]
-        [hashtable]$Task,
-        [Parameter(Mandatory = $true)]
-        [hashtable]$Tokens
-    )
-
-    if ($Task.ContainsKey('InputPath') -and $Task.InputPath) {
-        return Resolve-TemplateText -Template ([string]$Task.InputPath) -Tokens $Tokens
-    }
-
-    if (-not $Task.ContainsKey('InputDirectory') -or -not $Task.InputDirectory) {
-        throw "Task '$($Task.Name)' must define InputPath or InputDirectory."
-    }
-    if (-not $Task.ContainsKey('FileNamePattern') -or -not $Task.FileNamePattern) {
-        throw "Task '$($Task.Name)' must define FileNamePattern when InputDirectory is used."
-    }
-
-    $inputDirectory = Resolve-TemplateText -Template ([string]$Task.InputDirectory) -Tokens $Tokens
-    $fileNamePattern = Resolve-TemplateText -Template ([string]$Task.FileNamePattern) -Tokens $Tokens
-
-    if (-not (Test-Path $inputDirectory -PathType Container)) {
-        throw "Task '$($Task.Name)' input directory not found: $inputDirectory"
-    }
-
-    $matchedFiles = @(
-        Get-ChildItem -LiteralPath $inputDirectory -File |
-            Where-Object { $_.Name -like $fileNamePattern }
-    )
-
-    if ($matchedFiles.Count -eq 0) {
-        throw "Task '$($Task.Name)' did not match any file in '$inputDirectory' with pattern '$fileNamePattern'."
-    }
-    if ($matchedFiles.Count -gt 1) {
-        $matchedNames = $matchedFiles | Select-Object -ExpandProperty Name
-        throw "Task '$($Task.Name)' matched multiple files for pattern '$fileNamePattern': $($matchedNames -join ', ')"
-    }
-
-    return $matchedFiles[0].FullName
-}
-
-<#
-.SYNOPSIS
-English code-review note for function 'Backup-InputFile'.
-.DESCRIPTION
-Provides a reusable workflow helper for audit processing.
-#>
-function Backup-InputFile {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$SourcePath,
-        [Parameter(Mandatory = $true)]
-        [string]$BackupFolder,
-        [Parameter(Mandatory = $true)]
-        [hashtable]$BackupIndex
-    )
-
-    $resolvedSourcePath = (Resolve-Path -LiteralPath $SourcePath).Path
-    if ($BackupIndex.ContainsKey($resolvedSourcePath)) {
-        return $BackupIndex[$resolvedSourcePath]
-    }
-
-    $leafName = Split-Path $resolvedSourcePath -Leaf
-    $sourceHash = (Get-FileHash -LiteralPath $resolvedSourcePath -Algorithm SHA256).Hash
-    $primaryCandidatePath = Join-Path $BackupFolder $leafName
-    if (Test-Path $primaryCandidatePath -PathType Leaf) {
-        $candidateHash = (Get-FileHash -LiteralPath $primaryCandidatePath -Algorithm SHA256).Hash
-        if ($candidateHash -eq $sourceHash) {
-            $BackupIndex[$resolvedSourcePath] = $primaryCandidatePath
-            return $primaryCandidatePath
+    if ($TaskOutputDirectory) {
+        if (-not (Test-Path $TaskOutputDirectory)) {
+            New-Item -Path $TaskOutputDirectory -ItemType Directory -Force | Out-Null
         }
+        return $TaskOutputDirectory
     }
 
-    Copy-Item -LiteralPath $resolvedSourcePath -Destination $primaryCandidatePath -Force
-    $BackupIndex[$resolvedSourcePath] = $primaryCandidatePath
-    return $primaryCandidatePath
+    $datedFolder = $null
+    $timestamp = $null
+    try {
+        $timestamp = Get-Date -Format "yyyy_MM_dd"
+        $parentFolder = Split-Path $LogFilePath -Parent
+        $targetFolder = Join-Path $parentFolder $SubFolder
+        $datedFolder = Join-Path $targetFolder $timestamp
+        if (-not (Test-Path $datedFolder)) {
+            New-Item -Path $datedFolder -ItemType Directory -Force | Out-Null
+        }
+        return $datedFolder
+    }
+    catch {
+        Write-Error "Failed to create destination folder: $_"
+    }
 }
-<#
-.SYNOPSIS
-English code-review note for function 'Get-OptionalObjectPropertyValue'.
-.DESCRIPTION
-Retrieves computed or existing values required by the audit pipeline.
-#>
-function Get-OptionalObjectPropertyValue {
+
+function Save-AnalysisSummary {
     param(
-        [Parameter(Mandatory = $true)]
-        [object]$InputObject,
-        [Parameter(Mandatory = $true)]
-        [string]$PropertyName
+        [bool]$HasViolation,
+        [int]$ViolationDivisionCount,
+        [int]$ViolationRecordCount
     )
 
-    if ($null -eq $InputObject) {
-        return $null
+    if (-not $SummaryOutputPath) {
+        return
     }
 
-    if ($InputObject -is [System.Collections.IDictionary]) {
-        if ($InputObject.Contains($PropertyName)) {
-            return $InputObject[$PropertyName]
-        }
-
-        # Case-insensitive lookup for hashtable-like inputs.
-        foreach ($key in $InputObject.Keys) {
-            if ([string]$key -ieq $PropertyName) {
-                return $InputObject[$key]
-            }
-        }
-    }
-
-    $property = $InputObject.PSObject.Properties[$PropertyName]
-    if ($null -eq $property) {
-        return $null
-    }
-
-    return $property.Value
-}
-
-<#
-.SYNOPSIS
-English code-review note for function 'Get-ExistingArtifactPath'.
-.DESCRIPTION
-Retrieves computed or existing values required by the audit pipeline.
-#>
-function Get-ExistingArtifactPath {
-    param(
-        [string]$Path
-    )
-
-    if (-not $Path) {
-        return $null
-    }
-
-    if (Test-Path -LiteralPath $Path -PathType Leaf) {
-        return $Path
-    }
-
-    return $null
-}
-
-<#
-.SYNOPSIS
-English code-review note for function 'Write-LatestRunPointer'.
-.DESCRIPTION
-Writes workflow artifacts to disk for traceability and downstream consumption.
-#>
-function Write-LatestRunPointer {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$PointerPath,
-        [Parameter(Mandatory = $true)]
-        [string]$RunId,
-        [Parameter(Mandatory = $true)]
-        [string]$RunFolder,
-        [Parameter(Mandatory = $true)]
-        [string]$RunSummaryPath,
-        [Parameter(Mandatory = $true)]
-        [string]$RunSummaryTextPath,
-        [Parameter(Mandatory = $true)]
-        [string]$StartDate,
-        [Parameter(Mandatory = $true)]
-        [string]$EndDate,
-        [Parameter(Mandatory = $true)]
-        [string]$BackupFolder
-    )
-
-    $pointer = [PSCustomObject]@{
-        RunId              = $RunId
-        RunFolder          = $RunFolder
-        RunSummaryPath     = $RunSummaryPath
-        RunSummaryTextPath = $RunSummaryTextPath
-        StartDate          = $StartDate
-        EndDate            = $EndDate
-        BackupFolder       = $BackupFolder
-        UpdatedAt          = (Get-Date).ToString('o')
-    }
-
-    $pointer | ConvertTo-Json -Depth 5 | Set-Content -Path $PointerPath -Encoding UTF8
-}
-
-<#
-.SYNOPSIS
-English code-review note for function 'Format-RunSummaryText'.
-.DESCRIPTION
-Formats data into a human-readable representation for review output.
-#>
-function Format-RunSummaryText {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RunId,
-        [Parameter(Mandatory = $true)]
-        [string]$RunFolder,
-        [Parameter(Mandatory = $true)]
-        [string]$WorkflowLogPath,
-        [Parameter(Mandatory = $true)]
-        [string]$StartDate,
-        [Parameter(Mandatory = $true)]
-        [string]$EndDate,
-        [Parameter(Mandatory = $true)]
-        [object[]]$Tasks,
-        [string]$ErrorMessage
-    )
-
-    $lines = New-Object 'System.Collections.Generic.List[string]'
-    $lines.Add('WeCom Audit Run Summary')
-    $lines.Add("RunId: $RunId")
-    $lines.Add("Date Range: $StartDate - $EndDate")
-    $lines.Add("Run Folder: $RunFolder")
-    $lines.Add("Workflow Log: $WorkflowLogPath")
-    if ($ErrorMessage) {
-        $lines.Add("Error: $ErrorMessage")
-    }
-    $lines.Add('')
-    $lines.Add('Tasks:')
-    foreach ($task in $Tasks) {
-        $taskName = Get-OptionalObjectPropertyValue -InputObject $task -PropertyName 'Name'
-        $taskStatus = Get-OptionalObjectPropertyValue -InputObject $task -PropertyName 'Status'
-        $reportPath = Get-OptionalObjectPropertyValue -InputObject $task -PropertyName 'ReportPath'
-        $summaryPath = Get-OptionalObjectPropertyValue -InputObject $task -PropertyName 'SummaryPath'
-        $taskLogPath = Get-OptionalObjectPropertyValue -InputObject $task -PropertyName 'TaskLogPath'
-        $taskMessage = Get-OptionalObjectPropertyValue -InputObject $task -PropertyName 'Message'
-
-        $lines.Add(("- {0}: {1}" -f $taskName, $taskStatus))
-        if ($reportPath) {
-            $lines.Add("  Report: $reportPath")
-        }
-        if ($summaryPath) {
-            $lines.Add("  Summary: $summaryPath")
-        }
-        if ($taskLogPath) {
-            $lines.Add("  Task Log: $taskLogPath")
-        }
-        if ($taskMessage) {
-            $lines.Add("  Message: $taskMessage")
-        }
-    }
-
-    return ($lines -join [Environment]::NewLine)
-}
-
-Assert-ConfigInputDirectories -Config $config -Tokens $dateTokens -ConfigPath $ConfigPath
-
-$taskResults = New-Object 'System.Collections.Generic.List[object]'
-$tasksToRun = @()
-
-foreach ($task in $config.Tasks) {
-    $taskName = [string]$task.Name
-    $taskType = ([string]$task.Type).ToLowerInvariant()
-    $taskBU = if ($task.ContainsKey('BU') -and $task.BU) { ([string]$task.BU).ToUpperInvariant() } else { $null }
-    $taskEnabled = [bool]$task.Enabled
-    $taskInputPath = if ($task.ContainsKey('InputPath')) { [string]$task.InputPath } else { $null }
-
-    if (-not $taskName) {
-        throw 'Every configured task must have a Name.'
-    }
-    if ($taskType -notin @('mail', 'device')) {
-        throw "Task '$taskName' has unsupported Type '$taskType'."
-    }
-
-    if (-not $taskEnabled) {
-        $taskResults.Add((New-TaskResult -Name $taskName -Type $taskType -BU $taskBU -Status 'skipped' -InputFilePath $taskInputPath -TaskFolder $null -TaskLogPath $null -ReportPath $null -SummaryPath $null -Message 'Skipped because Enabled is false.'))
-        continue
-    }
-
-    if (-not (Get-TaskTypeSelected -TaskType $taskType -SelectedMode $RunMode)) {
-        $taskResults.Add((New-TaskResult -Name $taskName -Type $taskType -BU $taskBU -Status 'skipped' -InputFilePath $taskInputPath -TaskFolder $null -TaskLogPath $null -ReportPath $null -SummaryPath $null -Message "Skipped because RunMode '$RunMode' excludes this task type."))
-        continue
-    }
-
-    if ($normalizedIncludeBU.Count -gt 0) {
-        if (-not $taskBU -or $normalizedIncludeBU -notcontains $taskBU) {
-            $taskResults.Add((New-TaskResult -Name $taskName -Type $taskType -BU $taskBU -Status 'skipped' -InputFilePath $taskInputPath -TaskFolder $null -TaskLogPath $null -ReportPath $null -SummaryPath $null -Message 'Skipped because BU filter does not include this task.'))
-            continue
-        }
-    }
-
-    $tasksToRun += $task
-}
-
-if ($tasksToRun.Count -eq 0) {
     $summary = [PSCustomObject]@{
-        StartDate     = $startDate
-        EndDate       = $endDate
-        Environment   = $env
-        RunMode       = $RunMode
-        IncludeBU     = $normalizedIncludeBU
-        ExecutionMode = $effectiveExecutionMode
-        RunId         = $runId
-        ConfigPath    = $ConfigPath
-        BackupFolder  = $backupFolder
-        OutputFolder  = $runFolder
-        LogFilePath   = $logFilePath
-        Tasks         = [object[]]$taskResults
+        AnalysisType           = 'Device'
+        BusinessUnit           = $BU
+        StartDate              = $startDate
+        EndDate                = $endDate
+        HasViolation           = $HasViolation
+        ViolationDivisionCount = $ViolationDivisionCount
+        ViolationRecordCount   = $ViolationRecordCount
     }
-    $summary | ConvertTo-Json -Depth 8 | Set-Content -Path $runSummaryPath -Encoding UTF8
-    (Format-RunSummaryText -RunId $runId -RunFolder $runFolder -WorkflowLogPath $logFilePath -StartDate $startDate -EndDate $endDate -Tasks ([object[]]$taskResults)) | Set-Content -Path $runSummaryTextPath -Encoding UTF8
-    Write-LatestRunPointer -PointerPath $latestRunPointerPath -RunId $runId -RunFolder $runFolder -RunSummaryPath $runSummaryPath -RunSummaryTextPath $runSummaryTextPath -StartDate $startDate -EndDate $endDate -BackupFolder $backupFolder
-    Write-Host "No enabled tasks matched the current filters. Summary path: $runSummaryPath" -ForegroundColor Yellow
-    exit 0
+
+    $summary | ConvertTo-Json -Depth 4 | Set-Content -Path $SummaryOutputPath -Encoding UTF8
 }
+
+# main procedure
+$msmsDivisionScope = @("Private Credit & Equity", "Real Assets", "Global Sales and Marketing")
+$msbicDivision = "Fixed Income Division"
+# $msbicContacts = "css-wecom@abc.com"
+$msViolationCollection = @()
+$msbicViolationCollection = @()
+
+$destFoderPath = Export-AnalysisReport -LogFilePath $deviceLogFilePath
+$tempLogPath = $deviceLogFilePath
+$logFilePath = if ($TaskOutputDirectory) {
+    Join-Path $destFoderPath 'task.log'
+}
+else {
+    Get-LogFilePath -Directory $destFoderPath -BaseName "AnalysisLog"
+}
+$destFilePath = Join-Path $destFoderPath "report.csv"
+$Subject = ""
+
+# --set value according to Env
+$vaultEnv = 'prod'
+$prodid = "cod_wecom_ntfy_prod@abc.com.cn"
+$idName = "cod_wecom_ntfy_prod"
+$vault_server = "https://vault.srv.ms.com.cn"
+$ldapServer = 'cod.ms.com.cn'
+$smtp_server = "mta-hub.cod.ms.com.cn"
+$domain = 'COD'
+$BuContacter = $null
+
+$MsNoviolationRecipients = @("Cynthia.Xu@abc.com.cn", "Jun.Xu@abc.com", "susan.sun@abc.com")
+$MsbicBuContacter = "css-wecom@abc.com"
+$CcContacter = "cod-wecom-admin@abc.com.cn"
+
+$MSBURecipients = @{
+    "Private Credit & Equity"   = @("Cynthia.Xu@abc.com.cn", "Jun.Xu@abc.com", "msim_wecom_weekly_contactstatusreport")
+    "Real Assets"               = @("Susan.Sun@abc.com", "ivy.zhou@abc.com.cn", "msim_wecom_weekly_contactstatusreport")
+    "Global Sales and Marketing" = @("Matthew.Zhu@abc.com.cn", "msim_wecom_weekly_contactstatusreport")
+}
+
+if ($env.ToLower() -eq 'qa') {
+    $vaultEnv = "qa"
+    $prodid = "wecom_deploy_qa@infradev.abc.com.cn"
+    $idName = "wecom_deploy_qa"
+    $vault_server = "https://vault.srv.lab.ms.com.cn"
+    $ldapServer = 'codqa.lab.ms.com.cn'
+    $domain = 'CODQA'
+    $smtp_server = "mta-hub.mail.lab.ms.com.cn"
+    # Todo need update according to alignment with BUs
+    $MsNoviolationRecipients = @("ling.gu@infradev.abc.com.cn", "yimin.lu06@infradev.abc.com.cn")
+    $MSBURecipients = @{
+        "Private Credit & Equity"   = @("ling.gu@infradev.abc.com.cn", "Siyi.Huang@infradev.abc.com.cn")
+        "Real Assets"               = @("ling.gu@infradev.abc.com.cn", "yimin.lu06@infradev.abc.com.cn")
+        "Global Sales and Marketing" = @("ling.gu@infradev.abc.com.cn")
+    }
+    $CcContacter = "ling.gu@infradev.abc.com.cn"
+    $MsbicBuContacter = "yinmin.lu06@infradev.abc.com.cn"
+}
+
+$noViolationContent = "The purpose of this email is to provide information on users in your business unit( BU ) who used unapproved WeCom device(s) for the reporting period listed in the subject line.<br><br/>There were <b>no violations</b> to report this reporting period for your BU.<br><br/>We are only able to distinguish if a user is using WeCom via iPad/ windows/ mac/ and cannot determine if user uses their own iOS mobile to login. This is currently a known limitation for the logs we retrieve."
+$DeviceViolationContent = "The purpose of this email is to provide information on users in your business unit( BU ) who used unapproved WeCom device(s) for the reporting period listed in the subject line.<br><br/>We are only able to distinguish if a user is using WeCom via iPad/ windows/ mac/ and cannot determine if user uses their own iOS mobile to login. This is currently a known limitation for the logs we retrieve.<br/>The violation record(s) of this reporting period for your BU as below:<br/>"
+
+if ($BU.ToLower() -eq 'msms') {
+    $Subject = "COD WeCom Login to Non-Approved Devices IM BU - Report($startDate - $endDate)"
+}
+else {
+    $Subject = "COD WeCom Login to Non-Approved Devices FID BU - Report($startDate - $endDate)"
+}
+
+$violationcounter = 0
 
 try {
-    Write-Log -LogString "Configured analysis started. Config path: $ConfigPath" -LogFilePath $logFilePath
-    Write-Log -LogString "Run mode: $RunMode; ExecutionMode: $effectiveExecutionMode" -LogFilePath $logFilePath
+    $null = Convert-ExactDate $startDate
+    $null = Convert-ExactDate $endDate
 
-    foreach ($task in $tasksToRun) {
-        $taskName = [string]$task.Name
-        $taskType = ([string]$task.Type).ToLowerInvariant()
-        $taskBU = if ($task.ContainsKey('BU') -and $task.BU) { ([string]$task.BU).ToUpperInvariant() } else { $null }
-        $taskInputPath = if ($task.ContainsKey('InputPath')) { [string]$task.InputPath } else { $null }
-        $taskToken = Get-SafeTaskToken -Text $taskName
-        $taskFolder = Join-Path $tasksRoot $taskToken
-        New-Item -Path $taskFolder -ItemType Directory -Force | Out-Null
-        $summaryPath = Join-Path $taskFolder 'summary.json'
-        $taskLogPath = Join-Path $taskFolder 'task.log'
-        $reportPath = Join-Path $taskFolder 'report.csv'
-        $resolvedTaskInputPath = $null
-        $backupTaskInputPath = $null
-
-        try {
-            $resolvedTaskInputPath = Resolve-TaskInputPath -Task $task -Tokens $dateTokens
-            if (-not (Test-Path $resolvedTaskInputPath -PathType Leaf)) {
-                throw "Task '$taskName' input file not found: $resolvedTaskInputPath"
-            }
-
-            $backupTaskInputPath = Backup-InputFile -SourcePath $resolvedTaskInputPath -BackupFolder $backupFolder -BackupIndex $backupIndex
-            Write-Log -LogString "Task '$taskName' source file backed up to '$backupTaskInputPath'." -LogFilePath $logFilePath
-
-            switch ($taskType) {
-                'mail' {
-                    Write-Log -LogString "Starting mail task '$taskName' with BU '$taskBU' and source file '$resolvedTaskInputPath'." -LogFilePath $logFilePath
-                    & $mailScriptPath `
-                        -mailLogFilePath $resolvedTaskInputPath `
-                        -startDate $startDate `
-                        -endDate $endDate `
-                        -env $env `
-                        -SummaryOutputPath $summaryPath `
-                        -TaskOutputDirectory $taskFolder
-                }
-                'device' {
-                    if (-not $taskBU) {
-                        throw "Device task '$taskName' must define BU."
-                    }
-                    if ($supportedDeviceBUs -notcontains $taskBU) {
-                        throw "Device task '$taskName' uses unsupported BU '$taskBU'. Current project supports: $($supportedDeviceBUs -join ', ')."
-                    }
-
-                    Write-Log -LogString "Starting device task '$taskName' with BU '$taskBU' and source file '$resolvedTaskInputPath'." -LogFilePath $logFilePath
-                    & $deviceBootstrapScriptPath `
-                        -PythonScriptPath $pythonConverterScriptPath `
-                        -deviceLogFilePath $resolvedTaskInputPath `
-                        -startDate $startDate `
-                        -endDate $endDate `
-                        -BU $taskBU `
-                        -env $env `
-                        -SummaryOutputPath $summaryPath `
-                        -TaskOutputDirectory $taskFolder
-                }
-            }
-
-            if (-not $?) {
-                throw "Task '$taskName' did not complete successfully."
-            }
-
-            $taskResults.Add((New-TaskResult -Name $taskName -Type $taskType -BU $taskBU -Status 'completed' -InputFilePath $resolvedTaskInputPath -TaskFolder $taskFolder -TaskLogPath (Get-ExistingArtifactPath -Path $taskLogPath) -ReportPath (Get-ExistingArtifactPath -Path $reportPath) -SummaryPath (Get-ExistingArtifactPath -Path $summaryPath) -Message 'Completed successfully.'))
-        }
-        catch {
-            $errorMessage = $_.Exception.Message
-            Write-Log -LogString "Task '$taskName' failed: $errorMessage" -LogFilePath $logFilePath
-            $taskResults.Add((New-TaskResult -Name $taskName -Type $taskType -BU $taskBU -Status 'failed' -InputFilePath $resolvedTaskInputPath -TaskFolder $taskFolder -TaskLogPath (Get-ExistingArtifactPath -Path $taskLogPath) -ReportPath (Get-ExistingArtifactPath -Path $reportPath) -SummaryPath (Get-ExistingArtifactPath -Path $summaryPath) -Message $errorMessage))
-
-            if ($effectiveExecutionMode -eq 'FailFast') {
-                throw
-            }
-        }
-    }
-
-    $summary = [PSCustomObject]@{
-        StartDate     = $startDate
-        EndDate       = $endDate
-        Environment   = $env
-        RunMode       = $RunMode
-        IncludeBU     = $normalizedIncludeBU
-        ExecutionMode = $effectiveExecutionMode
-        RunId         = $runId
-        ConfigPath    = $ConfigPath
-        BackupFolder  = $backupFolder
-        OutputFolder  = $runFolder
-        LogFilePath   = $logFilePath
-        Tasks         = [object[]]$taskResults
-    }
-    $summary | ConvertTo-Json -Depth 8 | Set-Content -Path $runSummaryPath -Encoding UTF8
-    (Format-RunSummaryText -RunId $runId -RunFolder $runFolder -WorkflowLogPath $logFilePath -StartDate $startDate -EndDate $endDate -Tasks ([object[]]$taskResults)) | Set-Content -Path $runSummaryTextPath -Encoding UTF8
-    Write-LatestRunPointer -PointerPath $latestRunPointerPath -RunId $runId -RunFolder $runFolder -RunSummaryPath $runSummaryPath -RunSummaryTextPath $runSummaryTextPath -StartDate $startDate -EndDate $endDate -BackupFolder $backupFolder
-
-    $failedTasks = @($taskResults | Where-Object { $_.Status -eq 'failed' })
-    if ($failedTasks.Count -gt 0) {
-        Write-Host "Configured analysis finished with failures. Summary path: $runSummaryPath" -ForegroundColor Yellow
-        exit 1
-    }
-
-    Write-Log -LogString "Configured analysis completed successfully. Summary path: $runSummaryPath" -LogFilePath $logFilePath
-    Write-Host "Backup folder: $backupFolder" -ForegroundColor Green
-    Write-Host "Configured analysis completed successfully. Output folder: $runFolder" -ForegroundColor Green
-    Write-Host "Run summary: $runSummaryPath" -ForegroundColor Green
-    Write-Host "Run summary text: $runSummaryTextPath" -ForegroundColor Green
+    Write-Log "Start to handle device log analysis!" -LogFilePath $logFilePath
+    # get system id cert from windows server
+    $sysid_cert = Get-Cert -KeyName $prodid
+    # get vault secret correctly
+    $vault_secret = Get-VaultSecret -VaultServer $vault_server -VaultEnv $vaultEnv -Eonid "309843" -KeyName $prodid -SysIdCert $sysid_cert
+    $idSecret = New-Object System.Net.NetworkCredential($idName, $vault_secret, $Domain)
+    # build up Ladp lazy connection
+    $lazyConn = New-LazyLdapConnection -Server $ldapServer -Port 363 -Credential $idSecret
+    # start to do export data
+    $deviceData = Import-Csv -Path $tempLogPath -Encoding UTF8
+    $filterIds = ($deviceData.Account.ToLower().Trim() | Sort-Object -Unique) -join ';'
+    $cNamelookup = Get-LdapUserById -LazyConnection $lazyConn -UserId $filterIds
 }
 catch {
-    $summary = [PSCustomObject]@{
-        StartDate     = $startDate
-        EndDate       = $endDate
-        Environment   = $env
-        RunMode       = $RunMode
-        IncludeBU     = $normalizedIncludeBU
-        ExecutionMode = $effectiveExecutionMode
-        RunId         = $runId
-        ConfigPath    = $ConfigPath
-        BackupFolder  = $backupFolder
-        OutputFolder  = $runFolder
-        LogFilePath   = $logFilePath
-        Tasks         = [object[]]$taskResults
-        Error         = $_.Exception.Message
+    Write-Log "Failed during LDAP connection or Export CSV data: $_" -LogFilePath $logFilePath
+    return
+}
+finally {
+    if ($lazyConn) {
+        Close-LazyLdapConnection -lazy $lazyConn
     }
-    $summary | ConvertTo-Json -Depth 8 | Set-Content -Path $runSummaryPath -Encoding UTF8
-    (Format-RunSummaryText -RunId $runId -RunFolder $runFolder -WorkflowLogPath $logFilePath -StartDate $startDate -EndDate $endDate -Tasks ([object[]]$taskResults) -ErrorMessage $_.Exception.Message) | Set-Content -Path $runSummaryTextPath -Encoding UTF8
-    Write-LatestRunPointer -PointerPath $latestRunPointerPath -RunId $runId -RunFolder $runFolder -RunSummaryPath $runSummaryPath -RunSummaryTextPath $runSummaryTextPath -StartDate $startDate -EndDate $endDate -BackupFolder $backupFolder
-    Write-Log -LogString "Configured analysis failed: $($_.Exception.Message)" -LogFilePath $logFilePath
-    throw
+}
+
+# process Device data log
+foreach ($record in $deviceData) {
+    $platform = $record.Platform.ToLower().Trim()
+    if ($platform -eq 'ios(iphone)') { continue }
+    $userId = $record.Account.ToLower().Trim()
+    if ($cNamelookup.Valid.ContainsKey($userId)) {
+        $division = $cNamelookup.Valid[$userId].Division
+        $department = $record.Department.split('/')[1]
+        # convert to englist if its mandarin
+        $status = if ($record.Status -eq '使用') { 'Used' } else { $record.Status }
+        if ($BU -eq 'MSMS' -and $msmsDivisionScope -contains $division) {
+            $msViolationCollection += [PSCustomObject]@{
+                Time         = $record.Time
+                Name         = $record.Name
+                Account      = $record.Account
+                Department   = $department
+                Status       = $status
+                'LastUsedOn' = $record.'Last Used on'
+                Platform     = $record.Platform
+                Division     = $division
+            }
+            $violationcounter += 1
+        }
+        elseif ($BU -eq 'MSBIC' -and $division -eq $msbicDivision) {
+            $msbicViolationCollection += [PSCustomObject]@{
+                Time         = $record.Time
+                Name         = $record.Name
+                Account      = $record.Account
+                Department   = $department
+                Status       = $status
+                'LastUsedOn' = $record.'Last Used on'
+                Platform     = $record.Platform
+                Division     = $msbicDivision
+            }
+            $violationcounter += 1
+        }
+        else {
+            Write-Log "No macthing divsion condition for UserId: ${userId} in Record item: ${record}" -LogFilePath $logFilePath
+        }
+    }
+    else {
+        Write-Log "Invalid UserId found: ${userId} in Record item: ${record}" -LogFilePath $logFilePath
+    }
+}
+
+if ($violationcounter -eq 0) {
+    Write-Host "No Violation Usages found" -ForegroundColor Green
+    Write-Log "No Violation Usages found" -LogFilePath $LogFilePath
+    $htmlBody = New-HtmlBody -TableHtml "" -ViolationContent "" -NoViolationContent $noViolationContent -HasViolation:$false
+    Save-AnalysisSummary -HasViolation $false -ViolationDivisionCount 0 -ViolationRecordCount 0
+
+    if ($BU -eq 'MSMS') {
+        # noviolation of MSMS
+        $BuContacter = $MsNoviolationRecipients
+    }
+    else {
+        # noviolation of MSBIC
+        $BuContacter = $MsbicBuContacter
+    }
+
+    Send-Mail -From $prodid -To $BuContacter -Cc $CcContacter -Subject $Subject `
+        -Body $htmlBody -SmtpServer $smtp_server -KeyName $prodid -Cert $sysid_cert -Port 2587 -LogFilePath $logFilePath
+
+    if ($DeleteInputAfterAnalysis) {
+        Remove-Item -Path $tempLogPath -Force
+    }
+    return
+}
+else {
+    # violation records in MSMS
+    if ($msViolationCollection.Count -gt 0) {
+        $msmsViolationsByBU = $msViolationCollection | Group-Object 'Division' -AsHashTable
+        Save-AnalysisSummary -HasViolation $true -ViolationDivisionCount $msmsViolationsByBU.Keys.Count -ViolationRecordCount $msViolationCollection.Count
+        Write-Verbose "MSMS Violation Founds"
+        $msViolationCollection | Export-Csv -Path $destFilePath -NoTypeInformation -Encoding UTF8 -Force
+        Write-Log "Violation Usage In MSMS found" -LogFilePath $logFilePath
+        foreach ($BuItem in $msmsViolationsByBU.Keys + ($MSBURecipients.Keys | Where-Object { $_ -notin $msmsViolationsByBU.Keys })) {
+            $BuContacter = $MSBURecipients[$BuItem]
+            $hasViolation = $msmsViolationsByBU.ContainsKey($BuItem)
+            if ($hasViolation) {
+                Write-Verbose $BuItem
+                $rowsHtml = $msmsViolationsByBU[$BuItem] | Select-Object @{ Name = 'DateTime(HKT)'; Expression = { "$($_.Time)" } }, Name, Account, Department, Status, LastUsedOn, Platform, Division | ConvertTo-Html -Fragment
+                $tableHtml = @"
+<table>
+    $rowsHtml
+</table>
+"@
+                $htmlBody = New-HtmlBody -TableHtml $tableHtml -ViolationContent $DeviceViolationContent -NoViolationContent "" -HasViolation:$true
+                Send-Mail -From $prodid -To $BuContacter -Cc $CcContacter -Subject $Subject `
+                    -Body $htmlBody -SmtpServer $smtp_server -KeyName $prodid -Cert $sysid_cert -Port 2587 -LogFilePath $logFilePath
+            }
+            else {
+                Write-Verbose $BuItem
+                Write-Verbose "this BU has no violations, send normal mail"
+                $htmlBody = New-HtmlBody -TableHtml "" -ViolationContent "" -NoViolationContent $NoViolationContent -HasViolation:$false
+                Send-Mail -From $prodid -To $BuContacter -Cc $CcContacter -Subject $Subject `
+                    -Body $htmlBody -SmtpServer $smtp_server -KeyName $prodid -Cert $sysid_cert -Port 2587 -LogFilePath $logFilePath
+            }
+        }
+    }
+
+    # violation records in MSBIC
+    if ($msbicViolationCollection.Count -gt 0) {
+        Save-AnalysisSummary -HasViolation $true -ViolationDivisionCount 1 -ViolationRecordCount $msbicViolationCollection.Count
+        $msbicViolationCollection | Export-Csv -Path $destFilePath -NoTypeInformation -Encoding UTF8 -Force
+        Write-Log "Violation Usage In MSBIC found" -LogFilePath $logFilePath
+        $rowsHtml = $msbicViolationCollection | Select-Object @{ Name = 'DateTime(HKT)'; Expression = { "$($_.Time)" } }, Name, Account, Department, Status, LastUsedOn, Platform, Division | ConvertTo-Html -Fragment
+        $tableHtml = @"
+<table>
+    $rowsHtml
+</table>
+"@
+        $htmlBody = New-HtmlBody -TableHtml $tableHtml -ViolationContent $DeviceViolationContent -NoViolationContent "" -HasViolation:$true
+        Send-Mail -From $prodid -To $MsbicBuContacter -Cc $CcContacter -Subject $Subject `
+            -Body $htmlBody -SmtpServer $smtp_server -KeyName $prodid -Cert $sysid_cert -Port 2587 -LogFilePath $logFilePath
+    }
+}
+
+if ($DeleteInputAfterAnalysis) {
+    Remove-Item -Path $tempLogPath -Force
 }
