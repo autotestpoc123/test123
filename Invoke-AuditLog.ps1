@@ -1,578 +1,1153 @@
-[CmdletBinding(DefaultParameterSetName = 'LatestRun')]
-param(
-    [Parameter(Mandatory = $true, ParameterSetName = 'DateRange')]
-    [ValidatePattern('^\d{8}$')]
-    [string]$startDate,
-    [Parameter(Mandatory = $true, ParameterSetName = 'DateRange')]
-    [ValidatePattern('^\d{8}$')]
-    [string]$endDate,
-    [string]$ConfigPath,
-    [string]$OutputRoot,
-    [string]$BackupFolder,
-    [Parameter(Mandatory = $true, ParameterSetName = 'SummaryPath')]
-    [string]$AnalysisSummaryPath,
-    [Parameter(Mandatory = $true, ParameterSetName = 'RunId', Position = 0)]
-    [string]$RunId,
-    [ValidateSet('2', '4')]
-    [string]$CurrentRunWeeks,
-    [switch]$FailOnDifference
-)
-
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-
-$scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-$modulePath = Join-Path $scriptRoot 'wecom_analysis_comm.psm1'
-
-if (-not $ConfigPath) {
-    if ($env:WECOM_AUDIT_CONFIG_PATH) {
-        $ConfigPath = $env:WECOM_AUDIT_CONFIG_PATH
-    }
-    else {
-        $ConfigPath = Join-Path $scriptRoot 'analysis_task.config.psd1'
-    }
+if (-not ('System.DirectoryServices.Protocols.LdapConnection' -as [type])) {
+    Add-Type -AssemblyName System.DirectoryServices.Protocols
 }
-
-if (-not $ConfigPath) {
-    throw "No config file could be resolved. Provide -ConfigPath or set WECOM_AUDIT_CONFIG_PATH."
-}
-
-if (-not (Test-Path $ConfigPath -PathType Leaf)) {
-    throw "Config file not found: $ConfigPath"
-}
-if (-not (Test-Path $modulePath -PathType Leaf)) {
-    throw "Required module not found: $modulePath"
-}
-
-Import-Module $modulePath -Force
-
-$config = Import-PowerShellDataFile -Path $ConfigPath
-$backupValidationConfig = Get-BackupValidationConfig -Config $config
-if (-not $backupValidationConfig) {
-    throw "BackupValidation configuration not found in config: $ConfigPath"
-}
-
-$resolvedOutputRoot = if ($OutputRoot) {
-    $OutputRoot
-}
-else {
-    Split-Path $ConfigPath -Parent
-}
-
-if (-not (Test-Path $resolvedOutputRoot)) {
-    New-Item -Path $resolvedOutputRoot -ItemType Directory -Force | Out-Null
-}
-
-$resolvedBackupFolder = $null
-
-$runsRoot = Join-Path $resolvedOutputRoot 'runs'
-New-Item -Path $runsRoot -ItemType Directory -Force | Out-Null
-$latestRunPointerPath = Join-Path $runsRoot 'latest-run.json'
 
 <#
 .SYNOPSIS
-English code-review note for function 'Get-OptionalPropertyValue'.
+English code-review note for function 'Convert-ExactDate'.
+.DESCRIPTION
+Converts input data into a normalized output format used by the workflow.
+#>
+function Convert-ExactDate {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DateText
+    )
+
+    try {
+        return [datetime]::ParseExact($DateText, 'yyyyMMdd', [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    catch {
+        throw "Invalid date format '$DateText'. Expected yyyyMMdd."
+    }
+}
+
+<#
+.SYNOPSIS
+English code-review note for function 'Write-Log'.
+.DESCRIPTION
+Writes workflow artifacts to disk for traceability and downstream consumption.
+#>
+function Write-Log {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LogString,
+        [Parameter(Mandatory = $true)]
+        [string]$LogFilePath
+    )
+
+    $time = Get-Date -Format 'yyyy/MM/dd HH:mm:ss'
+    "$time - $LogString" | Out-File -FilePath $LogFilePath -Width 1024 -Append -Encoding UTF8
+}
+
+<#
+.SYNOPSIS
+English code-review note for function 'Get-LogFilePath'.
 .DESCRIPTION
 Retrieves computed or existing values required by the audit pipeline.
 #>
-function Get-OptionalPropertyValue {
+function Get-LogFilePath {
     param(
         [Parameter(Mandatory = $true)]
-        [object]$InputObject,
+        [string]$Directory,
         [Parameter(Mandatory = $true)]
-        [string]$PropertyName
+        [string]$BaseName
     )
 
-    if (-not $InputObject) {
-        return $null
+    if (-not (Test-Path -Path $Directory)) {
+        New-Item -ItemType Directory -Force -Path $Directory | Out-Null
     }
 
-    $property = $InputObject.PSObject.Properties[$PropertyName]
-    if ($null -eq $property) {
-        return $null
-    }
-
-    return $property.Value
+    $logDate = Get-Date -Format 'yyyyMMdd_HHmmss'
+    return (Join-Path $Directory "$BaseName.$logDate.log")
 }
 
 <#
 .SYNOPSIS
-English code-review note for function 'Resolve-AnalysisSummaryPathFromRunId'.
+English code-review note for function 'New-DateTokenMap'.
 .DESCRIPTION
-Resolves runtime values from configuration, tokens, and current execution context.
+Creates a new object or structure used by subsequent processing steps.
 #>
-function Resolve-AnalysisSummaryPathFromRunId {
+function New-DateTokenMap {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$RunsRoot,
-        [Parameter(Mandatory = $true)]
-        [string]$RunId
-    )
-
-    $runFolder = Join-Path $RunsRoot $RunId
-    if (-not (Test-Path -LiteralPath $runFolder -PathType Container)) {
-        throw "Run folder not found for RunId '$RunId': $runFolder"
-    }
-
-    foreach ($fileName in @('run-summary.json', 'configured-analysis-summary.json', 'configured_analysis_summary.json')) {
-        $summaryPath = Join-Path $runFolder $fileName
-        if (Test-Path -LiteralPath $summaryPath -PathType Leaf) {
-            return $summaryPath
-        }
-    }
-
-    throw "No supported analysis summary file was found under run folder: $runFolder"
-}
-
-<#
-.SYNOPSIS
-English code-review note for function 'Resolve-AnalysisSummaryPathFromLatestPointer'.
-.DESCRIPTION
-Resolves runtime values from configuration, tokens, and current execution context.
-#>
-function Resolve-AnalysisSummaryPathFromLatestPointer {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$PointerPath
-    )
-
-    if (-not (Test-Path -LiteralPath $PointerPath -PathType Leaf)) {
-        return $null
-    }
-
-    $pointerData = Get-Content -LiteralPath $PointerPath -Raw | ConvertFrom-Json
-    $runSummaryPath = Get-OptionalPropertyValue -InputObject $pointerData -PropertyName 'RunSummaryPath'
-    if ($runSummaryPath -and (Test-Path -LiteralPath $runSummaryPath -PathType Leaf)) {
-        return [PSCustomObject]@{
-            RunSummaryPath = [string]$runSummaryPath
-            BackupFolder   = [string](Get-OptionalPropertyValue -InputObject $pointerData -PropertyName 'BackupFolder')
-        }
-    }
-
-    return $null
-}
-
-<#
-.SYNOPSIS
-English code-review note for function 'Resolve-LatestAnalysisSummaryPath'.
-.DESCRIPTION
-Resolves runtime values from configuration, tokens, and current execution context.
-#>
-function Resolve-LatestAnalysisSummaryPath {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RunsRoot,
         [string]$StartDate,
+        [Parameter(Mandatory = $true)]
         [string]$EndDate
     )
 
-    if (-not (Test-Path $RunsRoot -PathType Container)) {
-        return $null
+    $startDateValue = Convert-ExactDate $StartDate
+    $endDateValue = Convert-ExactDate $EndDate
+
+    return @{
+        startDate            = $StartDate
+        endDate              = $EndDate
+        startDateMMdd        = $StartDate.Substring($StartDate.Length - 4)
+        endDateMMdd          = $EndDate.Substring($EndDate.Length - 4)
+        endDatePlus1         = $endDateValue.AddDays(1).ToString('yyyyMMdd')
+        endDatePlus1MMdd     = $endDateValue.AddDays(1).ToString('MMdd')
+        startDate_EndDate    = "${StartDate}_${EndDate}"
+        startDateDashEndDate = "${StartDate}-${EndDate}"
     }
-
-    $candidates = New-Object 'System.Collections.Generic.List[object]'
-    $candidateFiles = @(
-        Get-ChildItem -LiteralPath $RunsRoot -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.Name -in @('run-summary.json', 'configured-analysis-summary.json', 'configured_analysis_summary.json') -and
-                $_.DirectoryName -notmatch '[\\/]validation(?:_[^\\/]+)?(?:[\\/]|$)'
-            } |
-            Sort-Object LastWriteTime -Descending
-    )
-
-    foreach ($summaryFile in $candidateFiles) {
-        $summaryData = $null
-        try {
-            $summaryData = Get-Content -LiteralPath $summaryFile.FullName -Raw | ConvertFrom-Json
-        }
-        catch {
-            $summaryData = $null
-        }
-
-        $matchesRequestedDates = $false
-        if ($summaryData) {
-            $summaryStartDate = if ($summaryData.PSObject.Properties['StartDate']) { [string]$summaryData.StartDate } else { $null }
-            $summaryEndDate = if ($summaryData.PSObject.Properties['EndDate']) { [string]$summaryData.EndDate } else { $null }
-            $matchesRequestedDates = ($summaryStartDate -eq $StartDate -and $summaryEndDate -eq $EndDate)
-        }
-
-        $candidates.Add([PSCustomObject]@{
-            Path                  = $summaryFile.FullName
-            DirectoryLastWrite    = $summaryFile.Directory.LastWriteTime
-            FileLastWrite         = $summaryFile.LastWriteTime
-            MatchesRequestedDates = $matchesRequestedDates
-        })
-    }
-
-    $preferredCandidate = @(
-        $candidates |
-            Where-Object { $_.MatchesRequestedDates } |
-            Sort-Object -Property FileLastWrite, DirectoryLastWrite -Descending |
-            Select-Object -First 1
-    )[0]
-
-    if ($preferredCandidate) {
-        return [string]$preferredCandidate.Path
-    }
-
-    $latestCandidate = @(
-        $candidates |
-            Sort-Object -Property FileLastWrite, DirectoryLastWrite -Descending |
-            Select-Object -First 1
-    )[0]
-
-    if ($latestCandidate) {
-        return [string]$latestCandidate.Path
-    }
-
-    return $null
 }
 
 <#
 .SYNOPSIS
-English code-review note for function 'Load-AnalysisSummaryData'.
+English code-review note for function 'Resolve-TemplateText'.
+.DESCRIPTION
+Resolves runtime values from configuration, tokens, and current execution context.
+#>
+function Resolve-TemplateText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Template,
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Tokens
+    )
+
+    $resolved = $Template
+    foreach ($key in $Tokens.Keys) {
+        $resolved = $resolved.Replace("{$key}", [string]$Tokens[$key])
+    }
+
+    return $resolved
+}
+
+<#
+.SYNOPSIS
+Validates configured input paths before task execution starts.
+.DESCRIPTION
+Checks InputRoot and all configured task InputDirectory values (after token resolution)
+and throws one aggregated, readable error if any path is missing.
+#>
+function Assert-ConfigInputDirectories {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Config,
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Tokens,
+        [Parameter(Mandatory = $true)]
+        [string]$ConfigPath
+    )
+
+    $issues = New-Object 'System.Collections.Generic.List[string]'
+    $resolvedInputRoot = if ($Tokens.ContainsKey('inputRoot')) { [string]$Tokens.inputRoot } else { $null }
+
+    if (-not $resolvedInputRoot) {
+        $issues.Add("InputRoot is empty. Set 'InputRoot' in config or WECOM_AUDIT_INPUT_ROOT.")
+    }
+    elseif (-not (Test-Path -LiteralPath $resolvedInputRoot -PathType Container)) {
+        $issues.Add("InputRoot directory does not exist: $resolvedInputRoot")
+    }
+
+    $checkedDirectories = @{}
+    foreach ($task in @($Config.Tasks)) {
+        if (-not $task.ContainsKey('InputDirectory') -or -not $task.InputDirectory) {
+            continue
+        }
+
+        $taskName = if ($task.ContainsKey('Name') -and $task.Name) { [string]$task.Name } else { '<unnamed-task>' }
+        $rawInputDirectory = [string]$task.InputDirectory
+        $resolvedInputDirectory = Resolve-TemplateText -Template $rawInputDirectory -Tokens $Tokens
+
+        if (-not $resolvedInputDirectory) {
+            $issues.Add("Task '$taskName' has empty InputDirectory after token resolution (raw: '$rawInputDirectory').")
+            continue
+        }
+
+        if ($checkedDirectories.ContainsKey($resolvedInputDirectory)) {
+            continue
+        }
+
+        if (-not (Test-Path -LiteralPath $resolvedInputDirectory -PathType Container)) {
+            $issues.Add("Task '$taskName' InputDirectory does not exist: $resolvedInputDirectory (raw: '$rawInputDirectory').")
+        }
+        $checkedDirectories[$resolvedInputDirectory] = $true
+    }
+
+    if ($issues.Count -gt 0) {
+        $details = $issues | ForEach-Object { " - $_" }
+        throw ("Configuration pre-check failed for '$ConfigPath':`n" + ($details -join [Environment]::NewLine))
+    }
+}
+
+<#
+.SYNOPSIS
+English code-review note for function 'Get-TaskResultByName'.
+.DESCRIPTION
+Retrieves computed or existing values required by the audit pipeline.
+#>
+function Get-TaskResultByName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$TaskResults,
+        [Parameter(Mandatory = $true)]
+        [string]$TaskName
+    )
+
+    return @($TaskResults | Where-Object { $_.Name -eq $TaskName } | Select-Object -First 1)[0]
+}
+
+<#
+.SYNOPSIS
+English code-review note for function 'Get-TaskSummaryData'.
+.DESCRIPTION
+Retrieves computed or existing values required by the audit pipeline.
+#>
+function Get-TaskSummaryData {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$TaskResult
+    )
+
+    if (-not $TaskResult) {
+        return $null
+    }
+
+    if ($TaskResult.Status -ne 'completed') {
+        return $null
+    }
+
+    if (-not $TaskResult.SummaryPath -or -not (Test-Path $TaskResult.SummaryPath -PathType Leaf)) {
+        return $null
+    }
+
+    return Get-Content -LiteralPath $TaskResult.SummaryPath -Raw | ConvertFrom-Json
+}
+
+<#
+.SYNOPSIS
+English code-review note for function 'ConvertTo-BackupStaticRule'.
 .DESCRIPTION
 Provides a reusable workflow helper for audit processing.
 #>
-function Load-AnalysisSummaryData {
+function ConvertTo-BackupStaticRule {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$SummaryPath
+        [object]$Item,
+        [string[]]$DefaultWeeks
     )
 
-    if (-not (Test-Path -LiteralPath $SummaryPath -PathType Leaf)) {
-        return $null
-    }
-
-    try {
-        return Get-Content -LiteralPath $SummaryPath -Raw | ConvertFrom-Json
-    }
-    catch {
-        return $null
-    }
-}
-
-<#
-.SYNOPSIS
-English code-review note for function 'Get-RelatedAnalysisRuns'.
-.DESCRIPTION
-Retrieves computed or existing values required by the audit pipeline.
-#>
-function Get-RelatedAnalysisRuns {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RunsRoot,
-        [Parameter(Mandatory = $true)]
-        [string]$StartDate,
-        [Parameter(Mandatory = $true)]
-        [string]$EndDate
-    )
-
-    if (-not (Test-Path -LiteralPath $RunsRoot -PathType Container)) {
-        return @()
-    }
-
-    $relatedRuns = New-Object 'System.Collections.Generic.List[object]'
-    $candidateFiles = @(
-        Get-ChildItem -LiteralPath $RunsRoot -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.Name -in @('run-summary.json', 'configured-analysis-summary.json', 'configured_analysis_summary.json') -and
-                $_.DirectoryName -notmatch '[\\/]validation(?:_[^\\/]+)?(?:[\\/]|$)'
-            } |
-            Sort-Object LastWriteTime -Descending
-    )
-
-    foreach ($summaryFile in $candidateFiles) {
-        $summaryData = Load-AnalysisSummaryData -SummaryPath $summaryFile.FullName
-        if (-not $summaryData) {
-            continue
+    if ($Item -is [string]) {
+        return [PSCustomObject]@{
+            Template       = [string]$Item
+            Source         = 'generated'
+            Required       = $true
+            AppliesToWeeks = @($DefaultWeeks)
+            Description    = $null
         }
-
-        $summaryStartDate = [string](Get-OptionalPropertyValue -InputObject $summaryData -PropertyName 'StartDate')
-        $summaryEndDate = [string](Get-OptionalPropertyValue -InputObject $summaryData -PropertyName 'EndDate')
-        if ($summaryStartDate -ne $StartDate -or $summaryEndDate -ne $EndDate) {
-            continue
-        }
-
-        $runFolder = Split-Path -Parent $summaryFile.FullName
-        $relatedRuns.Add([PSCustomObject]@{
-            RunId       = if (Get-OptionalPropertyValue -InputObject $summaryData -PropertyName 'RunId') { [string]$summaryData.RunId } else { Split-Path -Leaf $runFolder }
-            RunFolder   = $runFolder
-            SummaryPath = $summaryFile.FullName
-            SummaryData = $summaryData
-            LastWriteTime = $summaryFile.LastWriteTime
-        })
     }
 
-    return @($relatedRuns.ToArray())
-}
+    $template = if ($null -ne $Item.Template -and [string]$Item.Template) {
+        [string]$Item.Template
+    }
+    elseif ($null -ne $Item.Name -and [string]$Item.Name) {
+        [string]$Item.Name
+    }
+    else {
+        throw 'Static backup validation rule must define Template.'
+    }
 
-<#
-.SYNOPSIS
-English code-review note for function 'Get-MergedTaskSummaries'.
-.DESCRIPTION
-Retrieves computed or existing values required by the audit pipeline.
-#>
-function Get-MergedTaskSummaries {
-    param(
-        [Parameter(Mandatory = $true)]
-        [object[]]$RelatedRuns,
-        [Parameter(Mandatory = $true)]
-        [string[]]$SummaryTaskNames
-    )
-
-    $mergedTaskSummaries = @{}
-    $mergedTaskSources = @{}
-    $sortedRuns = @($RelatedRuns | Sort-Object LastWriteTime -Descending)
-
-    foreach ($taskName in @($SummaryTaskNames | Where-Object { $_ } | Select-Object -Unique)) {
-        foreach ($run in $sortedRuns) {
-            $taskResult = @($run.SummaryData.Tasks | Where-Object { $_.Name -eq $taskName } | Select-Object -First 1)[0]
-            if (-not $taskResult) {
-                continue
-            }
-
-            $taskSummary = Get-TaskSummaryData -TaskResult $taskResult
-            if (-not $taskSummary) {
-                continue
-            }
-
-            $mergedTaskSummaries[$taskName] = $taskSummary
-            $mergedTaskSources[$taskName] = [PSCustomObject]@{
-                RunId           = $run.RunId
-                RunFolder       = $run.RunFolder
-                SummaryPath     = $run.SummaryPath
-                TaskSummaryPath = [string](Get-OptionalPropertyValue -InputObject $taskResult -PropertyName 'SummaryPath')
-            }
-            break
-        }
+    $appliesToWeeks = if ($null -ne $Item.AppliesToWeeks -and @($Item.AppliesToWeeks).Count -gt 0) {
+        @([string[]]$Item.AppliesToWeeks)
+    }
+    else {
+        @($DefaultWeeks)
     }
 
     return [PSCustomObject]@{
-        TaskSummaries = $mergedTaskSummaries
-        TaskSources   = $mergedTaskSources
+        Template       = $template
+        Source         = if ($null -ne $Item.Source -and [string]$Item.Source) { [string]$Item.Source } else { 'generated' }
+        Required       = if ($null -ne $Item.Required) { [bool]$Item.Required } else { $true }
+        AppliesToWeeks = $appliesToWeeks
+        Description    = if ($null -ne $Item.Description) { [string]$Item.Description } else { $null }
     }
 }
 
-$dateParametersProvided = ($PSCmdlet.ParameterSetName -eq 'DateRange')
-if ($dateParametersProvided) {
-    $null = Convert-ExactDate $startDate
-    $null = Convert-ExactDate $endDate
-}
+<#
+.SYNOPSIS
+English code-review note for function 'ConvertTo-BackupDynamicRule'.
+.DESCRIPTION
+Provides a reusable workflow helper for audit processing.
+#>
+function ConvertTo-BackupDynamicRule {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Item,
+        [string[]]$DefaultWeeks
+    )
 
-$resolutionMode = $null
-$pointerData = $null
-$resolvedAnalysisSummaryPath = if ($AnalysisSummaryPath) {
-    $resolutionMode = 'AnalysisSummaryPath'
-    $AnalysisSummaryPath
-}
-elseif ($RunId) {
-    $resolutionMode = 'RunId'
-    Resolve-AnalysisSummaryPathFromRunId -RunsRoot $runsRoot -RunId $RunId
-}
-elseif ($dateParametersProvided) {
-    $resolutionMode = 'DateRangeAutoDiscovery'
-    Resolve-LatestAnalysisSummaryPath -RunsRoot $runsRoot -StartDate $startDate -EndDate $endDate
-}
-else {
-    $pointerData = Resolve-AnalysisSummaryPathFromLatestPointer -PointerPath $latestRunPointerPath
-    if ($pointerData) {
-        $resolutionMode = 'LatestRunPointer'
-        [string]$pointerData.RunSummaryPath
+    if ($Item -is [string]) {
+        throw 'Dynamic backup validation rule must define BaseName and SummaryTaskName.'
+    }
+
+    $baseName = if ($null -ne $Item.BaseName -and [string]$Item.BaseName) {
+        [string]$Item.BaseName
+    }
+    elseif ($null -ne $Item.Template -and [string]$Item.Template) {
+        [string]$Item.Template
     }
     else {
-        $resolutionMode = 'AutoDiscovery'
-        Resolve-LatestAnalysisSummaryPath -RunsRoot $runsRoot -StartDate $startDate -EndDate $endDate
+        throw 'Dynamic backup validation rule must define BaseName.'
+    }
+
+    if ($null -eq $Item.SummaryTaskName -or -not [string]$Item.SummaryTaskName) {
+        throw "Dynamic backup validation rule '$baseName' must define SummaryTaskName."
+    }
+
+    $appliesToWeeks = if ($null -ne $Item.AppliesToWeeks -and @($Item.AppliesToWeeks).Count -gt 0) {
+        @([string[]]$Item.AppliesToWeeks)
+    }
+    else {
+        @($DefaultWeeks)
+    }
+
+    return [PSCustomObject]@{
+        BaseName        = $baseName
+        SummaryTaskName = [string]$Item.SummaryTaskName
+        Source          = if ($null -ne $Item.Source -and [string]$Item.Source) { [string]$Item.Source } else { 'generated' }
+        Required        = if ($null -ne $Item.Required) { [bool]$Item.Required } else { $true }
+        AppliesToWeeks  = $appliesToWeeks
+        Description     = if ($null -ne $Item.Description) { [string]$Item.Description } else { $null }
     }
 }
 
-$resolvedRunFolder = $null
-if ($resolvedAnalysisSummaryPath) {
-    $resolvedRunFolder = Split-Path $resolvedAnalysisSummaryPath -Parent
-    Write-Host "Resolution mode: $resolutionMode" -ForegroundColor Cyan
-    Write-Host "Using analysis summary: $resolvedAnalysisSummaryPath" -ForegroundColor Cyan
-}
-else {
-    if ($dateParametersProvided) {
-        Write-Host "Resolution mode: $resolutionMode" -ForegroundColor Yellow
-        Write-Host "No analysis summary matched startDate=$startDate endDate=$endDate. Validation will continue without task summaries." -ForegroundColor Yellow
-    }
-    $resolvedRunFolder = Join-Path $runsRoot ("validation_{0}" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
-    Write-Host 'No matching analysis summary was found. Creating a standalone validation run folder.' -ForegroundColor Yellow
-}
+<#
+.SYNOPSIS
+English code-review note for function 'Get-BackupValidationConfig'.
+.DESCRIPTION
+Retrieves computed or existing values required by the audit pipeline.
+#>
+function Get-BackupValidationConfig {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Config
+    )
 
-if (-not (Test-Path $resolvedRunFolder)) {
-    New-Item -Path $resolvedRunFolder -ItemType Directory -Force | Out-Null
-}
+    $validationNode = $null
+    $rulesNode = $null
+    $enforceFailure = $false
 
-$validationFolder = Join-Path $resolvedRunFolder 'validation'
-New-Item -Path $validationFolder -ItemType Directory -Force | Out-Null
-
-$logFilePath = Join-Path $validationFolder 'backup-validation.log'
-$validationSummaryPath = Join-Path $validationFolder 'backup-validation-summary.json'
-$validationJsonPath = Join-Path $validationFolder 'backup-folder-validation.json'
-$validationTextPath = Join-Path $validationFolder 'backup-folder-validation.txt'
-
-$analysisSummary = $null
-$taskSummaries = @{}
-if ($resolvedAnalysisSummaryPath) {
-    if (-not (Test-Path $resolvedAnalysisSummaryPath -PathType Leaf)) {
-        throw "Analysis summary not found: $resolvedAnalysisSummaryPath"
-    }
-
-    $analysisSummary = Get-Content -LiteralPath $resolvedAnalysisSummaryPath -Raw | ConvertFrom-Json
-    if (-not $dateParametersProvided) {
-        $startDate = [string](Get-OptionalPropertyValue -InputObject $analysisSummary -PropertyName 'StartDate')
-        $endDate = [string](Get-OptionalPropertyValue -InputObject $analysisSummary -PropertyName 'EndDate')
-        if (-not $startDate -or -not $endDate) {
-            throw 'Resolved analysis summary does not contain StartDate/EndDate, and they were not provided explicitly.'
+    if ($Config.ContainsKey('BackupValidation') -and $Config.BackupValidation) {
+        $validationNode = $Config.BackupValidation
+        $enforceFailure = if ($validationNode.ContainsKey('EnforceFailure')) {
+            [bool]$validationNode.EnforceFailure
         }
-        $null = Convert-ExactDate $startDate
-        $null = Convert-ExactDate $endDate
+        elseif ($validationNode.ContainsKey('EnforceBackupValidation')) {
+            [bool]$validationNode.EnforceBackupValidation
+        }
+        else {
+            $false
+        }
+
+        if ($validationNode.ContainsKey('Rules') -and $validationNode.Rules) {
+            $rulesNode = $validationNode.Rules
+        }
+        else {
+            $rulesNode = $validationNode
+        }
+    }
+    elseif ($Config.ContainsKey('BackupValidationRules') -and $Config.BackupValidationRules) {
+        $rulesNode = $Config.BackupValidationRules
+        $enforceFailure = if ($Config.ContainsKey('EnforceBackupValidation')) { [bool]$Config.EnforceBackupValidation } else { $false }
+    }
+    else {
+        return $null
     }
 
-    foreach ($taskResult in @($analysisSummary.Tasks)) {
-        if (-not $taskResult.Name) {
+    function Get-RuleItems {
+        param(
+            [Parameter(Mandatory = $true)]
+            [object]$Node,
+            [Parameter(Mandatory = $true)]
+            [string]$PropertyName
+        )
+
+        $value = $null
+        if ($Node -is [hashtable]) {
+            if (-not $Node.ContainsKey($PropertyName)) {
+                return @()
+            }
+
+            $value = $Node[$PropertyName]
+        }
+        else {
+            $property = $Node.PSObject.Properties[$PropertyName]
+            if (-not $property) {
+                return @()
+            }
+
+            $value = $property.Value
+        }
+
+        if ($null -eq $value) {
+            return @()
+        }
+
+        return @($value)
+    }
+
+    $staticRules = New-Object 'System.Collections.Generic.List[object]'
+    $dynamicRules = New-Object 'System.Collections.Generic.List[object]'
+
+    foreach ($item in (Get-RuleItems -Node $rulesNode -PropertyName 'CommonFiles')) {
+        [void]$staticRules.Add((ConvertTo-BackupStaticRule -Item $item -DefaultWeeks @()))
+    }
+    foreach ($item in (Get-RuleItems -Node $rulesNode -PropertyName 'CommonFixedFiles')) {
+        [void]$staticRules.Add((ConvertTo-BackupStaticRule -Item $item -DefaultWeeks @()))
+    }
+    foreach ($item in (Get-RuleItems -Node $rulesNode -PropertyName 'TwoWeekFiles')) {
+        [void]$staticRules.Add((ConvertTo-BackupStaticRule -Item $item -DefaultWeeks @('2')))
+    }
+    foreach ($item in (Get-RuleItems -Node $rulesNode -PropertyName 'TwoWeekFixedFiles')) {
+        [void]$staticRules.Add((ConvertTo-BackupStaticRule -Item $item -DefaultWeeks @('2')))
+    }
+    foreach ($item in (Get-RuleItems -Node $rulesNode -PropertyName 'FourWeekFiles')) {
+        [void]$staticRules.Add((ConvertTo-BackupStaticRule -Item $item -DefaultWeeks @('4')))
+    }
+    foreach ($item in (Get-RuleItems -Node $rulesNode -PropertyName 'FourWeekFixedFiles')) {
+        [void]$staticRules.Add((ConvertTo-BackupStaticRule -Item $item -DefaultWeeks @('4')))
+    }
+    foreach ($item in (Get-RuleItems -Node $rulesNode -PropertyName 'DynamicFiles')) {
+        [void]$dynamicRules.Add((ConvertTo-BackupDynamicRule -Item $item -DefaultWeeks @()))
+    }
+
+    return [PSCustomObject]([ordered]@{
+        EnforceFailure = $enforceFailure
+        StaticRules    = @($staticRules.ToArray())
+        DynamicRules   = @($dynamicRules.ToArray())
+    })
+}
+
+<#
+.SYNOPSIS
+English code-review note for function 'Get-ExpectedMessageFiles'.
+.DESCRIPTION
+Retrieves computed or existing values required by the audit pipeline.
+#>
+function Get-ExpectedMessageFiles {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BaseName,
+        [object]$SummaryData
+    )
+
+    if (-not $SummaryData -or -not $SummaryData.HasViolation) {
+        return @($BaseName)
+    }
+
+    $count = [int]$SummaryData.ViolationDivisionCount
+    if ($count -le 0) {
+        return @($BaseName)
+    }
+
+    $extension = [System.IO.Path]::GetExtension($BaseName)
+    $baseWithoutExtension = [System.IO.Path]::GetFileNameWithoutExtension($BaseName)
+    $files = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($index in 1..$count) {
+        $files.Add(('{0}_{1}{2}' -f $baseWithoutExtension, $index, $extension))
+    }
+
+    return @($files)
+}
+
+<#
+.SYNOPSIS
+English code-review note for function 'Get-ExpectedBackupFiles'.
+.DESCRIPTION
+Retrieves computed or existing values required by the audit pipeline.
+#>
+function Get-ExpectedBackupFiles {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CurrentRunWeeks,
+        [Parameter(Mandatory = $true)]
+        [hashtable]$DateTokens,
+        [Parameter(Mandatory = $true)]
+        [object]$BackupValidationConfig,
+        [hashtable]$TaskSummaries = @{}
+    )
+
+    $expected = New-Object 'System.Collections.Generic.List[string]'
+
+    foreach ($rule in @($BackupValidationConfig.StaticRules)) {
+        if (-not $rule.Required) {
             continue
         }
 
-        $taskSummaries[[string]$taskResult.Name] = Get-TaskSummaryData -TaskResult $taskResult
+        if (@($rule.AppliesToWeeks).Count -gt 0 -and $rule.AppliesToWeeks -notcontains $CurrentRunWeeks) {
+            continue
+        }
+
+        $expected.Add((Resolve-TemplateText -Template ([string]$rule.Template) -Tokens $DateTokens))
+    }
+
+    foreach ($rule in @($BackupValidationConfig.DynamicRules)) {
+        if (-not $rule.Required) {
+            continue
+        }
+
+        if (@($rule.AppliesToWeeks).Count -gt 0 -and $rule.AppliesToWeeks -notcontains $CurrentRunWeeks) {
+            continue
+        }
+
+        $baseName = Resolve-TemplateText -Template ([string]$rule.BaseName) -Tokens $DateTokens
+        $summaryData = if ($TaskSummaries.ContainsKey([string]$rule.SummaryTaskName)) { $TaskSummaries[[string]$rule.SummaryTaskName] } else { $null }
+        foreach ($name in (Get-ExpectedMessageFiles -BaseName $baseName -SummaryData $summaryData)) {
+            $expected.Add($name)
+        }
+    }
+
+    return @($expected)
+}
+
+<#
+.SYNOPSIS
+English code-review note for function 'Test-BackupFolderContent'.
+.DESCRIPTION
+Validates current state and returns comparison results for audit checks.
+#>
+function Test-BackupFolderContent {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BackupFolder,
+        [Parameter(Mandatory = $true)]
+        [string[]]$ExpectedFiles
+    )
+
+    $actualFiles = @(
+        Get-ChildItem -LiteralPath $BackupFolder -File |
+            Select-Object -ExpandProperty Name
+    )
+    $missingFiles = @($ExpectedFiles | Where-Object { $actualFiles -notcontains $_ })
+    $unexpectedFiles = @($actualFiles | Where-Object { $ExpectedFiles -notcontains $_ })
+
+    return [PSCustomObject]@{
+        ExpectedFiles   = @($ExpectedFiles)
+        ActualFiles     = @($actualFiles)
+        MissingFiles    = @($missingFiles)
+        UnexpectedFiles = @($unexpectedFiles)
+        Passed          = ($missingFiles.Count -eq 0 -and $unexpectedFiles.Count -eq 0)
     }
 }
 
-if ($BackupFolder) {
-    $resolvedBackupFolder = $BackupFolder
-}
-elseif ($pointerData -and $pointerData.BackupFolder) {
-    $resolvedBackupFolder = [string]$pointerData.BackupFolder
-}
-else {
-    $resolvedBackupFolder = Join-Path $resolvedOutputRoot $endDate
+<#
+.SYNOPSIS
+English code-review note for function 'Format-BackupValidationText'.
+.DESCRIPTION
+Formats data into a human-readable representation for review output.
+#>
+function Format-BackupValidationText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$ValidationResult,
+        [Parameter(Mandatory = $true)]
+        [string]$CurrentRunWeeks,
+        [Parameter(Mandatory = $true)]
+        [string]$BackupFolder
+    )
+
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $lines.Add('Backup Validation Report')
+    $lines.Add("Week Cycle: $CurrentRunWeeks")
+    $lines.Add("Backup Folder: $BackupFolder")
+    $lines.Add("Passed: $($ValidationResult.Passed)")
+    if ($ValidationResult.PSObject.Properties['ValidationMode'] -and $ValidationResult.ValidationMode) {
+        $lines.Add("Validation Mode: $($ValidationResult.ValidationMode)")
+    }
+    if ($ValidationResult.PSObject.Properties['MergedRunIds'] -and @($ValidationResult.MergedRunIds).Count -gt 0) {
+        $lines.Add("Merged Runs: $($ValidationResult.MergedRunIds -join ', ')")
+    }
+    $lines.Add('')
+
+    $lines.Add('Missing Files:')
+    if (@($ValidationResult.MissingFiles).Count -eq 0) {
+        $lines.Add('  (none)')
+    }
+    else {
+        foreach ($file in $ValidationResult.MissingFiles) {
+            $lines.Add("  - $file")
+        }
+    }
+
+    $lines.Add('')
+    $lines.Add('Unexpected Files:')
+    if (@($ValidationResult.UnexpectedFiles).Count -eq 0) {
+        $lines.Add('  (none)')
+    }
+    else {
+        foreach ($file in $ValidationResult.UnexpectedFiles) {
+            $lines.Add("  - $file")
+        }
+    }
+
+    $lines.Add('')
+    $lines.Add('Expected Files:')
+    foreach ($file in $ValidationResult.ExpectedFiles) {
+        $lines.Add("  - $file")
+    }
+
+    $lines.Add('')
+    $lines.Add('Actual Files:')
+    foreach ($file in $ValidationResult.ActualFiles) {
+        $lines.Add("  - $file")
+    }
+
+    return ($lines -join [Environment]::NewLine)
 }
 
-if (-not (Test-Path $resolvedBackupFolder -PathType Container)) {
-    throw "Backup folder not found: $resolvedBackupFolder"
-}
+<#
+.SYNOPSIS
+English code-review note for function 'Get-Cert'.
+.DESCRIPTION
+Retrieves computed or existing values required by the audit pipeline.
+#>
+function Get-Cert {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$KeyName
+    )
 
-$currentRunWeeksSource = $null
-$effectiveCurrentRunWeeks = if ($PSBoundParameters.ContainsKey('CurrentRunWeeks') -and $CurrentRunWeeks) {
-    $currentRunWeeksSource = 'Parameter'
-    $CurrentRunWeeks
-}
-elseif ($analysisSummary -and $analysisSummary.CurrentRunWeeks) {
-    $currentRunWeeksSource = 'AnalysisSummary'
-    [string]$analysisSummary.CurrentRunWeeks
-}
-elseif ($config.CurrentRunWeeks) {
-    $currentRunWeeksSource = 'Config'
-    [string]$config.CurrentRunWeeks
-}
-else {
-    $currentRunWeeksSource = 'Default'
-    '2'
-}
-
-if ($effectiveCurrentRunWeeks -notin @('2', '4')) {
-    throw "Unsupported CurrentRunWeeks '$effectiveCurrentRunWeeks'. Expected '2' or '4'."
-}
-
-$dynamicSummaryTaskNames = @(
-    @($backupValidationConfig.DynamicRules) |
-        Where-Object {
-            $_.Required -and
-            (@($_.AppliesToWeeks).Count -eq 0 -or $_.AppliesToWeeks -contains $effectiveCurrentRunWeeks)
-        } |
-        ForEach-Object { [string]$_.SummaryTaskName } |
-        Where-Object { $_ } |
-        Select-Object -Unique
-)
-
-[object[]]$relatedRuns = if ($startDate -and $endDate) {
-    @(Get-RelatedAnalysisRuns -RunsRoot $runsRoot -StartDate $startDate -EndDate $endDate)
-}
-else {
-    @()
-}
-
-$mergedSummaryData = if ($dynamicSummaryTaskNames.Count -gt 0 -and $relatedRuns.Count -gt 0) {
-    Get-MergedTaskSummaries -RelatedRuns $relatedRuns -SummaryTaskNames $dynamicSummaryTaskNames
-}
-else {
-    [PSCustomObject]@{
-        TaskSummaries = $taskSummaries
-        TaskSources   = @{}
+    Add-Type -AssemblyName System.Security
+    $certStore = New-Object System.Security.Cryptography.X509Certificates.X509Store('My', 'LocalMachine')
+    $certStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+    try {
+        $certs = $certStore.Certificates |
+            Where-Object { $_.Subject -like "*CN=$KeyName*" } |
+            Sort-Object NotAfter -Descending
+        return ($certs | Select-Object -First 1)
+    }
+    finally {
+        $certStore.Close()
     }
 }
 
-$effectiveTaskSummaries = if ($mergedSummaryData.TaskSummaries) { $mergedSummaryData.TaskSummaries } else { $taskSummaries }
-$usedRunIds = @(
-    @($mergedSummaryData.TaskSources.GetEnumerator()) |
-        ForEach-Object { $_.Value.RunId } |
-        Where-Object { $_ } |
-        Select-Object -Unique
-)
-$selectedRunId = if ($analysisSummary -and (Get-OptionalPropertyValue -InputObject $analysisSummary -PropertyName 'RunId')) {
-    [string]$analysisSummary.RunId
-}
-elseif ($resolvedRunFolder) {
-    Split-Path -Leaf $resolvedRunFolder
-}
-else {
-    $null
-}
-$validationMode = if ($usedRunIds.Count -gt 1 -or ($usedRunIds.Count -eq 1 -and $selectedRunId -and $usedRunIds[0] -ne $selectedRunId)) { 'aggregated' } else { 'single-run' }
+<#
+.SYNOPSIS
+English code-review note for function 'Get-VaultSecret'.
+.DESCRIPTION
+Retrieves computed or existing values required by the audit pipeline.
+#>
+function Get-VaultSecret {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$VaultServer,
+        [Parameter(Mandatory = $true)]
+        [string]$VaultEnv,
+        [Parameter(Mandatory = $true)]
+        [string]$KeyName,
+        [Parameter(Mandatory = $true)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$SysIdCert,
+        [string]$Eonid = '309843'
+    )
 
-$dateTokens = New-DateTokenMap -StartDate $startDate -EndDate $endDate
-$expectedBackupFiles = Get-ExpectedBackupFiles -CurrentRunWeeks $effectiveCurrentRunWeeks -DateTokens $dateTokens -BackupValidationConfig $backupValidationConfig -TaskSummaries $effectiveTaskSummaries
-$backupValidation = Test-BackupFolderContent -BackupFolder $resolvedBackupFolder -ExpectedFiles $expectedBackupFiles
-$backupValidation | Add-Member -MemberType NoteProperty -Name ValidationMode -Value $validationMode -Force
-$backupValidation | Add-Member -MemberType NoteProperty -Name MergedRunIds -Value @($usedRunIds) -Force
-$backupValidation | Add-Member -MemberType NoteProperty -Name MergedTaskSources -Value $mergedSummaryData.TaskSources -Force
-$backupValidation | ConvertTo-Json -Depth 8 | Set-Content -Path $validationJsonPath -Encoding UTF8
-$backupValidationText = Format-BackupValidationText -ValidationResult $backupValidation -CurrentRunWeeks $effectiveCurrentRunWeeks -BackupFolder $resolvedBackupFolder
-$backupValidationText | Set-Content -Path $validationTextPath -Encoding UTF8
+    $authHeader = @{
+        'X-Vault-Namespace' = 'msms/core'
+    }
+    $certAuthUrl = "$VaultServer/v1/auth/cert/login"
+    $keyPathUrl = "$VaultServer/v1/msa/data/secret/$Eonid/$VaultEnv/$KeyName"
 
-$effectiveFailOnDifference = if ($FailOnDifference.IsPresent) { $true } else { [bool]$backupValidationConfig.EnforceFailure }
+    try {
+        $certAuthResponse = Invoke-RestMethod -Uri $certAuthUrl -Certificate $SysIdCert -Method Post -Headers $authHeader -UseBasicParsing
+    }
+    catch {
+        throw "Failed to get vault token: $($_.Exception.Message)"
+    }
 
-$summary = [PSCustomObject]@{
-    StartDate            = $startDate
-    EndDate              = $endDate
-    ConfigPath           = $ConfigPath
-    OutputRoot           = $resolvedOutputRoot
-    RunFolder            = $resolvedRunFolder
-    ValidationFolder     = $validationFolder
-    BackupFolder         = $resolvedBackupFolder
-    AnalysisSummaryPath  = $resolvedAnalysisSummaryPath
-    CurrentRunWeeks      = $effectiveCurrentRunWeeks
-    ValidationMode       = $validationMode
-    RelatedRunIds        = @($relatedRuns | ForEach-Object { $_.RunId })
-    MergedTaskSources    = $mergedSummaryData.TaskSources
-    FailOnDifference     = $effectiveFailOnDifference
-    ValidationJsonPath   = $validationJsonPath
-    ValidationTextPath   = $validationTextPath
-    ValidationPassed     = $backupValidation.Passed
-    ExpectedFileCount    = @($expectedBackupFiles).Count
-    AnalysisSummaryFound = [bool]$analysisSummary
-}
-$summary | ConvertTo-Json -Depth 8 | Set-Content -Path $validationSummaryPath -Encoding UTF8
+    $vaultClientToken = $certAuthResponse.auth.client_token
+    if (-not $vaultClientToken) {
+        throw 'Vault authentication succeeded but no client token was returned.'
+    }
 
-Write-Log -LogString "Backup validation completed. Passed: $($backupValidation.Passed). Summary path: $validationSummaryPath" -LogFilePath $logFilePath
-Write-Host "Resolved run folder: $resolvedRunFolder" -ForegroundColor Cyan
-Write-Host "Resolved backup folder: $resolvedBackupFolder" -ForegroundColor Cyan
-Write-Host "CurrentRunWeeks: $effectiveCurrentRunWeeks (source: $currentRunWeeksSource)" -ForegroundColor Cyan
-Write-Host "Validation mode: $validationMode" -ForegroundColor Cyan
-if ($validationMode -eq 'aggregated') {
-    Write-Host "Merged run sources: $($usedRunIds -join ', ')" -ForegroundColor Cyan
+    $authHeader['X-Vault-Token'] = $vaultClientToken
+
+    try {
+        $keyRequestResponse = Invoke-WebRequest -Uri $keyPathUrl -Method Get -Headers $authHeader -UseBasicParsing
+    }
+    catch {
+        throw "Failed to get secret for ${KeyName}: $($_.Exception.Message)"
+    }
+
+    if (-not $keyRequestResponse.Content) {
+        throw "The secret response for $KeyName was empty."
+    }
+
+    $secret = ($keyRequestResponse.Content | ConvertFrom-Json).data.data.$KeyName
+    if (-not $secret) {
+        throw "The secret value for $KeyName was null."
+    }
+
+    return $secret
 }
 
-if ($backupValidation.Passed) {
-    Write-Host "Backup folder validation passed: $validationTextPath" -ForegroundColor Green
-    Write-Host "Validation summary: $validationSummaryPath" -ForegroundColor Green
-    exit 0
+<#
+.SYNOPSIS
+English code-review note for function 'New-LazyLdapConnection'.
+.DESCRIPTION
+Creates a new object or structure used by subsequent processing steps.
+#>
+function New-LazyLdapConnection {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Server,
+        [int]$Port = 636,
+        [switch]$UseSsl = $true,
+        [int]$TimeoutSeconds = 30,
+        [Parameter(Mandatory = $true)]
+        [System.Net.NetworkCredential]$Credential
+    )
+
+    $server = $Server
+    $port = [int]$Port
+    $useSsl = $UseSsl
+    $timeout = [int]$TimeoutSeconds
+    $credential = $Credential
+
+    $factory = [System.Func[System.DirectoryServices.Protocols.LdapConnection]] {
+        $identifier = [System.DirectoryServices.Protocols.LdapDirectoryIdentifier]::new($server, $port)
+        $conn = [System.DirectoryServices.Protocols.LdapConnection]::new(
+            $identifier,
+            $credential,
+            [System.DirectoryServices.Protocols.AuthType]::Negotiate
+        )
+        $conn.SessionOptions.ProtocolVersion = 3
+        if ($useSsl) {
+            $conn.SessionOptions.SecureSocketLayer = $true
+        }
+
+        $conn.Timeout = [TimeSpan]::FromSeconds($timeout)
+        try {
+            $conn.Bind()
+        }
+        catch {
+            $conn.Dispose()
+            throw "LDAP bind failed: $($_.Exception.Message)"
+        }
+
+        return $conn
+    }
+
+    return [System.Lazy[System.DirectoryServices.Protocols.LdapConnection]]::new(
+        $factory,
+        [System.Threading.LazyThreadSafetyMode]::PublicationOnly
+    )
 }
 
-Write-Host "Backup folder validation found differences. Validation report: $validationTextPath" -ForegroundColor Yellow
-Write-Host "Validation summary: $validationSummaryPath" -ForegroundColor Yellow
-if ($effectiveFailOnDifference) {
-    throw "Backup folder validation failed. See $validationTextPath"
+<#
+.SYNOPSIS
+Builds an LDAP OR filter for a list of values.
+.DESCRIPTION
+Generates an LDAP filter fragment by combining object class and attribute clauses.
+#>
+function New-LdapOrFilter {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Values,
+        [Parameter(Mandatory = $true)]
+        [string]$AttributeName,
+        [string]$ObjectClassFilter = '(objectClass=user)'
+    )
+
+    $clauses = @(
+        $Values |
+            ForEach-Object { $_ } |
+            Where-Object { $_ } |
+            ForEach-Object { "($AttributeName=$_)"} 
+    )
+
+    if ($clauses.Count -eq 0) {
+        throw 'New-LdapOrFilter requires at least one non-empty value.'
+    }
+
+    return "(&${ObjectClassFilter}(|$($clauses -join '')))"
 }
+
+<#
+.SYNOPSIS
+Splits values into fixed-size batches.
+.DESCRIPTION
+Returns an array-of-arrays used by LDAP query functions to control request size.
+#>
+function Split-LdapBatches {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Values,
+        [int]$BatchSize = 20
+    )
+
+    if ($BatchSize -lt 1) {
+        throw 'BatchSize must be greater than 0.'
+    }
+
+    $batches = New-Object System.Collections.Generic.List[object]
+    $current = New-Object System.Collections.Generic.List[string]
+
+    foreach ($value in $Values) {
+        if (-not $value) {
+            continue
+        }
+
+        $current.Add([string]$value)
+        if ($current.Count -ge $BatchSize) {
+            $batches.Add(@($current.ToArray()))
+            $current.Clear()
+        }
+    }
+
+    if ($current.Count -gt 0) {
+        $batches.Add(@($current.ToArray()))
+    }
+
+    return @($batches.ToArray())
+}
+
+<#
+.SYNOPSIS
+Resolves LDAP search base from RootDSE when not provided.
+.DESCRIPTION
+Uses defaultNamingContext as the search base for subtree queries.
+#>
+function Resolve-LdapSearchBase {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.DirectoryServices.Protocols.LdapConnection]$Connection,
+        [string]$SearchBase
+    )
+
+    if ($SearchBase) {
+        return $SearchBase
+    }
+
+    $rootReq = [System.DirectoryServices.Protocols.SearchRequest]::new(
+        '',
+        '(objectClass=*)',
+        [System.DirectoryServices.Protocols.SearchScope]::Base,
+        'defaultNamingContext'
+    )
+    $rootResp = $Connection.SendRequest($rootReq)
+    if ($rootResp.ResultCode -ne [System.DirectoryServices.Protocols.ResultCode]::Success) {
+        throw "Failed to read RootDSE: $($rootResp.ErrorMessage)"
+    }
+
+    return [string](($rootResp.Entries[0].Attributes['defaultNamingContext'])[0])
+}
+
+<#
+.SYNOPSIS
+Performs LDAP lookups by mail address.
+.DESCRIPTION
+Returns a hashtable with Valid mail mappings and Invalid addresses.
+#>
+function Get-LdapUserByMail {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Lazy[System.DirectoryServices.Protocols.LdapConnection]]$LazyConnection,
+        [Parameter(Mandatory = $true)]
+        [string[]]$MailAdds,
+        [string]$SearchBase,
+        [int]$SearchTimeoutSeconds = 30,
+        [string[]]$Attributes = @('sAMAccountName', 'mail', 'division'),
+        [int]$BatchSize = 20
+    )
+
+    try {
+        $conn = $LazyConnection.Value
+    }
+    catch {
+        throw "Failed to create LDAP connection: $($_.Exception.Message)"
+    }
+
+    $conn.Timeout = [TimeSpan]::FromSeconds($SearchTimeoutSeconds)
+    $resolvedBase = Resolve-LdapSearchBase -Connection $conn -SearchBase $SearchBase
+
+    $mailLookup = @{}
+    $invalid = New-Object System.Collections.Generic.List[string]
+    $normalized = @(
+        $MailAdds |
+            ForEach-Object {
+                if ($_ -is [string]) {
+                    $_.Trim().ToLower()
+                }
+            } |
+            Where-Object { $_ }
+    )
+
+    foreach ($batch in Split-LdapBatches -Values $normalized -BatchSize $BatchSize) {
+        $filter = New-LdapOrFilter -Values $batch -AttributeName 'mail' -ObjectClassFilter '(|(objectClass=user)(objectClass=group))'
+        $searchReq = [System.DirectoryServices.Protocols.SearchRequest]::new(
+            $resolvedBase,
+            $filter,
+            [System.DirectoryServices.Protocols.SearchScope]::Subtree,
+            $Attributes
+        )
+
+        $searchResp = $conn.SendRequest($searchReq)
+        $foundMails = @()
+
+        foreach ($entry in $searchResp.Entries) {
+            $info = [PSCustomObject]@{
+                SamAccountName = $null
+                Mail           = $null
+                Division       = $null
+            }
+
+            if ($entry.Attributes['mail']) {
+                $info.Mail = [string]$entry.Attributes['mail'][0].ToLower()
+                $foundMails += $info.Mail
+            }
+            if ($entry.Attributes['sAMAccountName']) {
+                $info.SamAccountName = [string]$entry.Attributes['sAMAccountName'][0]
+            }
+            if ($entry.Attributes['division']) {
+                $info.Division = [string]$entry.Attributes['division'][0]
+            }
+
+            if ($info.Mail) {
+                $mailLookup[$info.Mail] = $info
+            }
+        }
+
+        foreach ($address in $batch) {
+            if (-not ($foundMails -contains $address)) {
+                $invalid.Add($address)
+            }
+        }
+    }
+
+    return @{
+        Valid   = $mailLookup
+        Invalid = $invalid
+    }
+}
+
+<#
+.SYNOPSIS
+Performs LDAP lookups by account ID.
+.DESCRIPTION
+Returns a hashtable with Valid account mappings and Invalid account IDs.
+#>
+function Get-LdapUserById {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Lazy[System.DirectoryServices.Protocols.LdapConnection]]$LazyConnection,
+        [Parameter(Mandatory = $true)]
+        [string[]]$UserId,
+        [string]$SearchBase,
+        [int]$SearchTimeoutSeconds = 30,
+        [string[]]$Attributes = @('sAMAccountName', 'division', 'legalentity'),
+        [int]$BatchSize = 20
+    )
+
+    try {
+        $conn = $LazyConnection.Value
+    }
+    catch {
+        throw "failed to create LDAP connection: $($_.Exception.Message)"
+    }
+
+    $conn.Timeout = [TimeSpan]::FromSeconds($SearchTimeoutSeconds)
+    $resolvedBase = Resolve-LdapSearchBase -Connection $conn -SearchBase $SearchBase
+
+    $lookup = @{}
+    $invalid = New-Object System.Collections.Generic.List[string]
+    $normalized = @(
+        $UserId |
+            ForEach-Object {
+                if ($_ -is [string]) {
+                    $_ -split ';' | ForEach-Object { $_.Trim().ToLower() }
+                }
+            } |
+            Where-Object { $_ } |
+            Select-Object -Unique
+    )
+
+    foreach ($batch in Split-LdapBatches -Values $normalized -BatchSize $BatchSize) {
+        $filter = New-LdapOrFilter -Values $batch -AttributeName 'cn' -ObjectClassFilter '(objectClass=user)'
+        $searchReq = [System.DirectoryServices.Protocols.SearchRequest]::new(
+            $resolvedBase,
+            $filter,
+            [System.DirectoryServices.Protocols.SearchScope]::Subtree,
+            $Attributes
+        )
+        $searchResp = $conn.SendRequest($searchReq)
+        $foundCnNames = @()
+
+        foreach ($entry in $searchResp.Entries) {
+            $info = [PSCustomObject]@{
+                SamAccountName = $null
+                Division       = $null
+                LegalEntity    = $null
+            }
+
+            if ($entry.Attributes['sAMAccountName']) {
+                $info.SamAccountName = [string]$entry.Attributes['sAMAccountName'][0]
+                $foundCnNames += $info.SamAccountName.ToLower()
+            }
+            if ($entry.Attributes['division']) {
+                $info.Division = [string]$entry.Attributes['division'][0]
+            }
+            if ($entry.Attributes['legalentity']) {
+                $info.LegalEntity = [string]$entry.Attributes['legalentity'][0]
+            }
+
+            if ($info.SamAccountName) {
+                $lookup[$info.SamAccountName.ToLower()] = $info
+            }
+        }
+
+        foreach ($id in $batch) {
+            if (-not ($foundCnNames -contains $id)) {
+                $invalid.Add($id)
+            }
+        }
+    }
+
+    return @{
+        Valid   = $lookup
+        Invalid = $invalid
+    }
+}
+
+<#
+.SYNOPSIS
+English code-review note for function 'Close-LazyLdapConnection'.
+.DESCRIPTION
+Releases resources created earlier in the workflow to avoid leaks.
+#>
+function Close-LazyLdapConnection {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Lazy[System.DirectoryServices.Protocols.LdapConnection]]$Lazy
+    )
+
+    if ($Lazy.IsValueCreated) {
+        try {
+            $Lazy.Value.Dispose()
+        }
+        catch {
+            throw "LDAP dispose issue: $($_.Exception.Message)"
+        }
+    }
+}
+
+<#
+.SYNOPSIS
+English code-review note for function 'Send-Mail'.
+.DESCRIPTION
+Sends notifications using configured transport and security settings.
+#>
+function Send-Mail {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$From,
+        [Parameter(Mandatory = $true)]
+        [string[]]$To,
+        [Parameter(Mandatory = $true)]
+        [string]$Cc,
+        [Parameter(Mandatory = $true)]
+        [string]$Subject,
+        [Parameter(Mandatory = $true)]
+        [string]$Body,
+        [Parameter(Mandatory = $true)]
+        [string]$SmtpServer,
+        [Parameter(Mandatory = $true)]
+        [string]$KeyName,
+        [Parameter(Mandatory = $true)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert,
+        [int]$Port = 2587,
+        [string]$LogFilePath
+    )
+
+    if (-not $Cert) {
+        throw "Certificate not found in LocalMachine\My store for $KeyName."
+    }
+
+    $mail = $null
+    try {
+        $mail = New-Object System.Net.Mail.MailMessage
+        $mail.From = $From
+        foreach ($recipient in $To) {
+            $mail.To.Add($recipient)
+        }
+        $mail.CC.Add($Cc)
+        $mail.Subject = $Subject
+        $mail.Body = $Body
+        $mail.IsBodyHtml = $true
+
+        $smtp = New-Object System.Net.Mail.SmtpClient($SmtpServer, $Port)
+        $smtp.EnableSsl = $true
+        $smtp.ClientCertificates.Add([System.Security.Cryptography.X509Certificates.X509Certificate2]::new($Cert))
+        $smtp.Send($mail)
+        if ($LogFilePath) {
+            Write-Log -LogString "Email sent successfully to $($To -join ', ')" -LogFilePath $LogFilePath
+        }
+        Write-Host "Email sent successfully to $($To -join ', ')"
+    }
+    catch {
+        if ($LogFilePath) {
+            Write-Log -LogString "Failed to send email to $($To -join ', '): $($_.Exception.Message)" -LogFilePath $LogFilePath
+        }
+        throw "Failed to send email: $($_.Exception.Message)"
+    }
+    finally {
+        if ($mail) {
+            $mail.Dispose()
+        }
+    }
+}
+
+$htmlTemplateNew = @"
+<html>
+<head>
+    <style>
+        table { border-collapse: collapse; width: auto; }
+        th, td { border: 1px solid #ddd; padding: 8px; }
+        th { background-color: #f2f2f2; text-align: left; }
+        body { font-family: Arial; font-size: 16px; }
+    </style>
+</head>
+<body>
+    <div>Hi all,</div>
+    {{ViolationParagraph}}
+
+    {{TableSection}}
+
+    {{NoViolationParagraph}}
+    <br/>
+    <br/>
+    <div>Regards,</div>
+    <div>COD WeCom Team</div>
+</body>
+</html>
+"@
+
+<#
+.SYNOPSIS
+English code-review note for function 'New-HtmlBody'.
+.DESCRIPTION
+Creates a new object or structure used by subsequent processing steps.
+#>
+function New-HtmlBody {
+    param(
+        [string]$TableHtml = '',
+        [string]$ViolationContent,
+        [string]$NoViolationContent,
+        [bool]$HasViolation = $false
+    )
+
+    if ($HasViolation) {
+        $violationParaHtml = '<p>{{ViolationContent}}</p>'
+        return $htmlTemplateNew.Replace('{{ViolationParagraph}}', $violationParaHtml).
+            Replace('{{TableSection}}', $TableHtml).
+            Replace('{{NoViolationParagraph}}', '').
+            Replace('{{ViolationContent}}', $ViolationContent)
+    }
+
+    $noViolationParaHtml = '<p>{{NoViolationContent}}</p>'
+    return $htmlTemplateNew.Replace('{{ViolationParagraph}}', '').
+        Replace('{{TableSection}}', '').
+        Replace('{{NoViolationParagraph}}', $noViolationParaHtml).
+        Replace('{{NoViolationContent}}', $NoViolationContent)
+}
+
+Export-ModuleMember -Function Convert-ExactDate, Write-Log, Get-Cert, Get-LogFilePath, Get-VaultSecret, New-LazyLdapConnection, Close-LazyLdapConnection, Send-Mail, New-HtmlBody, New-DateTokenMap, Resolve-TemplateText, Assert-ConfigInputDirectories, Get-TaskResultByName, Get-TaskSummaryData, Get-BackupValidationConfig, Get-ExpectedBackupFiles, Test-BackupFolderContent, Format-BackupValidationText, New-LdapOrFilter, Split-LdapBatches, Resolve-LdapSearchBase, Get-LdapUserByMail, Get-LdapUserById
