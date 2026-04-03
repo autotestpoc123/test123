@@ -1,37 +1,28 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$deviceLogFilePath,
+    [string]$mailLogFilePath,
     [Parameter(Mandatory = $true)]
-    [ValidatePattern('^\d{8}$')]
     [string]$startDate,
     [Parameter(Mandatory = $true)]
-    [ValidatePattern('^\d{8}$')]
     [string]$endDate,
-    [Parameter(Mandatory = $true)]
-    [ValidateSet('MSMS', 'MSBIC')]
-    [string]$BU,
-    [ValidateSet('PROD', 'QA')]
-    [string]$env = 'PROD',
-    [switch]$DeleteInputAfterAnalysis,
+    [string]$env = 'QA',
     [string]$SummaryOutputPath,
     [string]$TaskOutputDirectory
 )
 
 $parentFolderPath = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-$importModulePath = Join-Path $parentFolderPath "wecom_analysis_comm.psm1"
+$importModulePath = Join-Path $parentFolderPath 'wecom_analysis_comm.psm1'
 
 if (-not (Test-Path $importModulePath)) {
-    throw "Module load path not found, please double check!"
+    throw 'Module load path not found, please double check!'
 }
 
-Import-Module $importModulePath
+Import-Module $importModulePath -Force
 
-# Generate Export Folder
 function Export-AnalysisReport {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$LogFilePath,
-        [string]$SubFolder = "analyzed"
+        [string]$LogFilePath
     )
 
     if ($TaskOutputDirectory) {
@@ -41,28 +32,69 @@ function Export-AnalysisReport {
         return $TaskOutputDirectory
     }
 
-    $datedFolder = $null
-    $timestamp = $null
-    try {
-        $timestamp = Get-Date -Format "yyyy_MM_dd"
-        $parentFolder = Split-Path $LogFilePath -Parent
-        $targetFolder = Join-Path $parentFolder $SubFolder
-        $datedFolder = Join-Path $targetFolder $timestamp
-        if (-not (Test-Path $datedFolder)) {
-            New-Item -Path $datedFolder -ItemType Directory -Force | Out-Null
+    $baseFolder = Split-Path -Parent $LogFilePath
+    $reportFolder = Join-Path $baseFolder 'AnalysisReport'
+    if (-not (Test-Path $reportFolder)) {
+        New-Item -Path $reportFolder -ItemType Directory -Force | Out-Null
+    }
+    return $reportFolder
+}
+
+function Resolve-MailColumns {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$CsvData
+    )
+
+    $propertyNames = @($CsvData[0].PSObject.Properties.Name)
+    $cnTime = ([string][char]0x65F6) + [char]0x95F4
+    $cnSendTime = ([string][char]0x53D1) + [char]0x9001 + [char]0x65F6 + [char]0x95F4
+    $cnSubject = ([string][char]0x4E3B) + [char]0x9898
+    $cnMailSubject = ([string][char]0x90AE) + [char]0x4EF6 + [char]0x4E3B + [char]0x9898
+    $cnSender = ([string][char]0x53D1) + [char]0x4EF6 + [char]0x4EBA
+    $cnSendUser = ([string][char]0x53D1) + [char]0x9001 + [char]0x4EBA
+    $cnRecipient = ([string][char]0x6536) + [char]0x4EF6 + [char]0x4EBA
+    $cnReceiveUser = ([string][char]0x63A5) + [char]0x6536 + [char]0x4EBA
+    $cnStatus = ([string][char]0x72B6) + [char]0x6001
+    $cnDeliveryStatus = ([string][char]0x6295) + [char]0x9012 + [char]0x72B6 + [char]0x6001
+
+    $aliasMap = @{
+        Time      = @($cnTime, $cnSendTime, 'Time', 'DateTime', 'SentTime')
+        Subject   = @($cnSubject, $cnMailSubject, 'Subject', 'Title')
+        Sender    = @($cnSender, $cnSendUser, 'Sender', 'From')
+        Recipient = @($cnRecipient, $cnReceiveUser, 'Recipients', 'Recipient', 'To')
+        Status    = @($cnStatus, $cnDeliveryStatus, 'Status', 'DeliveryStatus', 'Result')
+    }
+
+    $resolved = @{}
+    foreach ($logicalName in $aliasMap.Keys) {
+        $column = $propertyNames | Where-Object { $_ -in $aliasMap[$logicalName] } | Select-Object -First 1
+        if (-not $column) {
+            throw "Unable to resolve required mail log column: $logicalName. Available columns: $($propertyNames -join ', ')"
         }
-        return $datedFolder
+
+        $resolved[$logicalName] = $column
     }
-    catch {
-        Write-Error "Failed to create destination folder: $_"
-    }
+
+    return $resolved
+}
+
+function Get-RowValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$Row,
+        [Parameter(Mandatory = $true)]
+        [string]$ColumnName
+    )
+
+    return [string]$Row.PSObject.Properties[$ColumnName].Value
 }
 
 function Save-AnalysisSummary {
     param(
         [bool]$HasViolation,
         [int]$ViolationDivisionCount,
-        [int]$ViolationRecordCount
+        [string]$AnalysisType
     )
 
     if (-not $SummaryOutputPath) {
@@ -70,232 +102,246 @@ function Save-AnalysisSummary {
     }
 
     $summary = [PSCustomObject]@{
-        AnalysisType           = 'Device'
-        BusinessUnit           = $BU
+        AnalysisType           = 'Mail'
         StartDate              = $startDate
         EndDate                = $endDate
         HasViolation           = $HasViolation
         ViolationDivisionCount = $ViolationDivisionCount
-        ViolationRecordCount   = $ViolationRecordCount
     }
 
     $summary | ConvertTo-Json -Depth 4 | Set-Content -Path $SummaryOutputPath -Encoding UTF8
 }
 
-# main procedure
-$msmsDivisionScope = @("Private Credit & Equity", "Real Assets", "Global Sales and Marketing")
-$msbicDivision = "Fixed Income Division"
-# $msbicContacts = "css-wecom@abc.com"
-$msViolationCollection = @()
-$msbicViolationCollection = @()
-
-$destFoderPath = Export-AnalysisReport -LogFilePath $deviceLogFilePath
-$tempLogPath = $deviceLogFilePath
-$logFilePath = if ($TaskOutputDirectory) {
-    Join-Path $destFoderPath 'task.log'
-}
-else {
-    Get-LogFilePath -Directory $destFoderPath -BaseName "AnalysisLog"
-}
-$destFilePath = Join-Path $destFoderPath "report.csv"
-$Subject = ""
-
-# --set value according to Env
-$vaultEnv = 'prod'
-$prodid = "cod_wecom_ntfy_prod@abc.com.cn"
-$idName = "cod_wecom_ntfy_prod"
-$vault_server = "https://vault.srv.ms.com.cn"
-$ldapServer = 'cod.ms.com.cn'
-$smtp_server = "mta-hub.cod.ms.com.cn"
-$domain = 'COD'
-$BuContacter = $null
-
-$MsNoviolationRecipients = @("Cynthia.Xu@abc.com.cn", "Jun.Xu@abc.com", "susan.sun@abc.com")
-$MsbicBuContacter = "css-wecom@abc.com"
-$CcContacter = "cod-wecom-admin@abc.com.cn"
-
-$MSBURecipients = @{
-    "Private Credit & Equity"   = @("Cynthia.Xu@abc.com.cn", "Jun.Xu@abc.com", "msim_wecom_weekly_contactstatusreport")
-    "Real Assets"               = @("Susan.Sun@abc.com", "ivy.zhou@abc.com.cn", "msim_wecom_weekly_contactstatusreport")
-    "Global Sales and Marketing" = @("Matthew.Zhu@abc.com.cn", "msim_wecom_weekly_contactstatusreport")
-}
-
-if ($env.ToLower() -eq 'qa') {
-    $vaultEnv = "qa"
-    $prodid = "wecom_deploy_qa@infradev.abc.com.cn"
-    $idName = "wecom_deploy_qa"
-    $vault_server = "https://vault.srv.lab.ms.com.cn"
-    $ldapServer = 'codqa.lab.ms.com.cn'
-    $domain = 'CODQA'
-    $smtp_server = "mta-hub.mail.lab.ms.com.cn"
-    # Todo need update according to alignment with BUs
-    $MsNoviolationRecipients = @("ling.gu@infradev.abc.com.cn", "yimin.lu06@infradev.abc.com.cn")
-    $MSBURecipients = @{
-        "Private Credit & Equity"   = @("ling.gu@infradev.abc.com.cn", "Siyi.Huang@infradev.abc.com.cn")
-        "Real Assets"               = @("ling.gu@infradev.abc.com.cn", "yimin.lu06@infradev.abc.com.cn")
-        "Global Sales and Marketing" = @("ling.gu@infradev.abc.com.cn")
+switch ($env) {
+    'PROD' {
+        $smtp_server = 'mailhost.ms.com'
+        $ccContacter = @('ling.gu@infradev.mocktest.com.cn')
+        $prodid = 'wecom-audit-prod'
+        $sysid_cert = 'wecom-audit-prod-cert'
+        $internalDomain = [regex]'@mocktest\.com$'
+        $txmailFilter = [regex]'txmail'
+        $codDomain = '@mocktest.com'
+        $contactDivision = @(
+            'Morgan Stanley China',
+            'Morgan Stanley International Bank (China) Limited',
+            'Fixed Income Division'
+        )
+        $BURecipients = @{
+            'Morgan Stanley China' = @('ling.gu@infradev.mocktest.com.cn')
+            'Morgan Stanley International Bank (China) Limited' = @('ling.gu@infradev.mocktest.com.cn')
+            'Fixed Income Division' = @('ling.gu@infradev.mocktest.com.cn')
+        }
+        $noViolationRecipients = @('ling.gu@infradev.mocktest.com.cn')
     }
-    $CcContacter = "ling.gu@infradev.abc.com.cn"
-    $MsbicBuContacter = "yinmin.lu06@infradev.abc.com.cn"
+    'QA' {
+        $smtp_server = 'mailhost.ms.com'
+        $ccContacter = @('ling.gu@infradev.mocktest.com.cn')
+        $prodid = 'wecom-audit-qa'
+        $sysid_cert = 'wecom-audit-qa-cert'
+        $internalDomain = [regex]'@mocktest\.com$'
+        $txmailFilter = [regex]'txmail'
+        $codDomain = '@mocktest.com'
+        $contactDivision = @(
+            'Morgan Stanley China',
+            'Morgan Stanley International Bank (China) Limited',
+            'Fixed Income Division'
+        )
+        $BURecipients = @{
+            'Morgan Stanley China' = @('ling.gu@infradev.mocktest.com.cn')
+            'Morgan Stanley International Bank (China) Limited' = @('ling.gu@infradev.mocktest.com.cn')
+            'Fixed Income Division' = @('ling.gu@infradev.mocktest.com.cn')
+        }
+        $noViolationRecipients = @('ling.gu@infradev.mocktest.com.cn')
+    }
+    default {
+        throw "Unknown env: $env"
+    }
 }
 
-$noViolationContent = "The purpose of this email is to provide information on users in your business unit( BU ) who used unapproved WeCom device(s) for the reporting period listed in the subject line.<br><br/>There were <b>no violations</b> to report this reporting period for your BU.<br><br/>We are only able to distinguish if a user is using WeCom via iPad/ windows/ mac/ and cannot determine if user uses their own iOS mobile to login. This is currently a known limitation for the logs we retrieve."
-$DeviceViolationContent = "The purpose of this email is to provide information on users in your business unit( BU ) who used unapproved WeCom device(s) for the reporting period listed in the subject line.<br><br/>We are only able to distinguish if a user is using WeCom via iPad/ windows/ mac/ and cannot determine if user uses their own iOS mobile to login. This is currently a known limitation for the logs we retrieve.<br/>The violation record(s) of this reporting period for your BU as below:<br/>"
-
-if ($BU.ToLower() -eq 'msms') {
-    $Subject = "COD WeCom Login to Non-Approved Devices IM BU - Report($startDate - $endDate)"
-}
-else {
-    $Subject = "COD WeCom Login to Non-Approved Devices FID BU - Report($startDate - $endDate)"
-}
-
-$violationcounter = 0
+Write-Verbose $prodid
+Write-Verbose $codDomain
 
 try {
     $null = Convert-ExactDate $startDate
     $null = Convert-ExactDate $endDate
-
-    Write-Log "Start to handle device log analysis!" -LogFilePath $logFilePath
-    # get system id cert from windows server
-    $sysid_cert = Get-Cert -KeyName $prodid
-    # get vault secret correctly
-    $vault_secret = Get-VaultSecret -VaultServer $vault_server -VaultEnv $vaultEnv -Eonid "309843" -KeyName $prodid -SysIdCert $sysid_cert
-    $idSecret = New-Object System.Net.NetworkCredential($idName, $vault_secret, $Domain)
-    # build up Ladp lazy connection
-    $lazyConn = New-LazyLdapConnection -Server $ldapServer -Port 363 -Credential $idSecret
-    # start to do export data
-    $deviceData = Import-Csv -Path $tempLogPath -Encoding UTF8
-    $filterIds = ($deviceData.Account.ToLower().Trim() | Sort-Object -Unique) -join ';'
-    $cNamelookup = Get-LdapUserById -LazyConnection $lazyConn -UserId $filterIds
 }
 catch {
-    Write-Log "Failed during LDAP connection or Export CSV data: $_" -LogFilePath $logFilePath
-    return
-}
-finally {
-    if ($lazyConn) {
-        Close-LazyLdapConnection -lazy $lazyConn
-    }
+    throw 'Invalid date format. Both startDate and endDate must be in yyyyMMdd format.'
 }
 
-# process Device data log
-foreach ($record in $deviceData) {
-    $platform = $record.Platform.ToLower().Trim()
-    if ($platform -eq 'ios(iphone)') { continue }
-    $userId = $record.Account.ToLower().Trim()
-    if ($cNamelookup.Valid.ContainsKey($userId)) {
-        $division = $cNamelookup.Valid[$userId].Division
-        $department = $record.Department.split('/')[1]
-        # convert to englist if its mandarin
-        $status = if ($record.Status -eq '使用') { 'Used' } else { $record.Status }
-        if ($BU -eq 'MSMS' -and $msmsDivisionScope -contains $division) {
-            $msViolationCollection += [PSCustomObject]@{
-                Time         = $record.Time
-                Name         = $record.Name
-                Account      = $record.Account
-                Department   = $department
-                Status       = $status
-                'LastUsedOn' = $record.'Last Used on'
-                Platform     = $record.Platform
-                Division     = $division
-            }
-            $violationcounter += 1
-        }
-        elseif ($BU -eq 'MSBIC' -and $division -eq $msbicDivision) {
-            $msbicViolationCollection += [PSCustomObject]@{
-                Time         = $record.Time
-                Name         = $record.Name
-                Account      = $record.Account
-                Department   = $department
-                Status       = $status
-                'LastUsedOn' = $record.'Last Used on'
-                Platform     = $record.Platform
-                Division     = $msbicDivision
-            }
-            $violationcounter += 1
-        }
-        else {
-            Write-Log "No macthing divsion condition for UserId: ${userId} in Record item: ${record}" -LogFilePath $logFilePath
-        }
-    }
-    else {
-        Write-Log "Invalid UserId found: ${userId} in Record item: ${record}" -LogFilePath $logFilePath
-    }
-}
-
-if ($violationcounter -eq 0) {
-    Write-Host "No Violation Usages found" -ForegroundColor Green
-    Write-Log "No Violation Usages found" -LogFilePath $LogFilePath
-    $htmlBody = New-HtmlBody -TableHtml "" -ViolationContent "" -NoViolationContent $noViolationContent -HasViolation:$false
-    Save-AnalysisSummary -HasViolation $false -ViolationDivisionCount 0 -ViolationRecordCount 0
-
-    if ($BU -eq 'MSMS') {
-        # noviolation of MSMS
-        $BuContacter = $MsNoviolationRecipients
-    }
-    else {
-        # noviolation of MSBIC
-        $BuContacter = $MsbicBuContacter
-    }
-
-    Send-Mail -From $prodid -To $BuContacter -Cc $CcContacter -Subject $Subject `
-        -Body $htmlBody -SmtpServer $smtp_server -KeyName $prodid -Cert $sysid_cert -Port 2587 -LogFilePath $logFilePath
-
-    if ($DeleteInputAfterAnalysis) {
-        Remove-Item -Path $tempLogPath -Force
-    }
-    return
+$destFolder = Export-AnalysisReport -LogFilePath $mailLogFilePath
+$logFilePath = if ($TaskOutputDirectory) {
+    Join-Path $destFolder 'task.log'
 }
 else {
-    # violation records in MSMS
-    if ($msViolationCollection.Count -gt 0) {
-        $msmsViolationsByBU = $msViolationCollection | Group-Object 'Division' -AsHashTable
-        Save-AnalysisSummary -HasViolation $true -ViolationDivisionCount $msmsViolationsByBU.Keys.Count -ViolationRecordCount $msViolationCollection.Count
-        Write-Verbose "MSMS Violation Founds"
-        $msViolationCollection | Export-Csv -Path $destFilePath -NoTypeInformation -Encoding UTF8 -Force
-        Write-Log "Violation Usage In MSMS found" -LogFilePath $logFilePath
-        foreach ($BuItem in $msmsViolationsByBU.Keys + ($MSBURecipients.Keys | Where-Object { $_ -notin $msmsViolationsByBU.Keys })) {
-            $BuContacter = $MSBURecipients[$BuItem]
-            $hasViolation = $msmsViolationsByBU.ContainsKey($BuItem)
-            if ($hasViolation) {
-                Write-Verbose $BuItem
-                $rowsHtml = $msmsViolationsByBU[$BuItem] | Select-Object @{ Name = 'DateTime(HKT)'; Expression = { "$($_.Time)" } }, Name, Account, Department, Status, LastUsedOn, Platform, Division | ConvertTo-Html -Fragment
-                $tableHtml = @"
-<table>
-    $rowsHtml
-</table>
-"@
-                $htmlBody = New-HtmlBody -TableHtml $tableHtml -ViolationContent $DeviceViolationContent -NoViolationContent "" -HasViolation:$true
-                Send-Mail -From $prodid -To $BuContacter -Cc $CcContacter -Subject $Subject `
-                    -Body $htmlBody -SmtpServer $smtp_server -KeyName $prodid -Cert $sysid_cert -Port 2587 -LogFilePath $logFilePath
+    Get-LogFilePath -Directory $destFolder -BaseName 'AnalysisLog'
+}
+$subject = "COD WeCom Mail Data Leakage Manual Review - from ${startDate} to ${endDate}"
+$mailNoViolationContent = 'The purpose of this email is to provide information on users in your business unit(BU) that have sent emails externally via WeCom Mail for the reporting period. There were <b>no violations</b> to report this reporting period for your BU.<br/><br/>'
+$mailViolationContent = 'The purpose of this email is to provide information on users in your business unit(BU) that have sent emails externally via WeCom Mail for the reporting period. Violations were sent from WeCom Mail to both a non-MS email and an invalid MS email, as these cases are not allowed. The violation record(s) of this reporting period for your BU as below:'
+
+try {
+    $csvData = @(Import-Csv -Path $mailLogFilePath -Encoding UTF8 -Delimiter ',')
+}
+catch {
+    throw "Failed to import csv file: $mailLogFilePath"
+}
+
+if (-not $csvData) {
+    throw "Input mail log file is empty: $mailLogFilePath"
+}
+
+$columnMap = Resolve-MailColumns -CsvData $csvData
+
+$receivers = @(
+    $csvData |
+        ForEach-Object { Get-RowValue -Row $_ -ColumnName $columnMap.Recipient } |
+        ForEach-Object {
+            if ($_ -is [string]) {
+                $_ -split ';|,| ' | Where-Object { $_ }
             }
-            else {
-                Write-Verbose $BuItem
-                Write-Verbose "this BU has no violations, send normal mail"
-                $htmlBody = New-HtmlBody -TableHtml "" -ViolationContent "" -NoViolationContent $NoViolationContent -HasViolation:$false
-                Send-Mail -From $prodid -To $BuContacter -Cc $CcContacter -Subject $Subject `
-                    -Body $htmlBody -SmtpServer $smtp_server -KeyName $prodid -Cert $sysid_cert -Port 2587 -LogFilePath $logFilePath
+        } |
+        ForEach-Object { $_.Trim().ToLower() } |
+        Sort-Object -Unique
+)
+
+$senders = @(
+    $csvData |
+        ForEach-Object { Get-RowValue -Row $_ -ColumnName $columnMap.Sender } |
+        ForEach-Object {
+            if ($_ -is [string]) {
+                $_ -split ';|,| ' | Where-Object { $_ }
             }
+        } |
+        ForEach-Object { $_.Trim().ToLower() } |
+        Sort-Object -Unique
+)
+
+$receiverAddrs = @($receivers | Where-Object { $_ -match $internalDomain })
+$senderAddrs = @($senders | Where-Object { $_ -match $txmailFilter } | ForEach-Object { $_ -replace '@.*$', $codDomain })
+
+$ldapConn = [System.Lazy[System.DirectoryServices.Protocols.LdapConnection]]::new({
+    $server = 'localhost'
+    $ldap = [System.DirectoryServices.Protocols.LdapConnection]::new($server)
+    $ldap.AuthType = [System.DirectoryServices.Protocols.AuthType]::Negotiate
+    $ldap.SessionOptions.ProtocolVersion = 3
+    $ldap.Bind()
+    return $ldap
+})
+
+$recevierslookup = Get-LdapUserByMail -lazyConnection $ldapConn -mailAdds $receiverAddrs
+$sendersLookup = Get-LdapUserByMail -lazyConnection $ldapConn -mailAdds $senderAddrs
+
+if (@($receivers).Count -eq 0 -or @($senders).Count -eq 0) {
+    Write-Log -LogString 'Receivers or senders are empty after normalization.' -LogFilePath $logFilePath
+    Write-Host 'Receivers or senders are empty after normalization, please check the mail addresses.' -ForegroundColor Yellow
+    Save-AnalysisSummary -HasViolation $false -ViolationDivisionCount 0 -AnalysisType 'Mail'
+    return
+}
+
+$groupedMap = @{}
+foreach ($row in $csvData) {
+    $timeValue = Get-RowValue -Row $row -ColumnName $columnMap.Time
+    $subjectValue = Get-RowValue -Row $row -ColumnName $columnMap.Subject
+    $senderValue = ((Get-RowValue -Row $row -ColumnName $columnMap.Sender) -split ';|,| ' | Where-Object { $_ } | Select-Object -First 1) -as [string]
+    $recipientList = @((Get-RowValue -Row $row -ColumnName $columnMap.Recipient) -split ';|,| ' | Where-Object { $_ } | ForEach-Object { $_.Trim().ToLower() })
+    $statusValue = Get-RowValue -Row $row -ColumnName $columnMap.Status
+    if (-not $senderValue) {
+        continue
+    }
+
+    $senderValue = $senderValue.Trim().ToLower()
+    $groupKey = "$timeValue|$subjectValue|$senderValue"
+    if (-not $groupedMap.ContainsKey($groupKey)) {
+        $groupedMap[$groupKey] = [PSCustomObject]@{
+            Time       = $timeValue
+            Subject    = $subjectValue
+            Sender     = $senderValue
+            Recipients = @()
+            Status     = $statusValue
         }
     }
 
-    # violation records in MSBIC
-    if ($msbicViolationCollection.Count -gt 0) {
-        Save-AnalysisSummary -HasViolation $true -ViolationDivisionCount 1 -ViolationRecordCount $msbicViolationCollection.Count
-        $msbicViolationCollection | Export-Csv -Path $destFilePath -NoTypeInformation -Encoding UTF8 -Force
-        Write-Log "Violation Usage In MSBIC found" -LogFilePath $logFilePath
-        $rowsHtml = $msbicViolationCollection | Select-Object @{ Name = 'DateTime(HKT)'; Expression = { "$($_.Time)" } }, Name, Account, Department, Status, LastUsedOn, Platform, Division | ConvertTo-Html -Fragment
+    $groupedMap[$groupKey].Recipients += $recipientList
+}
+
+$violationFlag = $false
+$violationCollection = @()
+$destFilePath = Join-Path $destFolder 'report.csv'
+
+foreach ($item in $groupedMap.Values) {
+    $item.Recipients = @($item.Recipients | Sort-Object -Unique)
+    $groupRec = @($item.Recipients)
+    if ($groupRec.Count -eq 0) {
+        continue
+    }
+
+    $nonInternal = @($groupRec | Where-Object { $_ -notmatch $internalDomain })
+    $internalAddr = @($groupRec | Where-Object { $_ -match $internalDomain })
+    if (@($nonInternal).Count -gt 0) {
+        $invalidInternals = @($internalAddr | Where-Object { $recevierslookup.Invalid.Contains($_) })
+        Write-Log -LogString "The records contain external domain are : $($groupRec -join ';')" -LogFilePath $logFilePath
+
+        if (@($internalAddr).Count -gt 0 -and @($invalidInternals).Count -eq @($internalAddr).Count) {
+            $violationFlag = $true
+
+            if ($item.Sender -match $txmailFilter) {
+                $wecomAddr = $item.Sender -replace '@.*$', $codDomain
+                if ($sendersLookup.Valid[$wecomAddr]) {
+                    $division = $sendersLookup.Valid[$wecomAddr].Division
+                    if ($division -and $contactDivision -contains $division) {
+                        $violationCollection += [PSCustomObject]@{
+                            DateTime   = $item.Time
+                            Subject    = $item.Subject
+                            Sender     = $item.Sender
+                            Recipients = ($item.Recipients -join ';')
+                            Status     = $item.Status
+                            Division   = $division
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+if (-not $violationFlag) {
+    Write-Host 'No violation happened' -ForegroundColor Green
+    Write-Log -LogString 'Completed mail log analysis without violation founded' -LogFilePath $logFilePath
+    Save-AnalysisSummary -HasViolation $false -ViolationDivisionCount 0 -AnalysisType 'Mail'
+    $htmlBody = New-HtmlBody -TableHtml '' -ViolationContent '' -NoViolationContent $mailNoViolationContent -HasViolation $false
+    Send-Mail -From $prodid -To $noViolationRecipients -Cc ($ccContacter -join ';') -Subject $subject `
+        -Body $htmlBody -SmtpServer $smtp_server -KeyName $prodid -Cert (Get-Cert -KeyName $sysid_cert) -Port 2587 -LogFilePath $logFilePath
+    return
+}
+
+Write-Host "mail violations file path: $destFilePath"
+Write-Log -LogString 'Completed mail log analysis with violation founded' -LogFilePath $logFilePath
+$violationCollection | Export-Csv -Path $destFilePath -NoTypeInformation -Encoding UTF8 -Force
+$violationsByBU = $violationCollection | Group-Object 'Division' -AsHashTable
+Save-AnalysisSummary -HasViolation $true -ViolationDivisionCount $violationsByBU.Keys.Count -AnalysisType 'Mail'
+
+foreach ($bu in $BURecipients.Keys) {
+    $BuContacter = $BURecipients[$bu]
+    $hasViolation = $violationsByBU.ContainsKey($bu)
+    if ($hasViolation) {
+        Write-Verbose $bu
+        $rowsHtml = $violationsByBU[$bu] | Select-Object `
+            'DateTime', 'Subject', 'Sender', 'Recipients', 'Status', 'Division' | ConvertTo-Html -Fragment
         $tableHtml = @"
 <table>
     $rowsHtml
 </table>
 "@
-        $htmlBody = New-HtmlBody -TableHtml $tableHtml -ViolationContent $DeviceViolationContent -NoViolationContent "" -HasViolation:$true
-        Send-Mail -From $prodid -To $MsbicBuContacter -Cc $CcContacter -Subject $Subject `
-            -Body $htmlBody -SmtpServer $smtp_server -KeyName $prodid -Cert $sysid_cert -Port 2587 -LogFilePath $logFilePath
+        $htmlBody = New-HtmlBody -TableHtml $tableHtml -ViolationContent $mailViolationContent -NoViolationContent '' -HasViolation $true
+        Send-Mail -From $prodid -To $BuContacter -Cc ($ccContacter -join ';') -Subject $subject `
+            -Body $htmlBody -SmtpServer $smtp_server -KeyName $prodid -Cert (Get-Cert -KeyName $sysid_cert) -Port 2587 -LogFilePath $logFilePath
     }
-}
-
-if ($DeleteInputAfterAnalysis) {
-    Remove-Item -Path $tempLogPath -Force
+    else {
+        Write-Verbose $bu
+        Write-Verbose 'this BU has no violations, send normal mail'
+        $htmlBody = New-HtmlBody -TableHtml '' -ViolationContent '' -NoViolationContent $mailNoViolationContent -HasViolation $false
+        Send-Mail -From $prodid -To $BuContacter -Cc ($ccContacter -join ';') -Subject $subject `
+            -Body $htmlBody -SmtpServer $smtp_server -KeyName $prodid -Cert (Get-Cert -KeyName $sysid_cert) -Port 2587 -LogFilePath $logFilePath
+    }
 }
