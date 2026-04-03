@@ -1,21 +1,39 @@
+```mermaid
 flowchart TD
-    A[Start validation] --> B[Resolve analysis summary<br/>AnalysisSummaryPath / RunId / DateRange / LatestPointer]
-    B --> C[Load analysisSummary and taskSummaries]
-    C --> D[Build relatedRuns by same StartDate + EndDate]
-    D --> E{dynamicSummaryTaskNames.Count > 0<br/>and relatedRuns.Count > 0 ?}
+    A[Start] --> B[dateParametersProvided = ParameterSetName == DateRange]
+    B --> C{Resolve analysis summary path}
+    C -->|AnalysisSummaryPath provided| C1[resolutionMode = AnalysisSummaryPath]
+    C -->|else if RunId provided| C2[resolutionMode = RunId]
+    C -->|else if dateParametersProvided| C3[resolutionMode = DateRangeAutoDiscovery]
+    C -->|else| C4[Try LatestRunPointer then AutoDiscovery]
 
-    E -- Yes --> F[Get-MergedTaskSummaries<br/>from related runs]
-    E -- No --> G[Use current run taskSummaries only]
+    C1 --> D[resolvedAnalysisSummaryPath]
+    C2 --> D
+    C3 --> D
+    C4 --> D
 
-    F --> H[Collect usedRunIds = unique RunId<br/>from mergedSummaryData.TaskSources]
-    G --> H2[usedRunIds = empty]
-    H2 --> I[Get selectedRunId<br/>analysisSummary.RunId else runFolder name]
-    H --> I
+    D --> E{resolvedAnalysisSummaryPath exists?}
+    E -->|Yes| F[Load analysisSummary and taskSummaries]
+    E -->|No| G[Create standalone validation run folder]
+    F --> H[Compute dynamicSummaryTaskNames]
+    G --> H
 
-    I --> J{usedRunIds.Count > 1 ?}
-    J -- Yes --> K[validationMode = aggregated]
-    J -- No --> L{usedRunIds.Count == 1<br/>and selectedRunId exists<br/>and usedRunIds[0] != selectedRunId ?}
-    L -- Yes --> K
-    L -- No --> M[validationMode = single-run]
-    J -- No --> L
+    H --> I[relatedRuns = Get-RelatedAnalysisRuns by startDate/endDate]
+    I --> J{dynamicSummaryTaskNames count gt 0 and relatedRuns count gt 0}
+    J -->|Yes| K[mergedSummaryData = Get-MergedTaskSummaries]
+    J -->|No| L[mergedSummaryData = taskSummaries + empty TaskSources]
 
+    K --> M[usedRunIds = unique RunId from mergedSummaryData.TaskSources]
+    L --> M
+    M --> N[selectedRunId from analysisSummary RunId or run folder name]
+
+    N --> O{usedRunIds count gt 1}
+    O -->|Yes| P[validationMode = aggregated]
+    O -->|No| Q{usedRunIds count eq 1 and selectedRunId exists and first usedRunId differs}
+    Q -->|Yes| P
+    Q -->|No| R[validationMode = single-run]
+
+    P --> S[Write summary and validation artifacts]
+    R --> S
+
+```
