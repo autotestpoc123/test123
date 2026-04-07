@@ -1,1 +1,385 @@
+# Angular 升级指南：17 → 18 → 19
 
+> **项目**: daft  
+> **当前版本**: Angular 17.3.x  
+> **目标版本**: Angular 19.x  
+> **当前环境**: Node 20.19.4 / npm 10.8.2 / Angular CLI 18.2.21 (全局)
+
+---
+
+## 目录
+
+1. [升级原则](#1-升级原则)
+2. [环境要求对照表](#2-环境要求对照表)
+3. [第三方依赖兼容性](#3-第三方依赖兼容性)
+4. [升级前准备](#4-升级前准备)
+5. [第一阶段：Angular 17 → 18](#5-第一阶段angular-17--18)
+6. [第二阶段：Angular 18 → 19](#6-第二阶段angular-18--19)
+7. [升级后验证清单](#7-升级后验证清单)
+8. [常见问题与解决方案](#8-常见问题与解决方案)
+9. [注意事项总结](#9-注意事项总结)
+
+---
+
+## 1. 升级原则
+
+- **必须逐版本升级**：17 → 18 → 19，不能跳版本。每个大版本的 `ng update` 包含专属的 schematic 迁移脚本，跳版本会导致迁移不完整。
+- **每次升级后都要构建、测试**：确认无误后再 Git commit，然后继续下一个版本的升级。
+- **参考官方升级指南**：https://angular.dev/update-guide — 选择对应的版本和复杂度。
+
+---
+
+## 2. 环境要求对照表
+
+| 项目 | Angular 17 | Angular 18 | Angular 19 |
+|---|---|---|---|
+| **Node.js** | ^18.13.0 \|\| ^20.9.0 | ^18.19.0 \|\| ^20.11.0 \|\| ^22.0.0 | ^18.19.1 \|\| ^20.11.1 \|\| ^22.0.0 |
+| **TypeScript** | >=5.2.0 <5.5.0 | >=5.4.0 <5.6.0 | >=5.5.0 <5.7.0 |
+| **RxJS** | ^6.5.3 \|\| ^7.4.0 | ^6.5.3 \|\| ^7.4.0 | ^6.5.3 \|\| ^7.4.0 |
+| **Zone.js** | ~0.14.0 | ~0.14.0 | ~0.15.0 |
+
+> **当前 Node 20.19.4 满足所有三个版本要求，无需升级 Node。**
+
+---
+
+## 3. 第三方依赖兼容性
+
+以下是 `package.json` 中关键第三方依赖的版本映射：
+
+| 依赖包 | 当前版本 | Angular 18 兼容版本 | Angular 19 兼容版本 |
+|---|---|---|---|
+| `@ng-bootstrap/ng-bootstrap` | ^16.0.0 | **^17.0.0** (for Angular 18) | **^18.0.0** (for Angular 19) |
+| `ngx-bootstrap` | ^12.0.0 | 需确认（检查发布说明） | 需确认（检查发布说明） |
+| `@angular/material` | ^17.3.10 | **^18.0.0** | **^19.0.0** |
+| `angular-auth-oidc-client` | 18.0.2 | 18.0.2（支持 Angular 18） | **^19.0.0** 或 保持 18.0.2 尝试 |
+| `xlsx` | ^0.18.5 | ^0.18.5（无 Angular 绑定） | ^0.18.5（无 Angular 绑定） |
+| `file-saver` | ^2.0.5 | ^2.0.5（无 Angular 绑定） | ^2.0.5（无 Angular 绑定） |
+| `print-js` | ^1.6.0 | ^1.6.0（无 Angular 绑定） | ^1.6.0（无 Angular 绑定） |
+| `date-fns` | ^3.6.0 | ^3.6.0（无 Angular 绑定） | ^3.6.0（无 Angular 绑定） |
+
+### 需要特别关注的包
+
+- **`popper.js`** (^1.16.1)：已 deprecated，被 `@popperjs/core` 取代。项目中已有 `@popperjs/core`，建议移除 `popper.js`。
+- **`datejs`** (^0.0.2)：已 deprecated，建议逐步迁移到 `date-fns`（项目中已引入）。
+- **`jquery`** (^3.7.1) + **`@types/jquery`**：在 Angular 应用中不推荐使用，但升级不会破坏，后续可考虑移除。
+- **`underscore`** (^1.13.7)：同理，`lodash` 或原生 JS 方法更适合，但升级不会破坏。
+- **`font-awesome`** (^4.7.0)：非常老的版本，建议后续迁移到 `@fortawesome/angular-fontawesome`，但升级不会破坏。
+
+---
+
+## 4. 升级前准备
+
+### 4.1 确保 Git 工作区干净
+
+```bash
+git status
+# 确认在 upgrade/angular-19 分支上
+# commit 或 stash 所有未提交的改动
+```
+
+### 4.2 确保当前版本可以正常构建和运行
+
+```bash
+npm install
+ng build
+ng test          # 如果有单元测试
+ng serve --configuration=local --port=3600
+```
+
+> 如果当前版本都无法构建成功，先修复后再开始升级。
+
+### 4.3 备份
+
+```bash
+# 备份 package.json 和 package-lock.json
+cp package.json package.json.bak
+cp package-lock.json package-lock.json.bak
+```
+
+### 4.4 检查 esbuild override
+
+当前 `package.json` 中有：
+
+```json
+"overrides": {
+  "esbuild": "0.25.5"
+}
+```
+
+这个 override 可能在升级过程中引起冲突。**在每次 `ng update` 之前，暂时移除此 override，升级完成后如果仍然需要再加回来。**
+
+---
+
+## 5. 第一阶段：Angular 17 → 18
+
+### 5.1 更新全局 Angular CLI（可选）
+
+你的全局 CLI 已经是 18.2.21，满足要求。如果想直接升到 18 最新：
+
+```bash
+npm install -g @angular/cli@18
+```
+
+### 5.2 更新 Angular 核心包
+
+```bash
+# 先更新 CLI 和 Core
+ng update @angular/core@18 @angular/cli@18
+```
+
+> 如果遇到 peer dependency 冲突，可以加 `--force`，但务必仔细审查变更。
+
+### 5.3 更新 Angular Material
+
+```bash
+ng update @angular/material@18
+```
+
+#### Angular Material 18 的重要变更
+
+- `mat.define-palette` → `mat.m2-define-palette`
+- `mat.define-typography-config` → `mat.m2-define-typography-config`
+- `mat.define-light-theme` → `mat.m2-define-light-theme`
+- `mat.define-dark-theme` → `mat.m2-define-dark-theme`
+- 颜色 palette 名称变更（如 `mat.red-palette` → `mat.$m2-red-palette`）
+
+如果项目中使用了自定义 Material 主题，需要根据构建报错逐一修改。
+
+### 5.4 更新第三方依赖
+
+```bash
+# ng-bootstrap: 16 → 17（支持 Angular 18）
+npm install @ng-bootstrap/ng-bootstrap@^17.0.0
+
+# angular-auth-oidc-client: 18.0.2 应该兼容 Angular 18，先不动
+
+# ngx-bootstrap: 检查兼容版本
+npm install ngx-bootstrap@latest
+# 如果报错，查看 ngx-bootstrap 的 changelog 确认支持 Angular 18 的版本
+```
+
+### 5.5 手动更新 TypeScript
+
+Angular 18 要求 TypeScript >=5.4.0 <5.6.0：
+
+```bash
+npm install typescript@~5.4.5 --save-dev
+```
+
+### 5.6 更新 angular.json（可选但推荐）
+
+Angular 18 推荐使用新的 `application` builder（基于 esbuild + Vite），构建速度提升可达 70-80%：
+
+```bash
+# 自动迁移到 application builder
+ng update @angular/cli --name use-application-builder
+```
+
+> 这个迁移会修改 `angular.json` 中的 builder 从 `@angular-devkit/build-angular:browser` 改为 `@angular-devkit/build-angular:application`，以及相应的配置项。如果项目有自定义 webpack 配置，可能需要额外处理。
+
+### 5.7 构建和测试
+
+```bash
+# 删除 node_modules 和 lock 文件，重新安装
+rm -rf node_modules package-lock.json
+npm install
+
+# 构建
+ng build
+
+# 运行
+ng serve --configuration=local --port=3600
+
+# 测试
+ng test
+```
+
+### 5.8 提交变更
+
+```bash
+git add .
+git commit -m "chore: upgrade Angular 17 → 18"
+```
+
+---
+
+## 6. 第二阶段：Angular 18 → 19
+
+### 6.1 更新全局 Angular CLI
+
+```bash
+npm install -g @angular/cli@19
+```
+
+### 6.2 更新 Angular 核心包
+
+```bash
+ng update @angular/core@19 @angular/cli@19
+```
+
+### 6.3 更新 Angular Material
+
+```bash
+ng update @angular/material@19
+```
+
+### 6.4 更新 TypeScript
+
+Angular 19 要求 TypeScript >=5.5.0 <5.7.0：
+
+```bash
+npm install typescript@~5.5.4 --save-dev
+```
+
+### 6.5 更新 Zone.js
+
+Angular 19 需要 zone.js ~0.15.0：
+
+```bash
+npm install zone.js@~0.15.0
+```
+
+### 6.6 更新第三方依赖
+
+```bash
+# ng-bootstrap: 17 → 18（支持 Angular 19）
+npm install @ng-bootstrap/ng-bootstrap@^18.0.0
+
+# angular-auth-oidc-client: 升级到 v19 或 v20
+npm install angular-auth-oidc-client@latest
+# 查看迁移指南：https://angular-auth-oidc-client.com/docs/migrations/
+
+# ngx-bootstrap: 升级到兼容 Angular 19 的版本
+npm install ngx-bootstrap@latest
+```
+
+### 6.7 Angular 19 的重大变更
+
+#### 6.7.1 Standalone 组件默认化
+
+Angular 19 中，组件、指令和管道**默认就是 standalone 的**。`ng update` 迁移脚本会自动处理：
+
+- 已有 `standalone: true` 的声明会被移除（因为已是默认值）
+- 仍在 NgModule 中声明的组件需要显式设置 `standalone: false`
+
+**需要检查的点**：确认所有在 NgModule 中 `declarations` 里的组件都被正确标记了 `standalone: false`。
+
+#### 6.7.2 TypeScript 5.5+ 变更
+
+- 更严格的类型推断
+- 部分已 deprecated 的 API 被移除
+
+#### 6.7.3 其他变更
+
+- `provideExperimentalZonelessChangeDetection` 重命名为 `provideZonelessChangeDetection`
+- effect API 的时机变更（如果使用了 Signals）
+- Angular Material 19 中部分 mixin 和属性变更
+
+### 6.8 构建和测试
+
+```bash
+rm -rf node_modules package-lock.json
+npm install
+ng build
+ng serve --configuration=local --port=3600
+ng test
+```
+
+### 6.9 提交变更
+
+```bash
+git add .
+git commit -m "chore: upgrade Angular 18 → 19"
+```
+
+---
+
+## 7. 升级后验证清单
+
+- [ ] `ng build` 成功，无编译错误
+- [ ] `ng build --configuration=production` 生产构建成功
+- [ ] `ng serve` 本地开发服务器正常启动
+- [ ] 所有路由页面能正常导航
+- [ ] OIDC 登录/登出流程正常
+- [ ] Angular Material 组件样式正确显示
+- [ ] ng-bootstrap / ngx-bootstrap 组件正常工作
+- [ ] 文件导出功能正常（xlsx, print-js, file-saver）
+- [ ] `ng test` 单元测试全部通过
+- [ ] 浏览器控制台无新的 deprecation warning 或错误
+
+---
+
+## 8. 常见问题与解决方案
+
+### 8.1 `ng update` 报 peer dependency 冲突
+
+```bash
+# 方案 1: 强制更新（审查变更）
+ng update @angular/core@18 @angular/cli@18 --force
+
+# 方案 2: 手动修改 package.json 中的版本号，然后
+npm install --legacy-peer-deps
+```
+
+### 8.2 tslib 相关错误
+
+如果升级后 `app.module.ts` 出现 tslib 相关错误：
+
+```bash
+npm install tslib@latest
+```
+
+### 8.3 esbuild 相关错误
+
+如果 `overrides` 中的 esbuild 版本与 Angular 要求的版本冲突：
+
+```json
+// 临时移除 overrides
+// "overrides": { "esbuild": "0.25.5" }
+```
+
+然后重新安装。如果 Angular 自带的 esbuild 版本工作正常，可以永久移除此 override。
+
+### 8.4 Angular Material 主题编译错误
+
+常见错误：`Hue "500" does not exist in palette`
+
+解决方案：按照 Angular Material 18 的迁移指南，将 `mat.define-palette` 等函数名替换为带 `m2-` 前缀的版本。
+
+### 8.5 `@angular-devkit/build-angular` 版本显示 `<error>`
+
+这在你的截图中已经出现。这通常是因为全局 CLI 版本和项目本地版本不一致导致的。升级过程中会自动解决。
+
+### 8.6 第三方库不兼容
+
+如果某个第三方库暂不支持目标 Angular 版本：
+
+1. 查看该库的 GitHub Issues 和 Releases 页面
+2. 临时使用 `--force` 或 `--legacy-peer-deps` 安装
+3. 如果库已停止维护，考虑替代方案
+
+---
+
+## 9. 注意事项总结
+
+1. **不要跳版本**：必须 17 → 18 → 19 逐步升级。
+2. **每步都要 commit**：升级后构建成功就立刻提交，方便回退。
+3. **先移除 esbuild override**：在每次 `ng update` 前暂时移除 `"overrides"` 配置。
+4. **TypeScript 版本严格匹配**：每个 Angular 版本对 TypeScript 有明确的上下限，必须手动确认。
+5. **关注 `@ng-bootstrap` 版本映射**：ng-bootstrap 16 → Angular 17, ng-bootstrap 17 → Angular 18, ng-bootstrap 18 → Angular 19。
+6. **`angular-auth-oidc-client`**：当前 18.0.2 版本声称支持到 Angular 19，但建议升级到对应的新版本以获得最佳兼容性。
+7. **deprecated 包清理**：建议借此升级机会移除 `popper.js`（已被 `@popperjs/core` 替代）、`datejs`（迁移到 `date-fns`）。
+8. **`ng update` 会自动运行 schematic 迁移**：会自动修改部分代码（如 standalone 迁移、import 路径变更等），升级后务必 `git diff` 审查所有自动变更。
+9. **生产构建测试**：不要只测 `ng serve`，一定要测试 `ng build --configuration=production`，生产构建的优化和检查更严格。
+10. **保留回退方案**：确保 Git 分支策略允许随时回退到升级前的状态。
+
+---
+
+## 参考资源
+
+- [Angular 官方升级指南](https://angular.dev/update-guide)
+- [Angular 版本兼容性表](https://angular.dev/reference/versions)
+- [Angular CHANGELOG](https://github.com/angular/angular/blob/main/CHANGELOG.md)
+- [Angular Material Breaking Changes (v18)](https://github.com/angular/components/releases/tag/18.0.0)
+- [ng-bootstrap Releases](https://github.com/ng-bootstrap/ng-bootstrap/releases)
+- [angular-auth-oidc-client 迁移文档](https://angular-auth-oidc-client.com/)
