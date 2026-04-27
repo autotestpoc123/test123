@@ -1,20 +1,21 @@
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'LatestRun')]
 param(
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'DateRange')]
     [ValidatePattern('^\d{8}$')]
     [string]$startDate,
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'DateRange')]
     [ValidatePattern('^\d{8}$')]
     [string]$endDate,
-    [ValidateSet('PROD', 'QA')]
-    [string]$env = 'QA',
     [string]$ConfigPath,
-    [ValidateSet('all', 'mail', 'device')]
-    [string]$RunMode = 'all',
-    [string[]]$IncludeBU,
     [string]$OutputRoot,
-    [ValidateSet('FailFast', 'ContinueOnError')]
-    [string]$ExecutionMode
+    [string]$BackupFolder,
+    [Parameter(Mandatory = $true, ParameterSetName = 'SummaryPath')]
+    [string]$AnalysisSummaryPath,
+    [Parameter(Mandatory = $true, ParameterSetName = 'RunId', Position = 0)]
+    [string]$RunId,
+    [ValidateSet('2', '4')]
+    [string]$CurrentRunWeeks,
+    [switch]$FailOnDifference
 )
 
 Set-StrictMode -Version Latest
@@ -22,22 +23,9 @@ $ErrorActionPreference = 'Stop'
 
 $scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $modulePath = Join-Path $scriptRoot 'wecom_analysis_comm.psm1'
-$mailScriptPath = Join-Path $scriptRoot 'wecom_mail_analysis.ps1'
-$deviceAnalysisScriptPath = Join-Path $scriptRoot 'wecom_devicelog_analysis.ps1'
-$importExcelModulePath = Join-Path $scriptRoot 'modules\ImportExcel'
-$supportedDeviceBUs = @('MSMS', 'MSBIC')
 
 if (-not (Test-Path $modulePath -PathType Leaf)) {
     throw "Required module not found: $modulePath"
-}
-if (-not (Test-Path $mailScriptPath -PathType Leaf)) {
-    throw "Mail analysis script not found: $mailScriptPath"
-}
-if (-not (Test-Path $deviceAnalysisScriptPath -PathType Leaf)) {
-    throw "Device analysis script not found: $deviceAnalysisScriptPath"
-}
-if (-not (Test-Path $importExcelModulePath -PathType Container)) {
-    throw "ImportExcel module not found: $importExcelModulePath"
 }
 
 Import-Module $modulePath -Force
@@ -47,17 +35,10 @@ if (-not (Test-Path $ConfigPath -PathType Leaf)) {
     throw "Config file not found: $ConfigPath"
 }
 
-$null = Convert-ExactDate $startDate
-$null = Convert-ExactDate $endDate
-
 $config = Import-PowerShellDataFile -Path $ConfigPath
-if (-not $config.Tasks -or $config.Tasks.Count -eq 0) {
-    throw "No tasks were found in config: $ConfigPath"
-}
-
-$effectiveExecutionMode = if ($ExecutionMode) { $ExecutionMode } elseif ($config.ExecutionMode) { [string]$config.ExecutionMode } else { 'FailFast' }
-if ($effectiveExecutionMode -notin @('FailFast', 'ContinueOnError')) {
-    throw "Unsupported ExecutionMode '$effectiveExecutionMode'."
+$backupValidationConfig = Get-BackupValidationConfig -Config $config
+if (-not $backupValidationConfig) {
+    throw "BackupValidation configuration not found in config: $ConfigPath"
 }
 
 $resolvedOutputRoot = Resolve-AuditOutputRoot -OutputRoot $OutputRoot -Config $config -ConfigPath $ConfigPath
@@ -66,402 +47,601 @@ if (-not (Test-Path $resolvedOutputRoot)) {
     New-Item -Path $resolvedOutputRoot -ItemType Directory -Force | Out-Null
 }
 
+$resolvedBackupFolder = $null
+
 $runsRoot = Join-Path $resolvedOutputRoot 'runs'
 New-Item -Path $runsRoot -ItemType Directory -Force | Out-Null
-$runId = Get-Date -Format 'yyyyMMdd_HHmmss'
-$runFolder = Join-Path $runsRoot $runId
-$tasksRoot = Join-Path $runFolder 'tasks'
-New-Item -Path $runFolder -ItemType Directory -Force | Out-Null
-New-Item -Path $tasksRoot -ItemType Directory -Force | Out-Null
-
-$logFilePath = Join-Path $runFolder 'workflow.log'
-$runSummaryPath = Join-Path $runFolder 'run-summary.json'
-$runSummaryTextPath = Join-Path $runFolder 'run-summary.txt'
 $latestRunPointerPath = Join-Path $runsRoot 'latest-run.json'
-$normalizedIncludeBU = @()
-if ($IncludeBU) {
-    $normalizedIncludeBU = @(
-        $IncludeBU |
-            Where-Object { $_ } |
-            ForEach-Object { $_.Trim().ToUpperInvariant() } |
-            Where-Object { $_ }
-    )
-}
 
-$dateTokens = New-DateTokenMap -StartDate $startDate -EndDate $endDate
-$configuredInputRoot = Resolve-AuditInputRoot -Config $config
-$dateTokens.InputRoot = $configuredInputRoot
-
-function Get-TaskTypeSelected {
+function Get-OptionalPropertyValue {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$TaskType,
+        [object]$InputObject,
         [Parameter(Mandatory = $true)]
-        [string]$SelectedMode
+        [string]$PropertyName
     )
 
-    switch ($SelectedMode) {
-        'all' { return $true }
-        'mail' { return $TaskType -eq 'mail' }
-        'device' { return $TaskType -eq 'device' }
-        default { return $false }
+    return Get-OptionalObjectPropertyValue -InputObject $InputObject -PropertyName $PropertyName
+}
+
+function Resolve-AnalysisSummaryPathFromRunId {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RunsRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$RunId
+    )
+
+    $runFolder = Join-Path $RunsRoot $RunId
+    if (-not (Test-Path -LiteralPath $runFolder -PathType Container)) {
+        throw "Run folder not found for RunId '$RunId': $runFolder"
     }
-}
 
-function New-TaskResult {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Name,
-        [Parameter(Mandatory = $true)]
-        [string]$Type,
-        [string]$BU,
-        [Parameter(Mandatory = $true)]
-        [string]$Status,
-        [string]$InputFilePath,
-        [string]$TaskFolder = $null,
-        [string]$TaskLogPath = $null,
-        [string]$ReportPath = $null,
-        [string]$SummaryPath = $null,
-        [string]$Message
-    )
-
-    return [PSCustomObject]@{
-        Name          = $Name
-        Type          = $Type
-        BU            = $BU
-        Status        = $Status
-        InputFilePath = $InputFilePath
-        TaskFolder    = $TaskFolder
-        TaskLogPath   = $TaskLogPath
-        ReportPath    = $ReportPath
-        SummaryPath   = $SummaryPath
-        Message       = $Message
+    foreach ($fileName in @('run-summary.json', 'configured-analysis-summary.json', 'configured_analysis_summary.json')) {
+        $summaryPath = Join-Path $runFolder $fileName
+        if (Test-Path -LiteralPath $summaryPath -PathType Leaf) {
+            return $summaryPath
+        }
     }
+
+    throw "No supported analysis summary file was found under run folder: $runFolder"
 }
 
-function Get-SafeTaskToken {
+function Resolve-AnalysisSummaryPathFromLatestPointer {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Text
+        [string]$PointerPath
     )
 
-    return (($Text -replace '[^a-zA-Z0-9_-]', '_').Trim('_'))
-}
-
-function Get-ExistingArtifactPath {
-    param(
-        [string]$Path
-    )
-
-    if (-not $Path) {
+    if (-not (Test-Path -LiteralPath $PointerPath -PathType Leaf)) {
         return $null
     }
 
-    if (Test-Path -LiteralPath $Path -PathType Leaf) {
-        return $Path
+    $pointerData = Get-Content -LiteralPath $PointerPath -Raw | ConvertFrom-Json
+    $runSummaryPath = Get-OptionalPropertyValue -InputObject $pointerData -PropertyName 'RunSummaryPath'
+    if ($runSummaryPath -and (Test-Path -LiteralPath $runSummaryPath -PathType Leaf)) {
+        return [PSCustomObject]@{
+            RunSummaryPath = [string]$runSummaryPath
+            BackupFolder   = [string](Get-OptionalPropertyValue -InputObject $pointerData -PropertyName 'BackupFolder')
+        }
     }
 
     return $null
 }
 
-function Write-LatestRunPointer {
+function Resolve-LatestAnalysisSummaryPath {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$PointerPath,
-        [Parameter(Mandatory = $true)]
-        [string]$RunId,
-        [Parameter(Mandatory = $true)]
-        [string]$RunFolder,
-        [Parameter(Mandatory = $true)]
-        [string]$RunSummaryPath,
-        [Parameter(Mandatory = $true)]
-        [string]$RunSummaryTextPath,
-        [Parameter(Mandatory = $true)]
+        [string]$RunsRoot,
         [string]$StartDate,
-        [Parameter(Mandatory = $true)]
-        [string]$EndDate,
-        [string]$RunStatus = 'Unknown'
+        [string]$EndDate
     )
 
-    $pointer = [PSCustomObject]@{
-        RunId              = $RunId
-        RunFolder          = $RunFolder
-        RunSummaryPath     = $RunSummaryPath
-        RunSummaryTextPath = $RunSummaryTextPath
-        StartDate          = $StartDate
-        EndDate            = $EndDate
-        RunStatus          = $RunStatus
-        UpdatedAt          = (Get-Date).ToString('o')
+    if (-not (Test-Path $RunsRoot -PathType Container)) {
+        return $null
     }
 
-    $pointer | ConvertTo-Json -Depth 5 | Set-Content -Path $PointerPath -Encoding UTF8
-}
-
-function Format-RunSummaryText {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RunId,
-        [Parameter(Mandatory = $true)]
-        [string]$RunFolder,
-        [Parameter(Mandatory = $true)]
-        [string]$WorkflowLogPath,
-        [Parameter(Mandatory = $true)]
-        [string]$StartDate,
-        [Parameter(Mandatory = $true)]
-        [string]$EndDate,
-        [Parameter(Mandatory = $true)]
-        [object[]]$Tasks,
-        [string]$RunStatus,
-        [string]$ErrorMessage
+    $candidates = New-Object 'System.Collections.Generic.List[object]'
+    $candidateFiles = @(
+        Get-ChildItem -LiteralPath $RunsRoot -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -in @('run-summary.json', 'configured-analysis-summary.json', 'configured_analysis_summary.json') -and
+                $_.DirectoryName -notmatch '[\\/]validation(?:_[^\\/]+)?(?:[\\/]|$)'
+            } |
+            Sort-Object LastWriteTime -Descending
     )
 
-    $lines = New-Object 'System.Collections.Generic.List[string]'
-    $lines.Add('WeCom Audit Run Summary')
-    $lines.Add("RunId: $RunId")
-    $lines.Add("Date Range: $StartDate - $EndDate")
-    $lines.Add("Run Folder: $RunFolder")
-    $lines.Add("Workflow Log: $WorkflowLogPath")
-    if ($RunStatus) { $lines.Add("Run Status: $RunStatus") }
-    if ($ErrorMessage) {
-        $lines.Add("Error: $ErrorMessage")
-    }
-    $lines.Add('')
-    $lines.Add('Tasks:')
-    foreach ($task in $Tasks) {
-        $taskName = Get-OptionalObjectPropertyValue -InputObject $task -PropertyName 'Name'
-        $taskStatus = Get-OptionalObjectPropertyValue -InputObject $task -PropertyName 'Status'
-        $reportPath = Get-OptionalObjectPropertyValue -InputObject $task -PropertyName 'ReportPath'
-        $summaryPath = Get-OptionalObjectPropertyValue -InputObject $task -PropertyName 'SummaryPath'
-        $taskLogPath = Get-OptionalObjectPropertyValue -InputObject $task -PropertyName 'TaskLogPath'
-        $taskMessage = Get-OptionalObjectPropertyValue -InputObject $task -PropertyName 'Message'
-
-        $lines.Add(("- {0}: {1}" -f $taskName, $taskStatus))
-        if ($reportPath) {
-            $lines.Add("  Report: $reportPath")
-        }
-        if ($summaryPath) {
-            $lines.Add("  Summary: $summaryPath")
-        }
-        if ($taskLogPath) {
-            $lines.Add("  Task Log: $taskLogPath")
-        }
-        if ($taskMessage) {
-            $lines.Add("  Message: $taskMessage")
-        }
-    }
-
-    return ($lines -join [Environment]::NewLine)
-}
-
-function Write-RunSummary {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RunId,
-        [Parameter(Mandatory = $true)]
-        [string]$StartDate,
-        [Parameter(Mandatory = $true)]
-        [string]$EndDate,
-        [Parameter(Mandatory = $true)]
-        [string]$RunFolder,
-        [Parameter(Mandatory = $true)]
-        [string]$LogFilePath,
-        [Parameter(Mandatory = $true)]
-        [string]$SummaryPath,
-        [Parameter(Mandatory = $true)]
-        [string]$SummaryTextPath,
-        [Parameter(Mandatory = $true)]
-        [string]$PointerPath,
-        [Parameter(Mandatory = $true)]
-        [object[]]$TaskResults,
-        [string]$RunStatus,
-        [string]$ErrorMessage
-    )
-
-    $summary = [PSCustomObject]@{
-        StartDate     = $StartDate
-        EndDate       = $EndDate
-        Environment   = $env
-        RunMode       = $RunMode
-        IncludeBU     = $normalizedIncludeBU
-        ExecutionMode = $effectiveExecutionMode
-        RunId         = $RunId
-        ConfigPath    = $ConfigPath
-        OutputFolder  = $RunFolder
-        LogFilePath   = $LogFilePath
-        RunStatus     = $RunStatus
-        Tasks         = $TaskResults
-    }
-    if ($ErrorMessage) {
-        $summary | Add-Member -MemberType NoteProperty -Name 'Error' -Value $ErrorMessage
-    }
-    $summary | ConvertTo-Json -Depth 8 | Set-Content -Path $SummaryPath -Encoding UTF8
-    (Format-RunSummaryText -RunId $RunId -RunFolder $RunFolder -WorkflowLogPath $LogFilePath -StartDate $StartDate -EndDate $EndDate -Tasks $TaskResults -RunStatus $RunStatus -ErrorMessage $ErrorMessage) | Set-Content -Path $SummaryTextPath -Encoding UTF8
-    Write-LatestRunPointer -PointerPath $PointerPath -RunId $RunId -RunFolder $RunFolder -RunSummaryPath $SummaryPath -RunSummaryTextPath $SummaryTextPath -StartDate $StartDate -EndDate $EndDate -RunStatus $RunStatus
-}
-
-Assert-TaskNameUniqueness -Tasks ([object[]]$config.Tasks)
-Assert-ConfigInputDirectories -Config $config -Tokens $dateTokens -ConfigPath $ConfigPath
-
-$taskResults = New-Object 'System.Collections.Generic.List[object]'
-$tasksToRun = New-Object 'System.Collections.Generic.List[object]'
-
-foreach ($task in $config.Tasks) {
-    $taskName = [string]$task.Name
-    $taskType = ([string]$task.Type).ToLowerInvariant()
-    $taskBU = if ($task.ContainsKey('BU') -and $task.BU) { ([string]$task.BU).ToUpperInvariant() } else { $null }
-    $taskEnabled = [bool]$task.Enabled
-    $taskInputPath = if ($task.ContainsKey('InputPath')) { [string]$task.InputPath } else { $null }
-
-    if (-not $taskName) {
-        throw 'Every configured task must have a Name.'
-    }
-    if ($taskType -notin @('mail', 'device')) {
-        throw "Task '$taskName' has unsupported Type '$taskType'."
-    }
-
-    if (-not $taskEnabled) {
-        $taskResults.Add((New-TaskResult -Name $taskName -Type $taskType -BU $taskBU -Status 'skipped' -InputFilePath $taskInputPath -TaskFolder $null -TaskLogPath $null -ReportPath $null -SummaryPath $null -Message 'Skipped because Enabled is false.'))
-        continue
-    }
-
-    if (-not (Get-TaskTypeSelected -TaskType $taskType -SelectedMode $RunMode)) {
-        $taskResults.Add((New-TaskResult -Name $taskName -Type $taskType -BU $taskBU -Status 'skipped' -InputFilePath $taskInputPath -TaskFolder $null -TaskLogPath $null -ReportPath $null -SummaryPath $null -Message "Skipped because RunMode '$RunMode' excludes this task type."))
-        continue
-    }
-
-    if ($normalizedIncludeBU.Count -gt 0) {
-        if (-not $taskBU -or $normalizedIncludeBU -notcontains $taskBU) {
-            $taskResults.Add((New-TaskResult -Name $taskName -Type $taskType -BU $taskBU -Status 'skipped' -InputFilePath $taskInputPath -TaskFolder $null -TaskLogPath $null -ReportPath $null -SummaryPath $null -Message 'Skipped because BU filter does not include this task.'))
-            continue
-        }
-    }
-
-    $tasksToRun.Add($task)
-}
-
-$runSummaryArgs = @{
-    RunId       = $runId
-    StartDate   = $startDate
-    EndDate     = $endDate
-    RunFolder   = $runFolder
-    LogFilePath = $logFilePath
-    SummaryPath = $runSummaryPath
-    SummaryTextPath = $runSummaryTextPath
-    PointerPath = $latestRunPointerPath
-}
-
-if ($tasksToRun.Count -eq 0) {
-    Write-RunSummary @runSummaryArgs -TaskResults ([object[]]$taskResults) -RunStatus 'Success'
-    Write-Host "No enabled tasks matched the current filters. Summary path: $runSummaryPath" -ForegroundColor Yellow
-    exit 0
-}
-
-$hasDeviceTasks = @($tasksToRun | Where-Object { ([string]$_.Type).ToLowerInvariant() -eq 'device' }).Count -gt 0
-if ($hasDeviceTasks) {
-    Import-Module $importExcelModulePath -Force
-}
-
-try {
-    Write-Log -LogString "Configured analysis started. Config path: $ConfigPath" -LogFilePath $logFilePath
-    Write-Log -LogString "Run mode: $RunMode; ExecutionMode: $effectiveExecutionMode" -LogFilePath $logFilePath
-
-    foreach ($task in $tasksToRun) {
-        $taskName = [string]$task.Name
-        $taskType = ([string]$task.Type).ToLowerInvariant()
-        $taskBU = if ($task.ContainsKey('BU') -and $task.BU) { ([string]$task.BU).ToUpperInvariant() } else { $null }
-        $taskInputPath = if ($task.ContainsKey('InputPath')) { [string]$task.InputPath } else { $null }
-        $taskToken = Get-SafeTaskToken -Text $taskName
-        $taskFolder = Join-Path $tasksRoot $taskToken
-        New-Item -Path $taskFolder -ItemType Directory -Force | Out-Null
-        $summaryPath = Join-Path $taskFolder 'summary.json'
-        $taskLogPath = Join-Path $taskFolder 'task.log'
-        $reportPath = Join-Path $taskFolder 'report.csv'
-        $resolvedTaskInputPath = $null
-
+    foreach ($summaryFile in $candidateFiles) {
+        $summaryData = $null
         try {
-            $resolvedTaskInputPath = Resolve-TaskInputPath -Task $task -Tokens $dateTokens
-            if (-not (Test-Path $resolvedTaskInputPath -PathType Leaf)) {
-                throw "Task '$taskName' input file not found: $resolvedTaskInputPath"
-            }
-
-            switch ($taskType) {
-                'mail' {
-                    Write-Log -LogString "Starting mail task '$taskName' with BU '$taskBU' and source file '$resolvedTaskInputPath'." -LogFilePath $logFilePath
-                    & $mailScriptPath `
-                        -mailLogFilePath $resolvedTaskInputPath `
-                        -startDate $startDate `
-                        -endDate $endDate `
-                        -env $env `
-                        -SummaryOutputPath $summaryPath `
-                        -TaskOutputDirectory $taskFolder
-                }
-                'device' {
-                    if (-not $taskBU) {
-                        throw "Device task '$taskName' must define BU."
-                    }
-                    if ($supportedDeviceBUs -notcontains $taskBU) {
-                        throw "Device task '$taskName' uses unsupported BU '$taskBU'. Current project supports: $($supportedDeviceBUs -join ', ')."
-                    }
-
-                    Write-Log -LogString "Starting device task '$taskName' with BU '$taskBU' and source file '$resolvedTaskInputPath'." -LogFilePath $logFilePath
-
-                    $tmpCsvPath = Join-Path $taskFolder 'tmplog.csv'
-                    try {
-                        Import-Excel -Path $resolvedTaskInputPath |
-                            Export-Csv -Path $tmpCsvPath -NoTypeInformation -Encoding UTF8
-
-                        & $deviceAnalysisScriptPath `
-                            -deviceLogFilePath $tmpCsvPath `
-                            -startDate $startDate `
-                            -endDate $endDate `
-                            -BU $taskBU `
-                            -env $env `
-                            -SummaryOutputPath $summaryPath `
-                            -TaskOutputDirectory $taskFolder
-                    }
-                    finally {
-                        if (Test-Path -LiteralPath $tmpCsvPath -PathType Leaf) {
-                            Remove-Item -LiteralPath $tmpCsvPath -Force
-                        }
-                    }
-                }
-            }
-
-            if (-not $?) {
-                throw "Task '$taskName' did not complete successfully."
-            }
-
-            $taskResults.Add((New-TaskResult -Name $taskName -Type $taskType -BU $taskBU -Status 'completed' -InputFilePath $resolvedTaskInputPath -TaskFolder $taskFolder -TaskLogPath (Get-ExistingArtifactPath -Path $taskLogPath) -ReportPath (Get-ExistingArtifactPath -Path $reportPath) -SummaryPath (Get-ExistingArtifactPath -Path $summaryPath) -Message 'Completed successfully.'))
+            $summaryData = Get-Content -LiteralPath $summaryFile.FullName -Raw | ConvertFrom-Json
         }
         catch {
-            $errorMessage = $_.Exception.Message
-            Write-Log -LogString "Task '$taskName' failed: $errorMessage" -LogFilePath $logFilePath
-            $taskResults.Add((New-TaskResult -Name $taskName -Type $taskType -BU $taskBU -Status 'failed' -InputFilePath $resolvedTaskInputPath -TaskFolder $taskFolder -TaskLogPath (Get-ExistingArtifactPath -Path $taskLogPath) -ReportPath (Get-ExistingArtifactPath -Path $reportPath) -SummaryPath (Get-ExistingArtifactPath -Path $summaryPath) -Message $errorMessage))
+            $summaryData = $null
+        }
 
-            if ($effectiveExecutionMode -eq 'FailFast') {
-                throw
+        $matchesRequestedDates = $false
+        if ($summaryData) {
+            $summaryStartDate = if ($summaryData.PSObject.Properties['StartDate']) { [string]$summaryData.StartDate } else { $null }
+            $summaryEndDate = if ($summaryData.PSObject.Properties['EndDate']) { [string]$summaryData.EndDate } else { $null }
+            $matchesRequestedDates = ($summaryStartDate -eq $StartDate -and $summaryEndDate -eq $EndDate)
+        }
+
+        $candidates.Add([PSCustomObject]@{
+            Path                  = $summaryFile.FullName
+            DirectoryLastWrite    = $summaryFile.Directory.LastWriteTime
+            FileLastWrite         = $summaryFile.LastWriteTime
+            MatchesRequestedDates = $matchesRequestedDates
+        })
+    }
+
+    $preferredCandidate = @(
+        $candidates |
+            Where-Object { $_.MatchesRequestedDates } |
+            Sort-Object -Property FileLastWrite, DirectoryLastWrite -Descending |
+            Select-Object -First 1
+    )[0]
+
+    if ($preferredCandidate) {
+        return [string]$preferredCandidate.Path
+    }
+
+    $latestCandidate = @(
+        $candidates |
+            Sort-Object -Property FileLastWrite, DirectoryLastWrite -Descending |
+            Select-Object -First 1
+    )[0]
+
+    if ($latestCandidate) {
+        return [string]$latestCandidate.Path
+    }
+
+    return $null
+}
+
+function Load-AnalysisSummaryData {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SummaryPath
+    )
+
+    if (-not (Test-Path -LiteralPath $SummaryPath -PathType Leaf)) {
+        return $null
+    }
+
+    try {
+        return Get-Content -LiteralPath $SummaryPath -Raw | ConvertFrom-Json
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-RelatedAnalysisRuns {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RunsRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$StartDate,
+        [Parameter(Mandatory = $true)]
+        [string]$EndDate
+    )
+
+    if (-not (Test-Path -LiteralPath $RunsRoot -PathType Container)) {
+        return @()
+    }
+
+    $relatedRuns = New-Object 'System.Collections.Generic.List[object]'
+    $candidateFiles = @(
+        Get-ChildItem -LiteralPath $RunsRoot -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -in @('run-summary.json', 'configured-analysis-summary.json', 'configured_analysis_summary.json') -and
+                $_.DirectoryName -notmatch '[\\/]validation(?:_[^\\/]+)?(?:[\\/]|$)'
+            } |
+            Sort-Object LastWriteTime -Descending
+    )
+
+    foreach ($summaryFile in $candidateFiles) {
+        $summaryData = Load-AnalysisSummaryData -SummaryPath $summaryFile.FullName
+        if (-not $summaryData) {
+            continue
+        }
+
+        $summaryStartDate = [string](Get-OptionalPropertyValue -InputObject $summaryData -PropertyName 'StartDate')
+        $summaryEndDate = [string](Get-OptionalPropertyValue -InputObject $summaryData -PropertyName 'EndDate')
+        if ($summaryStartDate -ne $StartDate -or $summaryEndDate -ne $EndDate) {
+            continue
+        }
+
+        $runFolder = Split-Path -Parent $summaryFile.FullName
+        $relatedRuns.Add([PSCustomObject]@{
+            RunId       = if (Get-OptionalPropertyValue -InputObject $summaryData -PropertyName 'RunId') { [string]$summaryData.RunId } else { Split-Path -Leaf $runFolder }
+            RunFolder   = $runFolder
+            SummaryPath = $summaryFile.FullName
+            SummaryData = $summaryData
+            LastWriteTime = $summaryFile.LastWriteTime
+        })
+    }
+
+    return @($relatedRuns.ToArray())
+}
+
+function Get-MergedTaskSummaries {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$RelatedRuns,
+        [Parameter(Mandatory = $true)]
+        [string[]]$SummaryTaskNames
+    )
+
+    $mergedTaskSummaries = @{}
+    $mergedTaskSources = @{}
+    $sortedRuns = @($RelatedRuns | Sort-Object LastWriteTime -Descending)
+
+    foreach ($taskName in @($SummaryTaskNames | Where-Object { $_ } | Select-Object -Unique)) {
+        foreach ($run in $sortedRuns) {
+            $taskResult = @($run.SummaryData.Tasks | Where-Object { $_.Name -eq $taskName } | Select-Object -First 1)[0]
+            if (-not $taskResult) {
+                continue
             }
+
+            $taskSummary = Get-TaskSummaryData -TaskResult $taskResult
+            if (-not $taskSummary) {
+                continue
+            }
+
+            $mergedTaskSummaries[$taskName] = $taskSummary
+            $mergedTaskSources[$taskName] = [PSCustomObject]@{
+                RunId           = $run.RunId
+                RunFolder       = $run.RunFolder
+                SummaryPath     = $run.SummaryPath
+                TaskSummaryPath = [string](Get-OptionalPropertyValue -InputObject $taskResult -PropertyName 'SummaryPath')
+            }
+            break
         }
     }
 
-    $failedTasks = @($taskResults | Where-Object { $_.Status -eq 'failed' })
-    if ($failedTasks.Count -gt 0) {
-        Write-RunSummary @runSummaryArgs -TaskResults ([object[]]$taskResults) -RunStatus 'TasksFailed'
-        Write-Log -LogString "Configured analysis finished with $($failedTasks.Count) failed task(s). Summary path: $runSummaryPath" -LogFilePath $logFilePath
-        Write-Host "Configured analysis finished with failures. Summary path: $runSummaryPath" -ForegroundColor Yellow
-        exit 1
+    return [PSCustomObject]@{
+        TaskSummaries = $mergedTaskSummaries
+        TaskSources   = $mergedTaskSources
+    }
+}
+
+$dateParametersProvided = ($PSCmdlet.ParameterSetName -eq 'DateRange')
+if ($dateParametersProvided) {
+    $null = Convert-ExactDate $startDate
+    $null = Convert-ExactDate $endDate
+}
+
+$resolutionMode = $null
+$pointerData = $null
+$resolvedAnalysisSummaryPath = if ($AnalysisSummaryPath) {
+    $resolutionMode = 'AnalysisSummaryPath'
+    $AnalysisSummaryPath
+}
+elseif ($RunId) {
+    $resolutionMode = 'RunId'
+    Resolve-AnalysisSummaryPathFromRunId -RunsRoot $runsRoot -RunId $RunId
+}
+elseif ($dateParametersProvided) {
+    $resolutionMode = 'DateRangeAutoDiscovery'
+    Resolve-LatestAnalysisSummaryPath -RunsRoot $runsRoot -StartDate $startDate -EndDate $endDate
+}
+else {
+    $pointerData = Resolve-AnalysisSummaryPathFromLatestPointer -PointerPath $latestRunPointerPath
+    if ($pointerData) {
+        $resolutionMode = 'LatestRunPointer'
+        [string]$pointerData.RunSummaryPath
+    }
+    else {
+        $resolutionMode = 'AutoDiscovery'
+        Resolve-LatestAnalysisSummaryPath -RunsRoot $runsRoot -StartDate $startDate -EndDate $endDate
+    }
+}
+
+$resolvedRunFolder = $null
+if ($resolvedAnalysisSummaryPath) {
+    $resolvedRunFolder = Split-Path $resolvedAnalysisSummaryPath -Parent
+    Write-Host "Resolution mode: $resolutionMode" -ForegroundColor Cyan
+    Write-Host "Using analysis summary: $resolvedAnalysisSummaryPath" -ForegroundColor Cyan
+}
+else {
+    if ($dateParametersProvided) {
+        Write-Host "Resolution mode: $resolutionMode" -ForegroundColor Yellow
+        Write-Host "No analysis summary matched startDate=$startDate endDate=$endDate. Validation will continue without task summaries." -ForegroundColor Yellow
+    }
+    $resolvedRunFolder = Join-Path $runsRoot ("validation_{0}" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    Write-Host 'No matching analysis summary was found. Creating a standalone validation run folder.' -ForegroundColor Yellow
+}
+
+if (-not (Test-Path $resolvedRunFolder)) {
+    New-Item -Path $resolvedRunFolder -ItemType Directory -Force | Out-Null
+}
+
+$validationFolder = Join-Path $resolvedRunFolder 'validation'
+New-Item -Path $validationFolder -ItemType Directory -Force | Out-Null
+
+$logFilePath = Join-Path $validationFolder 'backup-validation.log'
+$validationSummaryPath = Join-Path $validationFolder 'backup-validation-summary.json'
+$validationJsonPath = Join-Path $validationFolder 'backup-folder-validation.json'
+$validationTextPath = Join-Path $validationFolder 'backup-folder-validation.txt'
+
+$analysisSummary = $null
+$taskSummaries = @{}
+if ($resolvedAnalysisSummaryPath) {
+    if (-not (Test-Path $resolvedAnalysisSummaryPath -PathType Leaf)) {
+        throw "Analysis summary not found: $resolvedAnalysisSummaryPath"
     }
 
-    Write-RunSummary @runSummaryArgs -TaskResults ([object[]]$taskResults) -RunStatus 'Success'
-    Write-Log -LogString "Configured analysis completed successfully. Summary path: $runSummaryPath" -LogFilePath $logFilePath
-    Write-Host "Configured analysis completed successfully. Output folder: $runFolder" -ForegroundColor Green
-    Write-Host "Run summary: $runSummaryPath" -ForegroundColor Green
+    $analysisSummary = Get-Content -LiteralPath $resolvedAnalysisSummaryPath -Raw | ConvertFrom-Json
+    if (-not $dateParametersProvided) {
+        $startDate = [string](Get-OptionalPropertyValue -InputObject $analysisSummary -PropertyName 'StartDate')
+        $endDate = [string](Get-OptionalPropertyValue -InputObject $analysisSummary -PropertyName 'EndDate')
+        if (-not $startDate -or -not $endDate) {
+            throw 'Resolved analysis summary does not contain StartDate/EndDate, and they were not provided explicitly.'
+        }
+        $null = Convert-ExactDate $startDate
+        $null = Convert-ExactDate $endDate
+    }
+
+    foreach ($taskResult in @($analysisSummary.Tasks)) {
+        if (-not $taskResult.Name) {
+            continue
+        }
+
+        $taskSummaries[[string]$taskResult.Name] = Get-TaskSummaryData -TaskResult $taskResult
+    }
 }
-catch {
-    $errorMessage = $_.Exception.Message
-    Write-RunSummary @runSummaryArgs -TaskResults ([object[]]$taskResults) -RunStatus 'Failed' -ErrorMessage $errorMessage
-    Write-Log -LogString "Configured analysis failed: $errorMessage" -LogFilePath $logFilePath
-    Write-Host "Configured analysis FAILED: $errorMessage" -ForegroundColor Red
+
+$resolvedBackupRoot = if ($env:WECOM_AUDIT_BACKUP_ROOT) {
+    [string]$env:WECOM_AUDIT_BACKUP_ROOT
+}
+elseif ($config.ContainsKey('BackupRoot') -and $config.BackupRoot) {
+    [string]$config.BackupRoot
+}
+else {
+    $resolvedOutputRoot
+}
+
+if ($BackupFolder) {
+    $resolvedBackupFolder = $BackupFolder
+}
+else {
+    $resolvedBackupFolder = [System.IO.Path]::Combine($resolvedBackupRoot, $endDate)
+}
+
+if (-not (Test-Path $resolvedBackupFolder -PathType Container)) {
+    New-Item -Path $resolvedBackupFolder -ItemType Directory -Force | Out-Null
+}
+
+$sourceCleanupConfig = Resolve-SourceCleanupConfig -Config $config
+
+$configuredInputRoot = Resolve-AuditInputRoot -Config $config
+$inputDirTokens = New-DateTokenMap -StartDate $startDate -EndDate $endDate
+$inputDirTokens.InputRoot = $configuredInputRoot
+
+$enabledInputDirs = @(
+    @($config.Tasks) |
+        Where-Object { $_.Enabled -eq $true -and $_.InputDirectory } |
+        ForEach-Object {
+            Resolve-TemplateText -Template ([string]$_.InputDirectory) -Tokens $inputDirTokens
+        } |
+        Sort-Object -Unique
+)
+
+Assert-SourceCleanupConfig `
+    -Enabled $sourceCleanupConfig.Enabled `
+    -AllowedRoots $sourceCleanupConfig.AllowedRoots `
+    -EnabledInputDirectories $enabledInputDirs `
+    -ProtectedRoots @($resolvedBackupRoot, $resolvedOutputRoot)
+
+$currentRunWeeksSource = $null
+$effectiveCurrentRunWeeks = if ($PSBoundParameters.ContainsKey('CurrentRunWeeks') -and $CurrentRunWeeks) {
+    $currentRunWeeksSource = 'Parameter'
+    $CurrentRunWeeks
+}
+elseif ($analysisSummary -and $analysisSummary.CurrentRunWeeks) {
+    $currentRunWeeksSource = 'AnalysisSummary'
+    [string]$analysisSummary.CurrentRunWeeks
+}
+elseif ($config.CurrentRunWeeks) {
+    $currentRunWeeksSource = 'Config'
+    [string]$config.CurrentRunWeeks
+}
+else {
+    $currentRunWeeksSource = 'Default'
+    '2'
+}
+
+if ($effectiveCurrentRunWeeks -notin @('2', '4')) {
+    throw "Unsupported CurrentRunWeeks '$effectiveCurrentRunWeeks'. Expected '2' or '4'."
+}
+
+$dynamicSummaryTaskNames = @(
+    @($backupValidationConfig.DynamicRules) |
+        Where-Object {
+            $_.Required -and
+            (@($_.AppliesToWeeks).Count -eq 0 -or $_.AppliesToWeeks -contains $effectiveCurrentRunWeeks)
+        } |
+        ForEach-Object { [string]$_.SummaryTaskName } |
+        Where-Object { $_ } |
+        Select-Object -Unique
+)
+
+[object[]]$relatedRuns = if ($startDate -and $endDate) {
+    @(Get-RelatedAnalysisRuns -RunsRoot $runsRoot -StartDate $startDate -EndDate $endDate)
+}
+else {
+    @()
+}
+
+$mergedSummaryData = if ($dynamicSummaryTaskNames.Count -gt 0 -and $relatedRuns.Count -gt 0) {
+    Get-MergedTaskSummaries -RelatedRuns $relatedRuns -SummaryTaskNames $dynamicSummaryTaskNames
+}
+else {
+    [PSCustomObject]@{
+        TaskSummaries = $taskSummaries
+        TaskSources   = @{}
+    }
+}
+
+$effectiveTaskSummaries = if ($mergedSummaryData.TaskSummaries) { $mergedSummaryData.TaskSummaries } else { $taskSummaries }
+$usedRunIds = @(
+    @($mergedSummaryData.TaskSources.GetEnumerator()) |
+        ForEach-Object { $_.Value.RunId } |
+        Where-Object { $_ } |
+        Select-Object -Unique
+)
+$selectedRunId = if ($analysisSummary -and (Get-OptionalPropertyValue -InputObject $analysisSummary -PropertyName 'RunId')) {
+    [string]$analysisSummary.RunId
+}
+elseif ($resolvedRunFolder) {
+    Split-Path -Leaf $resolvedRunFolder
+}
+else {
+    $null
+}
+$validationMode = if ($usedRunIds.Count -gt 1 -or ($usedRunIds.Count -eq 1 -and $selectedRunId -and $usedRunIds[0] -ne $selectedRunId)) { 'aggregated' } else { 'single-run' }
+
+$dateTokens = New-DateTokenMap -StartDate $startDate -EndDate $endDate
+$expectedBackupFiles = Get-ExpectedBackupFiles -CurrentRunWeeks $effectiveCurrentRunWeeks -DateTokens $dateTokens -BackupValidationConfig $backupValidationConfig -TaskSummaries $effectiveTaskSummaries
+$backupValidation = Test-BackupFolderContent -BackupFolder $resolvedBackupFolder -ExpectedFiles $expectedBackupFiles
+$backupValidation | Add-Member -MemberType NoteProperty -Name ValidationMode -Value $validationMode -Force
+$backupValidation | Add-Member -MemberType NoteProperty -Name MergedRunIds -Value @($usedRunIds) -Force
+$backupValidation | Add-Member -MemberType NoteProperty -Name MergedTaskSources -Value $mergedSummaryData.TaskSources -Force
+$backupValidation | ConvertTo-Json -Depth 8 | Set-Content -Path $validationJsonPath -Encoding UTF8
+$backupValidationText = Format-BackupValidationText -ValidationResult $backupValidation -CurrentRunWeeks $effectiveCurrentRunWeeks -BackupFolder $resolvedBackupFolder
+$backupValidationText | Set-Content -Path $validationTextPath -Encoding UTF8
+
+$effectiveFailOnDifference = if ($FailOnDifference.IsPresent) { $true } else { [bool]$backupValidationConfig.EnforceFailure }
+
+$sourceFilePaths = @()
+if ($analysisSummary -and $analysisSummary.Tasks) {
+    $sourceFilePaths = @(
+        $analysisSummary.Tasks |
+            Where-Object { $_.Status -eq 'completed' -and $_.InputFilePath } |
+            ForEach-Object { [string]$_.InputFilePath } |
+            Sort-Object -Unique
+    )
+}
+
+$archiveResult = $null
+$archiveStatus = 'NotAttempted'
+
+if ($backupValidation.Passed -and $sourceFilePaths.Count -gt 0 -and $sourceCleanupConfig.Enabled) {
+    Write-Log -LogString "Validation passed. Starting archive phase: $($sourceFilePaths.Count) source file(s) to backup." -LogFilePath $logFilePath
+    Write-Host "Validation passed. Archiving $($sourceFilePaths.Count) source file(s) to backup folder..." -ForegroundColor Cyan
+
+    $backupIndex = @{}
+    $pendingDeletions = New-Object 'System.Collections.Generic.List[object]'
+    $archiveErrors = New-Object 'System.Collections.Generic.List[string]'
+
+    foreach ($sourcePath in $sourceFilePaths) {
+        try {
+            if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+                Write-Log -LogString "Archive: source file not found (already moved?): $sourcePath" -LogFilePath $logFilePath
+                continue
+            }
+
+            $resolvedSource = (Resolve-Path -LiteralPath $sourcePath).Path
+            if ($backupIndex.ContainsKey($resolvedSource)) {
+                continue
+            }
+
+            $leafName = Split-Path $resolvedSource -Leaf
+            $sourceHash = (Get-FileHash -LiteralPath $resolvedSource -Algorithm SHA256).Hash
+            $destPath = Join-Path $resolvedBackupFolder $leafName
+
+            if (Test-Path $destPath -PathType Leaf) {
+                $destHash = (Get-FileHash -LiteralPath $destPath -Algorithm SHA256).Hash
+                if ($destHash -eq $sourceHash) {
+                    $backupIndex[$resolvedSource] = $destPath
+                    Write-Log -LogString "Archive: '$leafName' already in backup (hash match)." -LogFilePath $logFilePath
+                }
+                else {
+                    Copy-Item -LiteralPath $resolvedSource -Destination $destPath -Force
+                    $backupIndex[$resolvedSource] = $destPath
+                    Write-Log -LogString "Archive: '$leafName' copied to backup (overwrite, hash mismatch)." -LogFilePath $logFilePath
+                }
+            }
+            else {
+                Copy-Item -LiteralPath $resolvedSource -Destination $destPath -Force
+                $backupIndex[$resolvedSource] = $destPath
+                Write-Log -LogString "Archive: '$leafName' copied to backup." -LogFilePath $logFilePath
+            }
+
+            $pendingDeletions.Add([PSCustomObject]@{
+                SourcePath = $resolvedSource
+                BackupPath = $destPath
+                TaskName   = $leafName
+            })
+        }
+        catch {
+            $archiveErrors.Add("Failed to backup '$sourcePath': $($_.Exception.Message)")
+            Write-Log -LogString "Archive ERROR: Failed to backup '$sourcePath': $($_.Exception.Message)" -LogFilePath $logFilePath
+        }
+    }
+
+    if ($archiveErrors.Count -gt 0) {
+        $archiveStatus = 'BackupFailed'
+        Write-Host "Archive: $($archiveErrors.Count) file(s) failed to backup. Skipping source deletion." -ForegroundColor Yellow
+    }
+    elseif ($pendingDeletions.Count -eq 0) {
+        $archiveStatus = 'NoOp'
+        Write-Log -LogString "Archive: no files needed backup (all missing or already archived)." -LogFilePath $logFilePath
+    }
+    else {
+        $archiveResult = Invoke-SourceFileCleanup -PendingDeletions ([object[]]$pendingDeletions) -BackupFolder $resolvedBackupFolder -AllowedRoots $sourceCleanupConfig.AllowedRoots -LogFilePath $logFilePath
+        if ($archiveResult.Aborted) {
+            $archiveStatus = 'CleanupAborted'
+            Write-Host "Archive: source cleanup ABORTED — $($archiveResult.AbortReason)" -ForegroundColor Yellow
+        }
+        elseif ($archiveResult.FailedCount -gt 0) {
+            $archiveStatus = 'CleanupPartiallyFailed'
+            Write-Host "Archive: cleanup partially failed. Deleted=$($archiveResult.DeletedCount); Failed=$($archiveResult.FailedCount); Skipped=$($archiveResult.SkippedCount)." -ForegroundColor Yellow
+        }
+        elseif ($archiveResult.DeletedCount -gt 0) {
+            $archiveStatus = 'Success'
+            Write-Host "Archive: $($archiveResult.DeletedCount) source file(s) deleted after backup verification." -ForegroundColor Green
+        }
+        else {
+            $archiveStatus = 'NoOp'
+            Write-Log -LogString "Archive: cleanup completed but no files were actually deleted (all skipped)." -LogFilePath $logFilePath
+        }
+    }
+}
+elseif ($backupValidation.Passed) {
+    $archiveStatus = 'NoSourceFiles'
+}
+
+$summary = [PSCustomObject]@{
+    StartDate            = $startDate
+    EndDate              = $endDate
+    ConfigPath           = $ConfigPath
+    OutputRoot           = $resolvedOutputRoot
+    RunFolder            = $resolvedRunFolder
+    ValidationFolder     = $validationFolder
+    BackupFolder         = $resolvedBackupFolder
+    AnalysisSummaryPath  = $resolvedAnalysisSummaryPath
+    CurrentRunWeeks      = $effectiveCurrentRunWeeks
+    ValidationMode       = $validationMode
+    RelatedRunIds        = @($relatedRuns | ForEach-Object { $_.RunId })
+    MergedTaskSources    = $mergedSummaryData.TaskSources
+    FailOnDifference     = $effectiveFailOnDifference
+    ValidationJsonPath   = $validationJsonPath
+    ValidationTextPath   = $validationTextPath
+    ValidationPassed     = $backupValidation.Passed
+    ExpectedFileCount    = @($expectedBackupFiles).Count
+    AnalysisSummaryFound = [bool]$analysisSummary
+    ArchiveStatus        = $archiveStatus
+    ArchiveResult        = $archiveResult
+}
+$summary | ConvertTo-Json -Depth 8 | Set-Content -Path $validationSummaryPath -Encoding UTF8
+
+Write-Log -LogString "Backup validation completed. Passed: $($backupValidation.Passed). ArchiveStatus: $archiveStatus. Summary path: $validationSummaryPath" -LogFilePath $logFilePath
+Write-Host "Resolved run folder: $resolvedRunFolder" -ForegroundColor Cyan
+Write-Host "Resolved backup folder: $resolvedBackupFolder" -ForegroundColor Cyan
+Write-Host "CurrentRunWeeks: $effectiveCurrentRunWeeks (source: $currentRunWeeksSource)" -ForegroundColor Cyan
+Write-Host "Validation mode: $validationMode" -ForegroundColor Cyan
+if ($validationMode -eq 'aggregated') {
+    Write-Host "Merged run sources: $($usedRunIds -join ', ')" -ForegroundColor Cyan
+}
+
+if (-not $backupValidation.Passed) {
+    Write-Host "Backup folder validation found differences. Validation report: $validationTextPath" -ForegroundColor Yellow
+    Write-Host "Validation summary: $validationSummaryPath" -ForegroundColor Yellow
+    if ($effectiveFailOnDifference) {
+        throw "Backup folder validation failed. See $validationTextPath"
+    }
     exit 1
 }
-nofile
+
+Write-Host "Backup folder validation passed: $validationTextPath" -ForegroundColor Green
+Write-Host "Archive status: $archiveStatus" -ForegroundColor Cyan
+Write-Host "Validation summary: $validationSummaryPath" -ForegroundColor Green
+
+if ($archiveStatus -in @('CleanupAborted', 'CleanupPartiallyFailed', 'BackupFailed')) {
+    exit 2
+}
+
+exit 0
