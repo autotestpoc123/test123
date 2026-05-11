@@ -1,65 +1,87 @@
+:host ::ng-deep .no-texting-popover {
+    --bs-popover-max-width: 540px;
+    --bs-popover-border-color: #d7d7d7;
+    --bs-popover-border-radius: 0;
+    --bs-popover-box-shadow: 0 2px 12px rgba(0, 0, 0, 0.16);
+    --bs-popover-body-padding-x: 0;
+    --bs-popover-body-padding-y: 0;
+}
 
- 当前设计的硬约束
+:host ::ng-deep .no-texting-popover .popover-arrow {
+    display: none;
+}
 
-  Resolve-ScheduleCycle 有两处硬编码限制：
+.tooltip-text {
+    color: #0d6efd;
+    cursor: pointer;
+}
 
-  1. 第 1460 行：ScheduleAnchor 必须是周四，否则直接 throw
-  2. 第 1471 行：当天不是周四时，写 warning（NotThursday）
-  3. 第 1475 行：当天不在 14 天整数倍周期上，写 warning（OffCycle）
+.no-texting-alert {
+    display: flex;
+    gap: 18px;
+    width: min(500px, calc(100vw - 32px));
+    padding: 24px 28px 20px 24px;
+    color: #555;
+    background-color: #fff;
+}
 
-  ---
-  方案分析
+.no-texting-alert-icon {
+    flex: 0 0 auto;
+    margin-top: 4px;
+    color: #2f83c5;
+    font-size: 42px;
+}
 
-  方案 A：用已有参数绕过（不改代码，推荐测试用）
+.no-texting-alert-content {
+    flex: 1 1 auto;
+    min-width: 0;
+}
 
-  直接用 -StartDate 和 -ForceCurrentRunWeeks 参数，完全绕过周期计算：
+.no-texting-alert-title {
+    margin-bottom: 8px;
+    color: #2f83c5;
+    font-size: 16px;
+    font-weight: 700;
+}
 
-  ./Invoke-WeComAuditScheduler.ps1 `
-      -StartDate 20260416 `
-      -ForceCurrentRunWeeks 2 `
-      -env QA
+.no-texting-alert-list {
+    margin: 0;
+    padding-left: 16px;
+    font-size: 13px;
+    line-height: 1.45;
+}
 
-  - 日期范围固定为 StartDate 起的 14 天
-  - CurrentRunWeeks 强制指定
-  - 只会产生 NotThursday / OffCycle warning，不会 throw
-  - 零改动，最简单
+.no-texting-alert-list li + li {
+    margin-top: 4px;
+}
 
-  ---
-  方案 B：config 支持 ScheduleAnchor 任意星期（改动小）
+.no-texting-alert-list a {
+    color: #1f6fae;
+    font-weight: 700;
+    text-decoration: none;
+}
 
-  把第 1460 行的周四校验从 throw 改为 warning，同时把第 1471 行的 Thursday 判断改为与 anchor 同一个星期几：
+.no-texting-alert-list a:hover {
+    text-decoration: underline;
+}
 
-  改动点 1 (psm1): anchor 星期几不再要求必须是 Thursday → 改为 warning
-  改动点 2 (psm1): NotThursday warning → 改为 "today is not the same weekday as anchor"
-  改动点 3 (psm1): CLAUDE.md / throw 错误提示文字去掉 Thursday 限制
+.no-texting-alert-actions {
+    display: flex;
+    justify-content: center;
+    margin-top: 22px;
+}
 
-  优点：config 里把 anchor 换成周五/周一即可切换运行日
-  缺点：anchor 语义变了（不再是"必须周四"），需要更新文档，且 cycle 计算逻辑（14天整数）本身不受影响
+.no-texting-alert-ok {
+    min-width: 74px;
+    border-radius: 18px;
+    font-size: 13px;
+    font-weight: 600;
+}
 
-  ---
-  方案 C：scheduler 脚本加 -RunDate 参数（改动中等）
+span.fa, span.bi {
+    padding-left: 5px;
+}
 
-  在 scheduler 加一个测试参数，注入"假今天"替换 Get-Date：
-
-  param(
-      [string]$RunDate   # 测试用，模拟今天日期 yyyyMMdd
-  )
-
-  传给 Resolve-ScheduleCycle 内部使用，不影响生产路径。
-  优点：生产代码不改行为，测试可注入任意日期
-  缺点：需要改 Resolve-ScheduleCycle 签名加 $TodayOverride 参数
-
-  ---
-  推荐
-
-  ┌────────────────────────────┬─────────────────────────────────────────────────┐
-  │            场景            │                    推荐方案                     │
-  ├────────────────────────────┼─────────────────────────────────────────────────┤
-  │ 临时测试，不想改代码       │ 方案 A，直接加 -StartDate -ForceCurrentRunWeeks │
-  ├────────────────────────────┼─────────────────────────────────────────────────┤
-  │ 生产环境改为周五/周一运行  │ 方案 B，松绑 anchor 的 Thursday 限制            │
-  ├────────────────────────────┼─────────────────────────────────────────────────┤
-  │ 需要 CI/自动化测试注入日期 │ 方案 C，加 -RunDate 测试参数                    │
-  └────────────────────────────┴─────────────────────────────────────────────────┘
-
-  你的需求是哪种场景？
+.expandable-group{
+    cursor: pointer;
+}
