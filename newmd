@@ -1,87 +1,32 @@
-:host ::ng-deep .no-texting-popover {
-    --bs-popover-max-width: 540px;
-    --bs-popover-border-color: #d7d7d7;
-    --bs-popover-border-radius: 0;
-    --bs-popover-box-shadow: 0 2px 12px rgba(0, 0, 0, 0.16);
-    --bs-popover-body-padding-x: 0;
-    --bs-popover-body-padding-y: 0;
-}
-
-:host ::ng-deep .no-texting-popover .popover-arrow {
-    display: none;
-}
-
-.tooltip-text {
-    color: #0d6efd;
-    cursor: pointer;
-}
-
-.no-texting-alert {
-    display: flex;
-    gap: 18px;
-    width: min(500px, calc(100vw - 32px));
-    padding: 24px 28px 20px 24px;
-    color: #555;
-    background-color: #fff;
-}
-
-.no-texting-alert-icon {
-    flex: 0 0 auto;
-    margin-top: 4px;
-    color: #2f83c5;
-    font-size: 42px;
-}
-
-.no-texting-alert-content {
-    flex: 1 1 auto;
-    min-width: 0;
-}
-
-.no-texting-alert-title {
-    margin-bottom: 8px;
-    color: #2f83c5;
-    font-size: 16px;
-    font-weight: 700;
-}
-
-.no-texting-alert-list {
-    margin: 0;
-    padding-left: 16px;
-    font-size: 13px;
-    line-height: 1.45;
-}
-
-.no-texting-alert-list li + li {
-    margin-top: 4px;
-}
-
-.no-texting-alert-list a {
-    color: #1f6fae;
-    font-weight: 700;
-    text-decoration: none;
-}
-
-.no-texting-alert-list a:hover {
-    text-decoration: underline;
-}
-
-.no-texting-alert-actions {
-    display: flex;
-    justify-content: center;
-    margin-top: 22px;
-}
-
-.no-texting-alert-ok {
-    min-width: 74px;
-    border-radius: 18px;
-    font-size: 13px;
-    font-weight: 600;
-}
-
-span.fa, span.bi {
-    padding-left: 5px;
-}
-
-.expandable-group{
-    cursor: pointer;
-}
+  @if(user.UserAccount.PersonalMobilePhone) {
+    <div class="row align-items-center">
+        <label for="Personal" class="col-3 col-form-label">Personal</label>
+        <!-- <div class="col-3">Personal</div> -->
+        <div class="col-auto col-form-label profile-value">
+            <a href="ciscotel://{{user.UserAccount.PersonalMobilePhone | stringReplace:' ':''}}">{{user.UserAccount.PersonalMobilePhone}}
+            </a>
+            <span class="tooltip-text" [ngbPopover]="NoTextingPopover" #noTextingPopover="ngbPopover"
+                triggers="manual" [autoClose]="'outside'" [popoverClass]="'no-texting-popover'"
+                (click)="noTextingPopover.open()">(No
+                Texting)</span>
+            <ng-template #NoTextingPopover>
+                <div class="no-texting-alert">
+                    <i class="fa fa-exclamation-triangle no-texting-alert-icon" aria-hidden="true"></i>
+                    <div class="no-texting-alert-content">
+                        <div class="no-texting-alert-title">ALERT</div>
+                        <ul class="no-texting-alert-list">
+                            <li>Do not send a business text to a colleague's personal mobile phone.</li>
+                            <li>For more information please review the <a target="_blank"
+                                    href="https://abctestchina.sharepoint.cn/sites/howto/SitePages/Firm-Approved-Messaging-Systems-for-China-Onshore-Domain-(COD).aspx">Communications
+                                    Guidance FAQs</a></li>
+                        </ul>
+                        <div class="no-texting-alert-actions">
+                            <button type="button" class="btn btn-primary no-texting-alert-ok"
+                                (click)="noTextingPopover.close()">Ok</button>
+                        </div>
+                    </div>
+                </div>
+            </ng-template>
+        </div>
+    </div>
+    }
