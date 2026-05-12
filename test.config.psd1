@@ -1,18 +1,30 @@
-import { FullUser } from '../../data/user-full';
-import { EMPLYEE_TYPE } from '../../data/constants';
-import { NotificationService } from '../../service/notification.service';
-import { UserService } from '../../service/user.service';
+ <span class="tooltip-text no-texting-link" [ngbPopover]="noTextingAlertTpl"
+                #noTextingPopover="ngbPopover" popoverClass="no-texting-popover"
+                placement="top-start top top-end bottom-start auto" triggers="manual" [autoClose]="'outside'"
+                container="body" (click)="noTextingPopover.open()">
+                (No Texting)
+            </span>
 
+            <ng-template #noTextingAlertTpl>
+                <div class="no-texting-alert">
+                    <i class="bi bi-exclamation-triangle no-texting-alert-icon" aria-hidden="true"></i>
 
-
-export class FullUser {
-    [key: string]: any;
-    UserAccount!: UserAccount;
-    MemberOf?: (MailGroupCodFull | MailGroupGlobalFull)[];
-    OwnerOf?: (MailGroupCodFull | MailGroupGlobalFull)[];
-    ModeratorOf?: (MailGroupCodFull | MailGroupGlobalFull)[];
-    Manager?: UserAccount;
-    DirectReports?: UserAccount[];
-    CoDirectReports?: UserAccount[];
-    Contingents?: UserAccount[];
-}
+                    <div class="no-texting-alert-content">
+                        <div class="no-texting-alert-title">ALERT</div>
+                        <ul class="no-texting-alert-list">
+                            <li>Do not send a business text to a colleague's personal mobile phone.</li>
+                            <li>
+                                For more information please review the
+                                <a target="_blank" rel="noopener noreferrer"
+                                    href="https://abctestchina.sharepoint.cn/sites/howto/SitePages/Firm-Approved-Communications.aspx"
+                                    (click)="$event.stopPropagation()">
+                                    Communications Guidance FAQs
+                                </a>
+                            </li>
+                        </ul>
+                        <div class="no-texting-alert-actions">
+                            <button type="button" class="btn btn-primary no-texting-alert-ok"
+                                (click)="noTextingPopover.close()">Ok</button>
+                        </div>
+                    </div>
+                </div>
