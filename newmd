@@ -1,32 +1,306 @@
-  @if(user.UserAccount.PersonalMobilePhone) {
-    <div class="row align-items-center">
-        <label for="Personal" class="col-3 col-form-label">Personal</label>
-        <!-- <div class="col-3">Personal</div> -->
-        <div class="col-auto col-form-label profile-value">
-            <a href="ciscotel://{{user.UserAccount.PersonalMobilePhone | stringReplace:' ':''}}">{{user.UserAccount.PersonalMobilePhone}}
-            </a>
-            <span class="tooltip-text" [ngbPopover]="NoTextingPopover" #noTextingPopover="ngbPopover"
-                triggers="manual" [autoClose]="'outside'" [popoverClass]="'no-texting-popover'"
-                (click)="noTextingPopover.open()">(No
-                Texting)</span>
-            <ng-template #NoTextingPopover>
-                <div class="no-texting-alert">
-                    <i class="fa fa-exclamation-triangle no-texting-alert-icon" aria-hidden="true"></i>
-                    <div class="no-texting-alert-content">
-                        <div class="no-texting-alert-title">ALERT</div>
-                        <ul class="no-texting-alert-list">
-                            <li>Do not send a business text to a colleague's personal mobile phone.</li>
-                            <li>For more information please review the <a target="_blank"
-                                    href="https://abctestchina.sharepoint.cn/sites/howto/SitePages/Firm-Approved-Messaging-Systems-for-China-Onshore-Domain-(COD).aspx">Communications
-                                    Guidance FAQs</a></li>
-                        </ul>
-                        <div class="no-texting-alert-actions">
-                            <button type="button" class="btn btn-primary no-texting-alert-ok"
-                                (click)="noTextingPopover.close()">Ok</button>
-                        </div>
-                    </div>
-                </div>
-            </ng-template>
-        </div>
-    </div>
-    }
+下面按 Jira item 的格式，把“员工照片显示”新增功能拆成可实现、可验收的前端需求。范围只包含“展示员工头像/照片”，不包含“基于照片搜索员工”。
+
+Epic: 员工照片展示能力
+目标：在员工详情页、搜索结果列表、导航栏当前用户区、组织结构项中统一展示员工照片；无照片或加载失败时优雅降级为 initials 占位。
+
+JIRA-001: 新增员工头像展示组件 user-avatar
+类型：Story
+优先级：P0
+预估：1d
+
+描述：
+创建可复用头像组件，用于统一展示员工照片，并在无照片时显示姓名 initials 占位。
+
+验收标准：
+
+支持输入 msid、fullName、size、shape。
+有照片时显示真实头像。
+无照片、无 msid、接口返回空时显示 initials。
+支持 sm、md、lg 三种尺寸。
+支持圆形头像样式。
+不在业务页面中重复写 <img> 和 fallback 逻辑。
+涉及文件：
+
+src/app/components/common/user-avatar/user-avatar.component.ts
+src/app/components/common/user-avatar/user-avatar.component.html
+src/app/components/common/user-avatar/user-avatar.component.css
+JIRA-002: 新增员工照片请求服务 UserPhotoService
+类型：Story
+优先级：P0
+预估：1d
+
+描述：
+新增服务，根据员工 MSID 请求后端照片接口，并返回可用于 <img> 展示的安全 URL。
+
+验收标准：
+
+通过 GET /api/v1.0/photos/{msid} 获取照片。
+请求使用 responseType: 'blob'。
+对非法或空 msid 不发起 HTTP 请求。
+204/404/403 时返回 null，不抛出用户可见错误。
+5xx 或网络错误时静默降级，并保留开发侧可观测日志。
+相同 MSID 的并发请求只触发一次 HTTP 请求。
+涉及文件：
+
+src/app/service/user-photo.service.ts
+src/app/data/constants.ts
+JIRA-003: 增加头像请求缓存与去重
+类型：Task
+优先级：P0
+预估：0.8d
+
+描述：
+为员工照片请求增加内存缓存，避免同一员工照片在多个页面位置重复请求。
+
+验收标准：
+
+使用 MSID 作为缓存 key。
+同一个 MSID 多次调用复用同一个请求结果。
+缓存有最大容量限制。
+缓存命中时不重复发起 HTTP 请求。
+invalidate(msid) 可清除指定员工头像缓存。
+涉及文件：
+
+src/app/service/user-photo.service.ts
+JIRA-004: 实现头像懒加载
+类型：Task
+优先级：P0
+预估：0.8d
+
+描述：
+头像组件进入视口后再加载照片，降低列表和组织结构页面的初始请求压力。
+
+验收标准：
+
+使用 IntersectionObserver 监听头像组件是否进入视口。
+进入视口后才调用 UserPhotoService.getPhoto()。
+触发加载后断开 observer。
+浏览器不支持 IntersectionObserver 时自动退化为立即加载。
+滚动长列表时不会一次性请求所有头像。
+涉及文件：
+
+src/app/components/common/user-avatar/user-avatar.component.ts
+JIRA-005: 在员工详情页展示员工大头像
+类型：Story
+优先级：P0
+预估：0.5d
+
+描述：
+在员工详情页头部展示当前员工照片，替换原有默认用户图标或空白占位。
+
+验收标准：
+
+员工详情页顶部显示 lg 尺寸头像。
+使用当前员工 UserAccount.MSID 请求照片。
+使用当前员工 UserAccount.FullName 生成 fallback initials。
+无照片时页面布局不抖动。
+点击或切换员工详情时头像正确更新。
+涉及文件：
+
+src/app/components/user-view/user-view.component.html
+JIRA-006: 在用户列表中展示员工小头像
+类型：Story
+优先级：P0
+预估：0.5d
+
+描述：
+在搜索结果、历史浏览人员列表等用户表格中，在姓名前展示员工小头像。
+
+验收标准：
+
+user-table 中每行姓名前显示 sm 头像。
+使用行数据中的 MSID 和 FullName。
+头像加载失败不影响表格点击、筛选、分页。
+列表滚动时头像懒加载生效。
+表格导出逻辑不受头像影响。
+涉及文件：
+
+src/app/components/common/user-table/user-table.component.html
+JIRA-007: 在导航栏当前登录用户区展示头像
+类型：Story
+优先级：P1
+预估：0.5d
+
+描述：
+在页面右上角当前登录用户姓名前展示员工头像，增强用户身份识别。
+
+验收标准：
+
+导航栏当前用户区域显示 sm 头像。
+使用登录用户 UserAccount.MSID 和 FullName。
+登录用户信息未加载完成时不报错。
+无头像时显示 initials。
+不影响原有用户详情页跳转链接。
+涉及文件：
+
+src/app/components/common/navigation-bar/navigation-bar.component.html
+JIRA-008: 在组织结构人员项中展示头像
+类型：Story
+优先级：P1
+预估：0.5d
+
+描述：
+在组织结构、manager/direct reports 等人员项中显示员工头像。
+
+验收标准：
+
+组织结构人员项姓名前显示 sm 头像。
+使用人员项中的 MSID 和 FullName。
+不影响原有人员详情页跳转。
+无头像时显示 initials。
+多人员列表中懒加载生效。
+涉及文件：
+
+src/app/components/common/org-user-item/org-user-item.component.html
+JIRA-009: 优化照片请求拦截器行为
+类型：Task
+优先级：P0
+预估：0.8d
+
+描述：
+调整全局 HTTP 拦截器对照片请求的处理，避免照片请求触发全局 loading 抖动，并允许浏览器/服务端缓存策略生效。
+
+验收标准：
+
+/photos/ 请求不追加 Cache-Control: no-cache。
+/photos/ 请求不触发全局 loading 计数。
+/photos/ 请求错误不弹全局 toast。
+普通 GET 请求仍保持原有 no-cache 行为。
+普通业务请求 loading 行为不回归。
+涉及文件：
+
+src/app/interceptor/custom-request-interceptor.service.ts
+JIRA-010: 修复 Interceptor loading debounce 实现
+类型：Bug
+优先级：P0
+预估：0.5d
+
+描述：
+修复 CustomInterceptor 中 debounce 函数每次请求都重新创建的问题，保证 loading 状态更新节流生效。
+
+验收标准：
+
+debounce 包装函数只初始化一次。
+setLoadingStatus() 不重复创建 debounce。
+连续请求时 loading 状态更新稳定。
+不影响现有错误处理逻辑。
+涉及文件：
+
+src/app/interceptor/custom-request-interceptor.service.ts
+JIRA-011: 管理 Blob URL 生命周期
+类型：Task
+优先级：P0
+预估：1d
+
+描述：
+为 URL.createObjectURL() 创建的头像 URL 增加受控释放策略，降低长时间使用时的内存占用风险。
+
+验收标准：
+
+成功加载照片后记录对应 object URL。
+invalidate(msid) 时释放指定头像 URL。
+页面卸载或服务销毁时统一释放已缓存 URL。
+LRU 淘汰时不直接 revoke，避免可见图片变 broken。
+释放逻辑不影响当前头像正常显示。
+涉及文件：
+
+src/app/service/user-photo.service.ts
+JIRA-012: 增加头像服务单元测试
+类型：Test
+优先级：P1
+预估：1d
+
+描述：
+为 UserPhotoService 增加单元测试，覆盖照片请求、缓存、异常降级、URL 释放等关键路径。
+
+验收标准：
+
+覆盖空 msid 不发请求。
+覆盖非法 msid 不发请求。
+覆盖 204 返回 null。
+覆盖 404/403 静默降级。
+覆盖成功 blob 转 URL。
+覆盖相同 MSID 请求去重。
+覆盖 invalidate(msid) 后重新请求。
+覆盖 5xx 可观测日志与负缓存清理。
+涉及文件：
+
+src/app/service/user-photo.service.spec.ts
+JIRA-013: 增加头像组件单元测试
+类型：Test
+优先级：P1
+预估：0.8d
+
+描述：
+为 user-avatar 组件增加单元测试，覆盖 initials、fallback、懒加载和 msid 变化。
+
+验收标准：
+
+正确根据姓名生成 initials。
+无姓名时显示 ?。
+单词姓名可正常生成 initials。
+背景色生成稳定。
+不支持 IntersectionObserver 时立即加载。
+msid 变化后重新加载头像。
+涉及文件：
+
+src/app/components/common/user-avatar/user-avatar.component.spec.ts
+JIRA-014: 清理调试日志
+类型：Task
+优先级：P0
+预估：0.2d
+
+描述：
+移除常量文件中的环境配置调试输出，避免生产环境控制台噪声。
+
+验收标准：
+
+删除 console.log(environment)。
+不影响 API URL 常量生成。
+构建行为不变。
+涉及文件：
+
+src/app/data/constants.ts
+JIRA-015: 更新头像功能技术说明文档
+类型：Task
+优先级：P2
+预估：0.5d
+
+描述：
+同步更新员工头像展示功能设计与实现说明，记录当前实现边界、缓存策略、错误处理和后续风险。
+
+验收标准：
+
+明确当前功能只包含头像展示，不包含照片检索。
+说明 UserPhotoService、user-avatar、Interceptor 的职责。
+记录 Blob URL 释放策略。
+记录已知残余风险：LRU 淘汰不 revoke。
+文档与代码实现一致。
+涉及文件：
+
+src/user_photo_feature.md
+JIRA-016: 手工联调验证头像展示入口
+类型：Test
+优先级：P1
+预估：0.7d
+
+描述：
+对所有头像展示入口进行手工验证，确保功能在真实页面中表现稳定。
+
+验收标准：
+
+员工详情页头像正常显示。
+搜索结果用户列表头像正常显示。
+导航栏当前用户头像正常显示。
+组织结构人员项头像正常显示。
+无照片用户显示 initials。
+头像接口 404/204/5xx 时页面不报错。
+大量头像加载时全局 loading 不闪烁。
+浏览器 Network 中同一 MSID 不重复请求。
+涉及页面：
+
+/user
+/user/:id
+/search/:filter
+导航栏搜索结果
+组织结构区域
