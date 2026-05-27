@@ -304,3 +304,239 @@ JIRA-016: 手工联调验证头像展示入口
 /search/:filter
 导航栏搜索结果
 组织结构区域
+
+
+下面是一份可直接给 QA server 执行的 runbook。脚本名应为 Invoke-WeComAuditScheduler.ps1，你写的 Aduit 应该只是 typo。
+
+目标运行方式
+
+QA 建议部署成两个 Windows Task Scheduler jobs：
+
+Phase Analysis: 先跑分析，生成 RunId 和 latest-run.json
+运维窗口：补齐需要人工放入 source folder 的文件
+Phase Validate: 读取上一步 RunId，做 validation + archive，失败时发邮件
+不建议 QA/生产用 -Phase All，因为中间没有人工补文件窗口。
+
+1. 部署代码到 QA Server
+
+建议目录：
+
+C:\SysAdmin\wecom_audit\
+把项目文件复制过去，至少包含：
+
+Invoke-WeComAuditScheduler.ps1
+Invoke-AuditLog.ps1
+Invoke-AuditValidate.ps1
+wecom_analysis_comm.psm1
+analysis_task.config.psd1
+modules\
+*.ps1 analysis dependencies
+如果文件来自 zip 或网络共享，先 unblock：
+
+Get-ChildItem C:\SysAdmin\wecom_audit -Recurse | Unblock-File
+2. 准备 QA 目录和权限
+
+当前 config 默认：
+
+InputRoot  = 'C:\addin_deploy_cert'
+LogRoot    = 'C:\SysAdmin\log'
+BackupRoot = '\\cod.test.com.cn\apptest\wecom_audit_log_backup'
+需要确保运行账号有权限：
+
+New-Item -ItemType Directory -Force C:\addin_deploy_cert\wecom_audit_log
+New-Item -ItemType Directory -Force C:\SysAdmin\log
+并确认账号能访问 backup share：
+
+Test-Path '\\cod.test.com.cn\apptest\wecom_audit_log_backup'
+输入文件应放在：
+
+C:\addin_deploy_cert\wecom_audit_log\
+运行输出一般在：
+
+C:\SysAdmin\log\runs\<RunId>\
+C:\SysAdmin\log\latest-run.json
+C:\SysAdmin\log\runs\<RunId>\validation\
+3. 检查 QA config
+
+打开：
+
+C:\SysAdmin\wecom_audit\analysis_task.config.psd1
+重点确认：
+
+ScheduleAnchor = '20260402'
+InputRoot      = 'C:\addin_deploy_cert'
+LogRoot        = 'C:\SysAdmin\log'
+BackupRoot     = '\\cod.test.com.cn\apptest\wecom_audit_log_backup'
+Notification.QA
+Tasks
+BackupValidationRules
+如果 QA server 要用独立配置，建议新建：
+
+analysis_task.config.qa.psd1
+然后运行时显式传：
+
+-ConfigPath C:\SysAdmin\wecom_audit\analysis_task.config.qa.psd1
+4. 检查邮件证书
+
+config 里 QA 使用：
+
+CertName = 'wecom-audit-qa-cert'
+运行账号必须能读取该证书。建议先在 QA server 上用同一个账号测试：
+
+cd C:\SysAdmin\wecom_audit
+Import-Module .\wecom_analysis_comm.psm1 -Force
+Get-Cert -KeyName 'wecom-audit-qa-cert'
+如果返回为空或报错，preflight/validation/archive failure notification 会失败或写 notification sidecar。
+
+5. 手动试跑 Phase Analysis
+
+先准备 Analysis 阶段需要的文件。按当前 config，2-week cycle 需要类似：
+
+C:\addin_deploy_cert\wecom_audit_log\MSMS WeCom Mail Log_{startDate}_{endDate}.csv
+C:\addin_deploy_cert\wecom_audit_log\<member operation records xlsx>
+然后执行：
+
+cd C:\SysAdmin\wecom_audit
+
+.\Invoke-WeComAuditScheduler.ps1 `
+    -Phase Analysis `
+    -env QA `
+    -ConfigPath .\analysis_task.config.psd1
+成功后检查：
+
+Get-Content C:\SysAdmin\log\latest-run.json -Raw
+如果 preflight 失败，exit code 是 3，检查：
+
+C:\SysAdmin\log\runs\preflight_yyyyMMdd_HHmmss\preflight-report.json
+C:\SysAdmin\log\runs\latest-preflight.json
+6. 手动试跑 Phase Validate
+
+Analysis 成功后，补齐 Validate 阶段要求的人工文件到 source folder：
+
+C:\addin_deploy_cert\wecom_audit_log\
+例如当前 config 里：
+
+COD WeCom Login to Non-Approved Devices FID BU - Report({startDate} - {endDate}).msg
+Conduct WeCom Log Audit file uploaded.msg    # 4-week cycle
+然后执行：
+
+cd C:\SysAdmin\wecom_audit
+
+.\Invoke-WeComAuditScheduler.ps1 `
+    -Phase Validate `
+    -env QA `
+    -ConfigPath .\analysis_task.config.psd1
+Validate 会读取 latest-run.json，并校验日期一致后调用 Invoke-AuditValidate.ps1 -RunId <RunId>。
+
+Exit code 含义：
+
+0 = 成功
+1 = validation missing/unexpected files
+2 = archive/copy/delete 阶段失败
+3 = preflight failed
+其他 = analysis 或脚本异常
+失败时重点看：
+
+C:\SysAdmin\log\runs\<RunId>\validation\backup-validation-summary.json
+C:\SysAdmin\log\runs\<RunId>\validation\backup-validation-report.txt
+C:\SysAdmin\log\runs\<RunId>\validation\notification-failure.json
+7. 创建 Scheduler Jobs
+
+建议用运行账号登录 QA server，以管理员 PowerShell 执行。下面示例是每两周周四：
+
+Analysis job: 08:00
+Validate job: 16:00
+
+请把 $User 改成实际 domain service account。
+
+$ScriptRoot = 'C:\SysAdmin\wecom_audit'
+$ConfigPath = 'C:\SysAdmin\wecom_audit\analysis_task.config.psd1'
+$User = 'DOMAIN\svc-wecom-audit'
+
+$ActionAnalysis = New-ScheduledTaskAction `
+    -Execute 'powershell.exe' `
+    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptRoot\Invoke-WeComAuditScheduler.ps1`" -Phase Analysis -env QA -ConfigPath `"$ConfigPath`"" `
+    -WorkingDirectory $ScriptRoot
+
+$TriggerAnalysis = New-ScheduledTaskTrigger `
+    -Weekly `
+    -WeeksInterval 2 `
+    -DaysOfWeek Thursday `
+    -At 08:00
+
+Register-ScheduledTask `
+    -TaskName 'WeCom-Audit-QA-Phase1-Analysis' `
+    -Action $ActionAnalysis `
+    -Trigger $TriggerAnalysis `
+    -User $User `
+    -RunLevel Highest `
+    -Description 'WeCom audit QA phase 1 analysis'
+再创建 Validate job：
+
+$ActionValidate = New-ScheduledTaskAction `
+    -Execute 'powershell.exe' `
+    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptRoot\Invoke-WeComAuditScheduler.ps1`" -Phase Validate -env QA -ConfigPath `"$ConfigPath`"" `
+    -WorkingDirectory $ScriptRoot
+
+$TriggerValidate = New-ScheduledTaskTrigger `
+    -Weekly `
+    -WeeksInterval 2 `
+    -DaysOfWeek Thursday `
+    -At 16:00
+
+Register-ScheduledTask `
+    -TaskName 'WeCom-Audit-QA-Phase2-Validate' `
+    -Action $ActionValidate `
+    -Trigger $TriggerValidate `
+    -User $User `
+    -RunLevel Highest `
+    -Description 'WeCom audit QA phase 2 validation and archive'
+注册时系统会提示输入 $User 密码。
+
+8. Scheduler Job 设置建议
+
+在 Task Scheduler UI 里确认：
+
+General:
+- Run whether user is logged on or not
+- Run with highest privileges
+
+Conditions:
+- 取消 Start the task only if the computer is on AC power，除非服务器策略要求
+
+Settings:
+- Allow task to be run on demand
+- Stop the task if it runs longer than: 4 hours
+- If the running task does not end when requested, force it to stop
+- If the task is already running: Do not start a new instance
+9. 手动触发验证 Scheduler
+
+Start-ScheduledTask -TaskName 'WeCom-Audit-QA-Phase1-Analysis'
+Get-ScheduledTaskInfo -TaskName 'WeCom-Audit-QA-Phase1-Analysis'
+
+Start-ScheduledTask -TaskName 'WeCom-Audit-QA-Phase2-Validate'
+Get-ScheduledTaskInfo -TaskName 'WeCom-Audit-QA-Phase2-Validate'
+查看 LastTaskResult：
+
+(Get-ScheduledTaskInfo -TaskName 'WeCom-Audit-QA-Phase1-Analysis').LastTaskResult
+(Get-ScheduledTaskInfo -TaskName 'WeCom-Audit-QA-Phase2-Validate').LastTaskResult
+0 表示成功。1/2/3 对应上面的业务 exit code。
+
+10. Backfill 手动运行
+
+如果要补跑历史日期，两个 phase 必须使用同一个 -StartDate，必要时也固定 -ForceCurrentRunWeeks：
+
+.\Invoke-WeComAuditScheduler.ps1 `
+    -Phase Analysis `
+    -StartDate 20260319 `
+    -ForceCurrentRunWeeks 4 `
+    -env QA `
+    -ConfigPath .\analysis_task.config.psd1
+
+.\Invoke-WeComAuditScheduler.ps1 `
+    -Phase Validate `
+    -StartDate 20260319 `
+    -ForceCurrentRunWeeks 4 `
+    -env QA `
+    -ConfigPath .\analysis_task.config.psd1
+否则 Validate 会因为 handoff 日期不一致而中止，这是设计行为。
