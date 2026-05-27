@@ -99,6 +99,260 @@ function Write-PreflightReport {
     return $reportPath
 }
 
+function Get-ValidateSummaryPath {
+    param(
+        [Parameter(Mandatory)]
+        [string]$RunsRoot,
+        [Parameter(Mandatory)]
+        [string]$RunId
+    )
+    return (Join-Path $RunsRoot (Join-Path $RunId 'validation\backup-validation-summary.json'))
+}
+
+function Write-NotificationSidecar {
+    param(
+        [Parameter(Mandatory)]
+        [string]$RunsRoot,
+        [Parameter(Mandatory)]
+        [string]$RunId,
+        [Parameter(Mandatory)]
+        [string]$Type,
+        [Parameter(Mandatory)]
+        [string]$Reason
+    )
+
+    $validationDir = Join-Path $RunsRoot (Join-Path $RunId 'validation')
+    $sidecarPath = if (Test-Path -LiteralPath $validationDir -PathType Container) {
+        Join-Path $validationDir 'notification-failure.json'
+    }
+    else {
+        Join-Path $RunsRoot 'notification-failure.json'
+    }
+
+    try {
+        $sidecarDir = Split-Path -Parent $sidecarPath
+        if ($sidecarDir -and -not (Test-Path -LiteralPath $sidecarDir -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $sidecarDir | Out-Null
+        }
+        $payload = [PSCustomObject]@{
+            Type       = $Type
+            Reason     = $Reason
+            RunId      = $RunId
+            RecordedAt = (Get-Date).ToString('o')
+        }
+        $payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $sidecarPath -Encoding UTF8
+        Write-Warning "Notification sidecar written to '$sidecarPath'."
+    }
+    catch {
+        Write-Warning "Failed to write notification sidecar '$sidecarPath': $($_.Exception.Message)"
+    }
+}
+
+function Update-SummaryNotificationBlock {
+    param(
+        [Parameter(Mandatory)]
+        [string]$SummaryPath,
+        [Parameter(Mandatory)]
+        [object]$Summary,
+        [Parameter(Mandatory)]
+        [hashtable]$Block
+    )
+    try {
+        $Summary | Add-Member -MemberType NoteProperty -Name 'Notification' -Value ([PSCustomObject]$Block) -Force
+        $Summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $SummaryPath -Encoding UTF8
+    }
+    catch {
+        Write-Warning "Failed to write Notification block back to summary '$SummaryPath': $($_.Exception.Message)"
+    }
+}
+
+function Send-ValidationFailureNotificationFromSummary {
+    param(
+        [Parameter(Mandatory)]
+        [string]$RunsRoot,
+        [Parameter(Mandatory)]
+        [string]$RunId,
+        [Parameter(Mandatory)]
+        [hashtable]$Config,
+        [Parameter(Mandatory)]
+        [string]$Environment,
+        [Parameter(Mandatory)]
+        [string]$StartDate,
+        [Parameter(Mandatory)]
+        [string]$EndDate
+    )
+
+    $summaryPath = Get-ValidateSummaryPath -RunsRoot $RunsRoot -RunId $RunId
+    if (-not (Test-Path -LiteralPath $summaryPath -PathType Leaf)) {
+        Write-Warning "Validation summary not found at '$summaryPath'. Skipping notification."
+        Write-NotificationSidecar -RunsRoot $RunsRoot -RunId $RunId -Type 'ValidationFailed' -Reason "Summary missing: $summaryPath"
+        return
+    }
+
+    $summary = $null
+    try {
+        $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
+    }
+    catch {
+        Write-Warning "Failed to parse validation summary '$summaryPath': $($_.Exception.Message)"
+        Write-NotificationSidecar -RunsRoot $RunsRoot -RunId $RunId -Type 'ValidationFailed' -Reason "Summary parse error: $($_.Exception.Message)"
+        return
+    }
+
+    $missingFiles = @()
+    $unexpectedFiles = @()
+    if ($summary.PSObject.Properties['MissingFiles'])    { $missingFiles    = @($summary.MissingFiles) }
+    if ($summary.PSObject.Properties['UnexpectedFiles']) { $unexpectedFiles = @($summary.UnexpectedFiles | ForEach-Object { [string]$_ }) }
+
+    if ($missingFiles.Count -eq 0 -and $unexpectedFiles.Count -eq 0) {
+        Write-Warning "Validation summary reports no missing or unexpected files; skipping notification."
+        return
+    }
+
+    $notificationConfig = Resolve-NotificationConfig -Config $Config -Environment $Environment
+    $attempted = $false
+    $sent = $false
+    $errorMessage = $null
+    $recipients = @()
+    $sentAt = $null
+
+    if (-not $notificationConfig -or -not $notificationConfig.Cert) {
+        $errorMessage = 'Notification config not available or cert not found.'
+        Write-Warning $errorMessage
+    }
+    else {
+        $attempted = $true
+        $recipients = @($notificationConfig.OpsTeam)
+        try {
+            $validationFolder = if ($summary.PSObject.Properties['ValidationTargetFolder']) {
+                [string]$summary.ValidationTargetFolder
+            }
+            elseif ($summary.PSObject.Properties['ValidationFolder']) {
+                [string]$summary.ValidationFolder
+            }
+            else { $null }
+            $validationReportPath = if ($summary.PSObject.Properties['ValidationTextPath'])  { [string]$summary.ValidationTextPath } else { $null }
+
+            Send-ValidationFailureNotification `
+                -NotificationConfig $notificationConfig `
+                -Environment $Environment `
+                -RunId $RunId `
+                -StartDate $StartDate `
+                -EndDate $EndDate `
+                -MissingFiles $missingFiles `
+                -UnexpectedFiles $unexpectedFiles `
+                -ValidationFolder $validationFolder `
+                -ValidationReportPath $validationReportPath `
+                -SummaryPath $summaryPath
+
+            $sent = $true
+            $sentAt = (Get-Date).ToString('o')
+            Write-Host "Validation failure notification sent to ops team." -ForegroundColor Cyan
+        }
+        catch {
+            $errorMessage = $_.Exception.Message
+            Write-Warning "Failed to send validation failure notification: $errorMessage"
+        }
+    }
+
+    Update-SummaryNotificationBlock -SummaryPath $summaryPath -Summary $summary -Block @{
+        Attempted  = $attempted
+        Sent       = $sent
+        Type       = 'ValidationFailed'
+        Recipients = $recipients
+        Error      = $errorMessage
+        SentAt     = $sentAt
+    }
+}
+
+function Send-ArchiveFailureNotificationFromSummary {
+    param(
+        [Parameter(Mandatory)]
+        [string]$RunsRoot,
+        [Parameter(Mandatory)]
+        [string]$RunId,
+        [Parameter(Mandatory)]
+        [hashtable]$Config,
+        [Parameter(Mandatory)]
+        [string]$Environment,
+        [Parameter(Mandatory)]
+        [string]$StartDate,
+        [Parameter(Mandatory)]
+        [string]$EndDate
+    )
+
+    $summaryPath = Get-ValidateSummaryPath -RunsRoot $RunsRoot -RunId $RunId
+    if (-not (Test-Path -LiteralPath $summaryPath -PathType Leaf)) {
+        Write-Warning "Validation summary not found at '$summaryPath'. Skipping archive notification."
+        Write-NotificationSidecar -RunsRoot $RunsRoot -RunId $RunId -Type 'ArchiveFailed' -Reason "Summary missing: $summaryPath"
+        return
+    }
+
+    $summary = $null
+    try {
+        $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
+    }
+    catch {
+        Write-Warning "Failed to parse validation summary '$summaryPath': $($_.Exception.Message)"
+        Write-NotificationSidecar -RunsRoot $RunsRoot -RunId $RunId -Type 'ArchiveFailed' -Reason "Summary parse error: $($_.Exception.Message)"
+        return
+    }
+
+    $archiveStatus = if ($summary.PSObject.Properties['ArchiveStatus']) { [string]$summary.ArchiveStatus } else { 'Unknown' }
+    if ($archiveStatus -notin @('BackupFailed', 'CleanupAborted', 'CleanupPartiallyFailed')) {
+        Write-Warning "ArchiveStatus '$archiveStatus' is not a failure state; skipping notification."
+        return
+    }
+
+    $notificationConfig = Resolve-NotificationConfig -Config $Config -Environment $Environment
+    $attempted = $false
+    $sent = $false
+    $errorMessage = $null
+    $recipients = @()
+    $sentAt = $null
+
+    if (-not $notificationConfig -or -not $notificationConfig.Cert) {
+        $errorMessage = 'Notification config not available or cert not found.'
+        Write-Warning $errorMessage
+    }
+    else {
+        $attempted = $true
+        $recipients = @($notificationConfig.OpsTeam)
+        try {
+            $backupFolder = if ($summary.PSObject.Properties['BackupFolder']) { [string]$summary.BackupFolder } else { $null }
+            $archiveResult = if ($summary.PSObject.Properties['ArchiveResult']) { $summary.ArchiveResult } else { $null }
+
+            Send-ArchiveFailureNotification `
+                -NotificationConfig $notificationConfig `
+                -Environment $Environment `
+                -RunId $RunId `
+                -StartDate $StartDate `
+                -EndDate $EndDate `
+                -ArchiveStatus $archiveStatus `
+                -ArchiveResult $archiveResult `
+                -BackupFolder $backupFolder `
+                -SummaryPath $summaryPath
+
+            $sent = $true
+            $sentAt = (Get-Date).ToString('o')
+            Write-Host "Archive failure notification sent to ops team." -ForegroundColor Cyan
+        }
+        catch {
+            $errorMessage = $_.Exception.Message
+            Write-Warning "Failed to send archive failure notification: $errorMessage"
+        }
+    }
+
+    Update-SummaryNotificationBlock -SummaryPath $summaryPath -Summary $summary -Block @{
+        Attempted  = $attempted
+        Sent       = $sent
+        Type       = 'ArchiveFailed'
+        Recipients = $recipients
+        Error      = $errorMessage
+        SentAt     = $sentAt
+    }
+}
+
 function Invoke-PreflightCheck {
     param(
         [Parameter(Mandatory)]
@@ -114,7 +368,9 @@ function Invoke-PreflightCheck {
         [string]$StartDate,
         [string]$EndDate,
         [string]$Environment,
-        [string]$BackupFolder,
+        # Folder checked for ReadyBy='Validate' fixed files. Under source-mode
+        # validation this is the SOURCE folder, not the backup folder.
+        [string]$ValidationFolder,
         [string]$SourceFolder
     )
 
@@ -124,8 +380,8 @@ function Invoke-PreflightCheck {
         Phase           = $Phase
         CurrentRunWeeks = $CurrentRunWeeks
     }
-    if ($BackupFolder) { $preflightArgs.BackupFolder = $BackupFolder }
-    if ($SourceFolder) { $preflightArgs.SourceFolder = $SourceFolder }
+    if ($ValidationFolder) { $preflightArgs.ValidationFolder = $ValidationFolder }
+    if ($SourceFolder)     { $preflightArgs.SourceFolder     = $SourceFolder }
 
     $preflight = Test-PreflightReady @preflightArgs
 
@@ -151,10 +407,12 @@ function Invoke-PreflightCheck {
         try {
             $notifArgs = @{
                 NotificationConfig = $notificationConfig
-                MissingItems       = $preflight.MissingItems
                 Phase              = $Phase
                 StartDate          = $StartDate
                 EndDate            = $EndDate
+            }
+            if ($preflight.MissingItems.Count -gt 0) {
+                $notifArgs.MissingItems = $preflight.MissingItems
             }
             if ($preflight.InvalidItems.Count -gt 0) {
                 $notifArgs.InvalidItems = $preflight.InvalidItems
@@ -273,7 +531,7 @@ if ($Phase -in @('Validate', 'All')) {
         -StartDate $cycle.StartDate `
         -EndDate $cycle.EndDate `
         -Environment $env `
-        -BackupFolder $resolvedSourceFolder
+        -ValidationFolder $resolvedSourceFolder
 
     Write-Host "--- Phase 2: Validation + Archive (RunId=$($handoff.RunId), CurrentRunWeeks=$($cycle.CurrentRunWeeks)) ---" -ForegroundColor Cyan
     $validateArgs = @{
@@ -284,6 +542,25 @@ if ($Phase -in @('Validate', 'All')) {
 
     & $auditValidateScript @validateArgs
     $validateExitCode = $LASTEXITCODE
+
+    if ($validateExitCode -eq 1) {
+        Send-ValidationFailureNotificationFromSummary `
+            -RunsRoot $runsRoot `
+            -RunId $handoff.RunId `
+            -Config $config `
+            -Environment $env `
+            -StartDate $cycle.StartDate `
+            -EndDate $cycle.EndDate
+    }
+    elseif ($validateExitCode -eq 2) {
+        Send-ArchiveFailureNotificationFromSummary `
+            -RunsRoot $runsRoot `
+            -RunId $handoff.RunId `
+            -Config $config `
+            -Environment $env `
+            -StartDate $cycle.StartDate `
+            -EndDate $cycle.EndDate
+    }
 
     if ($validateExitCode -ne 0) {
         Write-Host "Validation/archive completed with exit code $validateExitCode." -ForegroundColor Yellow
