@@ -1,0 +1,150 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)]
+    [ValidateSet('Analysis', 'Validate')]
+    [string]$Phase,
+    [ValidateSet('PROD', 'QA')]
+    [string]$env = 'QA',
+    [string]$ConfigPath,
+    [ValidatePattern('^\d{8}$')]
+    [string]$StartDate,
+    [ValidateSet('2', '4')]
+    [string]$ForceCurrentRunWeeks,
+    [ValidatePattern('^\d+/\d+$')]
+    [string]$Sequence,
+    [ValidateSet('Normal', 'Final', 'LastCall')]
+    [string]$Severity = 'Normal',
+    [switch]$DryRun
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$modulePath = Join-Path $scriptRoot 'wecom_analysis_comm.psm1'
+if (-not (Test-Path $modulePath -PathType Leaf)) { throw "Module not found: $modulePath" }
+Import-Module $modulePath -Force
+
+$ConfigPath = Resolve-AuditConfigPath -ConfigPath $ConfigPath -ScriptRoot $scriptRoot
+if (-not (Test-Path $ConfigPath -PathType Leaf)) { throw "Config file not found: $ConfigPath" }
+$config = Import-PowerShellDataFile -Path $ConfigPath
+
+$cycle = Resolve-ScheduleCycle -Config $config -StartDateOverride $StartDate -ForceCurrentRunWeeks $ForceCurrentRunWeeks
+foreach ($w in $cycle.Warnings) { Write-Warning $w.Message }
+
+# Cycle-day guard: non-backfill reminders must fire on cycle.EndDate, otherwise
+# a mis-configured cron or anchor drift would ping ops on the wrong day.
+$todayStr = (Get-Date -Format 'yyyyMMdd')
+$isBackfill = [bool]$StartDate
+if (-not $isBackfill -and $cycle.EndDate -ne $todayStr) {
+    Write-Warning "Reminder skipped: today ($todayStr) is not the cycle endDate ($($cycle.EndDate)). Use -StartDate <yyyyMMdd> for backfill runs."
+    exit 0
+}
+
+$configuredInputRoot = Resolve-AuditInputRoot -Config $config
+$auditLogFolderName = Get-WeComAuditLogFolderName
+$resolvedSourceFolder = [System.IO.Path]::Combine($configuredInputRoot, $auditLogFolderName)
+
+$dateTokens = New-DateTokenMap -StartDate $cycle.StartDate -EndDate $cycle.EndDate
+$dateTokens.InputRoot = $configuredInputRoot
+
+# Source-mode validation: Validate phase checks the source folder too (matches scheduler).
+$preflightArgs = @{
+    Config           = $config
+    DateTokens       = $dateTokens
+    Phase            = $Phase
+    CurrentRunWeeks  = $cycle.CurrentRunWeeks
+}
+if ($Phase -eq 'Analysis') {
+    $preflightArgs.SourceFolder     = $resolvedSourceFolder
+}
+else {
+    $preflightArgs.ValidationFolder = $resolvedSourceFolder
+}
+$preflight = Test-PreflightReady @preflightArgs
+
+# Minimal log line; does NOT go under runs/<RunId>/ since reminders have no RunId.
+# Resolve-AuditOutputRoot already appends wecom_audit_log; only need to add reminders/.
+$logRoot = Resolve-AuditOutputRoot -Config $config -ConfigPath $ConfigPath
+$reminderLogDir = [System.IO.Path]::Combine($logRoot, 'reminders')
+if (-not (Test-Path -LiteralPath $reminderLogDir -PathType Container)) {
+    New-Item -ItemType Directory -Force -Path $reminderLogDir | Out-Null
+}
+$reminderLogPath = Join-Path $reminderLogDir ("reminder-{0}-{1}-{2}.log" -f $todayStr, $Phase, (Get-Date -Format 'HHmm'))
+
+$logLines = New-Object 'System.Collections.Generic.List[string]'
+$logLines.Add("[$((Get-Date).ToString('o'))] Reminder phase=$Phase env=$env cycle=$($cycle.StartDate)-$($cycle.EndDate) backfill=$isBackfill sequence=$Sequence severity=$Severity dryRun=$($DryRun.IsPresent)")
+$logLines.Add("AllReady=$($preflight.AllReady) missing=$($preflight.MissingItems.Count) invalid=$($preflight.InvalidItems.Count)")
+
+if ($preflight.AllReady) {
+    Write-Host "Preflight reports all files ready for phase $Phase. No reminder sent." -ForegroundColor Green
+    $logLines.Add("Action: SKIPPED (all ready)")
+    Set-Content -LiteralPath $reminderLogPath -Value $logLines -Encoding UTF8
+    exit 0
+}
+
+Write-Host "Preflight reports $($preflight.MissingItems.Count) missing and $($preflight.InvalidItems.Count) invalid item(s) for phase $Phase." -ForegroundColor Yellow
+foreach ($item in $preflight.MissingItems) {
+    Write-Host "  MISSING: [$($item.Source)] $($item.Name) - $($item.ExpectedPath)" -ForegroundColor Yellow
+}
+foreach ($item in $preflight.InvalidItems) {
+    Write-Host "  INVALID: [$($item.Source)] $($item.Name) - $($item.Error)" -ForegroundColor Yellow
+}
+
+$nextSchedulerTime = $null
+if ($config.ContainsKey('ReminderTargetTimes') -and $config.ReminderTargetTimes -and $config.ReminderTargetTimes.ContainsKey($Phase)) {
+    $nextSchedulerTime = [string]$config.ReminderTargetTimes[$Phase]
+}
+else {
+    Write-Warning "ReminderTargetTimes.$Phase not set in config; reminder will omit the deadline."
+}
+
+$notificationConfig = Resolve-NotificationConfig -Config $config -Environment $env
+if (-not $notificationConfig) {
+    Write-Warning "Reminder skipped: notification config not available for env=$env."
+    $logLines.Add("Action: SKIPPED (no notification config)")
+    Set-Content -LiteralPath $reminderLogPath -Value $logLines -Encoding UTF8
+    exit 0
+}
+# DryRun only renders the preview, so an absent Cert is not a blocker. Real
+# sends still require Cert (enforced inside Send-AuditReminderNotification).
+if (-not $DryRun -and -not $notificationConfig.Cert) {
+    Write-Warning "Reminder email skipped: cert not available for env=$env. Use -DryRun to render the preview without a cert."
+    $logLines.Add("Action: SKIPPED (no cert)")
+    Set-Content -LiteralPath $reminderLogPath -Value $logLines -Encoding UTF8
+    exit 0
+}
+
+try {
+    $sendArgs = @{
+        NotificationConfig = $notificationConfig
+        Environment        = $env
+        Phase              = $Phase
+        CycleStartDate     = $cycle.StartDate
+        CycleEndDate       = $cycle.EndDate
+        SourceFolder       = $resolvedSourceFolder
+        MissingItems       = @($preflight.MissingItems)
+        InvalidItems       = @($preflight.InvalidItems)
+        Severity           = $Severity
+    }
+    if ($nextSchedulerTime) { $sendArgs.NextSchedulerTime = $nextSchedulerTime }
+    if ($Sequence)          { $sendArgs.Sequence          = $Sequence }
+    if ($isBackfill)        { $sendArgs.Backfill          = $true }
+    if ($DryRun)            { $sendArgs.DryRun            = $true }
+
+    Send-AuditReminderNotification @sendArgs
+    if ($DryRun) {
+        $logLines.Add("Action: DRY-RUN (preview printed, recipients=$($notificationConfig.OpsTeam -join ';'))")
+    }
+    else {
+        Write-Host "Reminder email sent to ops team." -ForegroundColor Cyan
+        $logLines.Add("Action: SENT (recipients=$($notificationConfig.OpsTeam -join ';'))")
+    }
+}
+catch {
+    Write-Warning "Failed to send reminder email: $($_.Exception.Message)"
+    $logLines.Add("Action: FAILED ($($_.Exception.Message))")
+}
+
+Set-Content -LiteralPath $reminderLogPath -Value $logLines -Encoding UTF8
+exit 0
