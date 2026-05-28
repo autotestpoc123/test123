@@ -2321,4 +2321,206 @@ function Send-ArchiveFailureNotification {
         -LogFilePath $LogFilePath
 }
 
-Export-ModuleMember -Function Convert-ExactDate, Write-Log, Get-Cert, Get-LogFilePath, Get-VaultSecret, New-LazyLdapConnection, Close-LazyLdapConnection, Send-Mail, New-HtmlBody, New-DateTokenMap, Resolve-TemplateText, Get-OptionalObjectPropertyValue, Write-AnalysisSummaryJson, Assert-ConfigInputDirectories, Get-TaskResultByName, Get-TaskSummaryData, Get-BackupValidationConfig, Get-ExpectedBackupFiles, Test-BackupFolderContent, Get-SourceCopyTargets, Format-BackupValidationText, Export-AnalysisReport, New-LdapOrFilter, Split-LdapBatches, Resolve-LdapSearchBase, Get-LdapUserByMail, Get-LdapUserById, Get-WeComAuditLogFolderName, Get-NormalizedFullPath, Test-PathWithinAllowedRoots, Test-SafeToDeleteSourceFile, Remove-SourceFileWithRetry, Invoke-SourceFileCleanup, Test-AllowedRootIsTooBroad, Resolve-SourceCleanupConfig, Assert-SourceCleanupConfig, Assert-TaskNameUniqueness, Resolve-AuditConfigPath, Resolve-AuditOutputRoot, Resolve-AuditInputRoot, Resolve-TaskInputPath, Resolve-NotificationConfig, Get-PreflightFiles, Test-PreflightReady, Send-PreflightNotification, Send-ValidationFailureNotification, Send-ArchiveFailureNotification, Resolve-ScheduleCycle, Resolve-PhaseHandoff
+<#
+.SYNOPSIS
+Sends a "files missing" reminder to ops ahead of a scheduled Analysis or Validate
+run.
+.DESCRIPTION
+Builds an HTML body listing missing/invalid items, the source folder where ops
+should copy the files, and the deadline (next scheduler job time). Subject
+encodes Phase, sequence (e.g. "1/2"), and severity (Normal / Final / LastCall)
+so successive reminders are visually distinguishable. Unlike Send-PreflightFailed
+this is sent BEFORE the scheduled job runs — wording assumes ops can still act in
+time, not that a job already failed.
+
+Reuses Send-Mail and Build-AuditNotificationHtml; OpsTeam / CcRecipients are
+filtered through the same email-regex validation used elsewhere.
+.PARAMETER NotificationConfig
+Resolved notification config (from Resolve-NotificationConfig).
+.PARAMETER Environment
+Environment tag (PROD / QA) shown in the subject line.
+.PARAMETER Phase
+'Analysis' or 'Validate' — which scheduled job this reminder fronts.
+.PARAMETER CycleStartDate
+Cycle start date (yyyyMMdd) shown in intro.
+.PARAMETER CycleEndDate
+Cycle end date (yyyyMMdd) shown in intro and subject.
+.PARAMETER SourceFolder
+Folder where ops should copy the files.
+.PARAMETER NextSchedulerTime
+Local time string ("HH:mm") of the next scheduled job. Used as the deadline in
+the email body. Comes from config ReminderTargetTimes[Phase].
+.PARAMETER MissingItems
+Items from Test-PreflightReady -MissingItems (Name, ExpectedPath, Source).
+.PARAMETER InvalidItems
+Items from Test-PreflightReady -InvalidItems (Name, Error, Source).
+.PARAMETER Sequence
+Optional "<n>/<total>" string shown in subject (e.g. "1/2"). Empty omits the
+counter.
+.PARAMETER Severity
+'Normal' | 'Final' | 'LastCall'. Drives subject prefix wording — 'Normal' →
+"Action Required", 'Final' → "FINAL CALL", 'LastCall' → "LAST CALL".
+.PARAMETER Backfill
+Mark this reminder as a backfill (out-of-cycle / manual catch-up). Adds a
+[Backfill] tag to the subject so ops do not confuse it with today's cycle.
+.PARAMETER DryRun
+Build the email exactly as it would be sent (running all validation and HTML
+encoding) but print Subject / From / To / Cc / Body to the console instead of
+calling Send-Mail. Useful for verifying first deployment or wording changes.
+.PARAMETER LogFilePath
+Optional log file forwarded to Send-Mail.
+.EXAMPLE
+Send-AuditReminderNotification -NotificationConfig $cfg -Environment 'QA' `
+    -Phase 'Analysis' -CycleStartDate '20260514' -CycleEndDate '20260528' `
+    -SourceFolder 'C:\addin_deploy_cert\wecom_audit_log' `
+    -NextSchedulerTime '08:00' -MissingItems $preflight.MissingItems `
+    -Sequence '1/2' -Severity 'Normal'
+.NOTES
+Dispatched by Invoke-WeComAuditOpsReminder.ps1 on a separate cron schedule —
+NEVER from the main scheduler. The main scheduler still runs its own preflight
+gate at job start; reminders are advisory only.
+#>
+function Send-AuditReminderNotification {
+    param(
+        [Parameter(Mandatory)]
+        [object]$NotificationConfig,
+        [Parameter(Mandatory)]
+        [string]$Environment,
+        [Parameter(Mandatory)]
+        [ValidateSet('Analysis', 'Validate')]
+        [string]$Phase,
+        [Parameter(Mandatory)]
+        [string]$CycleStartDate,
+        [Parameter(Mandatory)]
+        [string]$CycleEndDate,
+        [Parameter(Mandatory)]
+        [string]$SourceFolder,
+        [string]$NextSchedulerTime,
+        [object[]]$MissingItems = @(),
+        [object[]]$InvalidItems = @(),
+        [string]$Sequence,
+        [ValidateSet('Normal', 'Final', 'LastCall')]
+        [string]$Severity = 'Normal',
+        [switch]$Backfill,
+        [switch]$DryRun,
+        [string]$LogFilePath
+    )
+
+    if (-not $NotificationConfig) {
+        throw "Notification config missing."
+    }
+    # DryRun only needs From / OpsTeam / Cc to render the preview; SmtpServer /
+    # Cert / CertName / Port are required only when actually calling Send-Mail.
+    if (-not $DryRun) {
+        if (-not $NotificationConfig.SmtpServer -or -not $NotificationConfig.Cert) {
+            throw "Notification config incomplete: missing SmtpServer or Cert."
+        }
+    }
+    if ($NotificationConfig.OpsTeam.Count -eq 0) {
+        throw "Notification config has no OpsTeam recipients."
+    }
+    if ($MissingItems.Count -eq 0 -and $InvalidItems.Count -eq 0) {
+        throw "Send-AuditReminderNotification called with no MissingItems and no InvalidItems."
+    }
+
+    $emailPattern = '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+
+    $fromAddress = ([string]$NotificationConfig.From).Trim()
+    if ($fromAddress -notmatch $emailPattern) {
+        throw "Notification 'From' is not a valid email address: '$fromAddress'."
+    }
+    $validTo = @(
+        $NotificationConfig.OpsTeam |
+            Where-Object { $_ } |
+            ForEach-Object { ([string]$_).Trim() } |
+            Where-Object { $_ -match $emailPattern }
+    )
+    if ($validTo.Count -eq 0) {
+        throw "Notification 'OpsTeam' has no valid email recipients."
+    }
+    $validCc = @(
+        $NotificationConfig.CcRecipients |
+            Where-Object { $_ } |
+            ForEach-Object { ([string]$_).Trim() } |
+            Where-Object { $_ -match $emailPattern }
+    )
+    $ccStr = if ($validCc.Count -gt 0) { $validCc -join ',' } else { $validTo[0] }
+
+    $enc = { param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
+
+    $totalMissing = $MissingItems.Count + $InvalidItems.Count
+
+    $introParts = New-Object 'System.Collections.Generic.List[string]'
+    $introParts.Add("Phase: $(& $enc $Phase)")
+    $introParts.Add("Cycle: $(& $enc $CycleStartDate) - $(& $enc $CycleEndDate)")
+    $introParts.Add("Source folder: $(& $enc $SourceFolder)")
+    if ($NextSchedulerTime) {
+        $introParts.Add("Next scheduled $(& $enc $Phase) job: <b>$(& $enc $NextSchedulerTime)</b> today")
+    }
+    if ($Sequence) {
+        $introParts.Add("Reminder: $(& $enc $Sequence)")
+    }
+    $intro = ($introParts -join '<br/>')
+
+    $missingRendered = @(
+        $MissingItems | ForEach-Object {
+            $src = if ($_.PSObject.Properties['Source'] -and $_.Source) { " <i>[$(& $enc $_.Source)]</i>" } else { '' }
+            "<b>$(& $enc $_.Name)</b>: $(& $enc $_.ExpectedPath)$src"
+        }
+    )
+    $invalidRendered = @(
+        $InvalidItems | ForEach-Object {
+            $src = if ($_.PSObject.Properties['Source'] -and $_.Source) { " <i>[$(& $enc $_.Source)]</i>" } else { '' }
+            "<b>$(& $enc $_.Name)</b>: $(& $enc $_.Error)$src"
+        }
+    )
+
+    $sections = @(
+        [PSCustomObject]@{ Heading = 'Missing Files';  Items = $missingRendered }
+        [PSCustomObject]@{ Heading = 'Invalid Items';  Items = $invalidRendered }
+    )
+
+    $deadlineText = if ($NextSchedulerTime) { "by $NextSchedulerTime today" } else { 'before the next scheduled job' }
+    $footer = "Please copy the listed files to '$SourceFolder' $deadlineText. The scheduled $Phase job will fail if files are still missing at run time."
+
+    $body = Build-AuditNotificationHtml `
+        -Heading "WeCom Audit Reminder - $Phase pre-check ($CycleEndDate)" `
+        -Intro $intro `
+        -Sections $sections `
+        -Footer $footer
+
+    $envTag = ([string]$Environment).ToUpperInvariant()
+    $severityPrefix = switch ($Severity) {
+        'Final'    { 'FINAL CALL' }
+        'LastCall' { 'LAST CALL'  }
+        default    { 'Action Required' }
+    }
+    $backfillTag = if ($Backfill) { '[Backfill]' } else { '' }
+    $sequenceTag = if ($Sequence) { " ($Sequence)" } else { '' }
+    $subject = "[WeCom Audit][$envTag]$backfillTag $severityPrefix$sequenceTag - Pre-${Phase}: $totalMissing file(s) missing ($CycleEndDate)"
+
+    if ($DryRun) {
+        Write-Host "[DryRun] Reminder NOT sent. Email preview:" -ForegroundColor Cyan
+        Write-Host "  Subject : $subject"               -ForegroundColor Cyan
+        Write-Host "  From    : $fromAddress"           -ForegroundColor Cyan
+        Write-Host "  To      : $($validTo -join ', ')" -ForegroundColor Cyan
+        Write-Host "  Cc      : $ccStr"                 -ForegroundColor Cyan
+        Write-Host "  Body    :"                        -ForegroundColor Cyan
+        Write-Host $body
+        return
+    }
+
+    Send-Mail `
+        -From $fromAddress `
+        -To $validTo `
+        -Cc $ccStr `
+        -Subject $subject `
+        -Body $body `
+        -SmtpServer $NotificationConfig.SmtpServer `
+        -KeyName $NotificationConfig.CertName `
+        -Cert $NotificationConfig.Cert `
+        -Port $NotificationConfig.Port `
+        -LogFilePath $LogFilePath
+}
+
+Export-ModuleMember -Function Convert-ExactDate, Write-Log, Get-Cert, Get-LogFilePath, Get-VaultSecret, New-LazyLdapConnection, Close-LazyLdapConnection, Send-Mail, New-HtmlBody, New-DateTokenMap, Resolve-TemplateText, Get-OptionalObjectPropertyValue, Write-AnalysisSummaryJson, Assert-ConfigInputDirectories, Get-TaskResultByName, Get-TaskSummaryData, Get-BackupValidationConfig, Get-ExpectedBackupFiles, Test-BackupFolderContent, Get-SourceCopyTargets, Format-BackupValidationText, Export-AnalysisReport, New-LdapOrFilter, Split-LdapBatches, Resolve-LdapSearchBase, Get-LdapUserByMail, Get-LdapUserById, Get-WeComAuditLogFolderName, Get-NormalizedFullPath, Test-PathWithinAllowedRoots, Test-SafeToDeleteSourceFile, Remove-SourceFileWithRetry, Invoke-SourceFileCleanup, Test-AllowedRootIsTooBroad, Resolve-SourceCleanupConfig, Assert-SourceCleanupConfig, Assert-TaskNameUniqueness, Resolve-AuditConfigPath, Resolve-AuditOutputRoot, Resolve-AuditInputRoot, Resolve-TaskInputPath, Resolve-NotificationConfig, Get-PreflightFiles, Test-PreflightReady, Send-PreflightNotification, Send-ValidationFailureNotification, Send-ArchiveFailureNotification, Send-AuditReminderNotification, Resolve-ScheduleCycle, Resolve-PhaseHandoff
