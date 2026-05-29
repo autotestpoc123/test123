@@ -1,248 +1,107 @@
-function Send-AuditReminderNotification {
-    param(
-        [Parameter(Mandatory)]
-        [object]$NotificationConfig,
-        [Parameter(Mandatory)]
-        [string]$Environment,
-        [Parameter(Mandatory)]
-        [ValidateSet('Analysis', 'Validate')]
-        [string]$Phase,
-        [Parameter(Mandatory)]
-        [string]$CycleStartDate,
-        [Parameter(Mandatory)]
-        [string]$CycleEndDate,
-        [Parameter(Mandatory)]
-        [string]$SourceFolder,
-        [string]$NextSchedulerTime,
-        [object[]]$MissingItems = @(),
-        [object[]]$InvalidItems = @(),
-        [string]$Sequence,
-        [ValidateSet('Normal', 'Final', 'LastCall')]
-        [string]$Severity = 'Normal',
-        [switch]$Backfill,
-        [string]$LogFilePath
-    )
+ function Get-ExpectedBackupFiles {
+      param(
+          [Parameter(Mandatory = $true)]
+          [string]$CurrentRunWeeks,
+          [Parameter(Mandatory = $true)]
+          [hashtable]$DateTokens,
+          [Parameter(Mandatory = $true)]
+          [object]$BackupValidationConfig,
+          [hashtable]$TaskSummaries = @{}
+      )
 
-    if (-not $NotificationConfig) {
-        throw "Notification config missing."
-    }
-    if (-not $NotificationConfig.SmtpServer -or -not $NotificationConfig.Cert) {
-        throw "Notification config incomplete: missing SmtpServer or Cert."
-    }
-    if ($NotificationConfig.OpsTeam.Count -eq 0) {
-        throw "Notification config has no OpsTeam recipients."
-    }
-    if ($MissingItems.Count -eq 0 -and $InvalidItems.Count -eq 0) {
-        throw "Send-AuditReminderNotification called with no MissingItems and no InvalidItems."
-    }
+      $expected = New-Object 'System.Collections.Generic.List[object]'
 
-    $emailPattern = '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+      foreach ($rule in @($BackupValidationConfig.StaticRules)) {
+          if (-not $rule.Required) { continue }
+          if (@($rule.AppliesToWeeks).Count -gt 0 -and $rule.AppliesToWeeks -notcontains $CurrentRunWeeks) { continue }
 
-    $fromAddress = ([string]$NotificationConfig.From).Trim()
-    if ($fromAddress -notmatch $emailPattern) {
-        throw "Notification 'From' is not a valid email address: '$fromAddress'."
-    }
-    $validTo = @(
-        $NotificationConfig.OpsTeam |
-            Where-Object { $_ } |
-            ForEach-Object { ([string]$_).Trim() } |
-            Where-Object { $_ -match $emailPattern }
-    )
-    if ($validTo.Count -eq 0) {
-        throw "Notification 'OpsTeam' has no valid email recipients."
-    }
-    # Reminders go to the ops team only - intentionally no CC.
+          $name = Resolve-TemplateText -Template ([string]$rule.Template) -Tokens $DateTokens
+          $expected.Add([PSCustomObject]@{
+              Name       = $name
+              Source     = 'static'
+              ProducedBy = $null
+          })
+      }
 
-    $enc = { param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
+      foreach ($rule in @($BackupValidationConfig.DynamicRules)) {
+          if (-not $rule.Required) { continue }
+          if (@($rule.AppliesToWeeks).Count -gt 0 -and $rule.AppliesToWeeks -notcontains $CurrentRunWeeks) { continue }
 
-    $totalMissing = $MissingItems.Count + $InvalidItems.Count
+          $baseName = Resolve-TemplateText -Template ([string]$rule.BaseName) -Tokens $DateTokens
+          $taskName = [string]$rule.SummaryTaskName
+          $summaryData = if ($TaskSummaries.ContainsKey($taskName)) { $TaskSummaries[$taskName] } else { $null }
+          foreach ($name in (Get-ExpectedMessageFiles -BaseName $baseName -SummaryData $summaryData)) {
+              $expected.Add([PSCustomObject]@{
+                  Name       = $name
+                  Source     = 'dynamic'
+                  ProducedBy = $taskName
+              })
+          }
+      }
 
-    $introParts = New-Object 'System.Collections.Generic.List[string]'
-    $introParts.Add("Phase: $(& $enc $Phase)")
-    $introParts.Add("Cycle: $(& $enc $CycleStartDate) - $(& $enc $CycleEndDate)")
-    $introParts.Add("Source folder: $(& $enc $SourceFolder)")
-    if ($NextSchedulerTime) {
-        $introParts.Add("Next scheduled $(& $enc $Phase) job: <b>$(& $enc $NextSchedulerTime)</b> today")
-    }
-    if ($Sequence) {
-        $introParts.Add("Reminder: $(& $enc $Sequence)")
-    }
-    $intro = ($introParts -join '<br/>')
-
-    $missingRendered = @(
-        $MissingItems | ForEach-Object {
-            $src = if ($_.PSObject.Properties['Source'] -and $_.Source) { " <i>[$(& $enc $_.Source)]</i>" } else { '' }
-            "<b>$(& $enc $_.Name)</b>: $(& $enc $_.ExpectedPath)$src"
-        }
-    )
-    $invalidRendered = @(
-        $InvalidItems | ForEach-Object {
-            $src = if ($_.PSObject.Properties['Source'] -and $_.Source) { " <i>[$(& $enc $_.Source)]</i>" } else { '' }
-            "<b>$(& $enc $_.Name)</b>: $(& $enc $_.Error)$src"
-        }
-    )
-
-    $sections = @(
-        [PSCustomObject]@{ Heading = 'Missing Files';  Items = $missingRendered }
-        [PSCustomObject]@{ Heading = 'Invalid Items';  Items = $invalidRendered }
-    )
-
-    $deadlineText = if ($NextSchedulerTime) { "by $NextSchedulerTime today" } else { 'before the next scheduled job' }
-    $footer = "Please copy the listed files to '$SourceFolder' $deadlineText. The scheduled $Phase job will fail if files are still missing at run time."
-
-    $body = Build-AuditNotificationHtml `
-        -Heading "WeCom Audit Reminder - $Phase pre-check ($CycleEndDate)" `
-        -Intro $intro `
-        -Sections $sections `
-        -Footer $footer
-
-    $envTag = ([string]$Environment).ToUpperInvariant()
-    $severityPrefix = switch ($Severity) {
-        'Final'    { 'FINAL CALL' }
-        'LastCall' { 'LAST CALL'  }
-        default    { 'Action Required' }
-    }
-    $backfillTag = if ($Backfill) { '[Backfill]' } else { '' }
-    $sequenceTag = if ($Sequence) { " ($Sequence)" } else { '' }
-    $subject = "[WeCom Audit][$envTag]$backfillTag $severityPrefix$sequenceTag - Pre-${Phase}: $totalMissing file(s) missing ($CycleEndDate)"
-
-    Send-Mail `
-        -From $fromAddress `
-        -To $validTo `
-        -Subject $subject `
-        -Body $body `
-        -SmtpServer $NotificationConfig.SmtpServer `
-        -KeyName $NotificationConfig.CertName `
-        -Cert $NotificationConfig.Cert `
-        -Port $NotificationConfig.Port `
-        -LogFilePath $LogFilePath
-}
+      return @($expected)
+  }
 
 
-function New-AuditTokenMap {
+function Test-BackupFolderContent {
     param(
         [Parameter(Mandatory = $true)]
-        [hashtable]$Config,
+        [string]$BackupFolder,
         [Parameter(Mandatory = $true)]
-        [string]$StartDate,
-        [Parameter(Mandatory = $true)]
-        [string]$EndDate
+        [object[]]$ExpectedFiles
     )
 
-    $tokens = New-DateTokenMap -StartDate $StartDate -EndDate $EndDate
-    $tokens.InputRoot    = Resolve-AuditInputRoot   -Config $Config
-    $tokens.SourceFolder = Resolve-AuditSourceFolder -Config $Config
-    return $tokens
-}
-
-
-
-function Resolve-AuditSourceFolder {
-    param(
-        [hashtable]$Config
+    $expectedObjects = @(
+        $ExpectedFiles | ForEach-Object {
+            if ($_ -is [string]) {
+                [PSCustomObject]@{ Name = $_; Source = 'unknown'; ProducedBy = $null }
+            }
+            else { $_ }
+        }
     )
 
-    if ($env:WECOM_AUDIT_SOURCE_FOLDER) {
-        return [string]$env:WECOM_AUDIT_SOURCE_FOLDER
-    }
-
-    if ($Config -and $Config.ContainsKey('SourceFolder') -and $Config.SourceFolder) {
-        return [string]$Config.SourceFolder
-    }
-
-    throw "SourceFolder is not configured. Set 'SourceFolder' in config (e.g. 'C:\addin_deploy_cert\wecom_audit_log\source') or the WECOM_AUDIT_SOURCE_FOLDER environment variable."
-}
-
-function Send-Mail {
-    param (
-        [Parameter(Mandatory = $true)]
-        [string]$From,
-        [Parameter(Mandatory = $true)]
-        [string[]]$To,
-        [string]$Cc,
-        [Parameter(Mandatory = $true)]
-        [string]$Subject,
-        [Parameter(Mandatory = $true)]
-        [string]$Body,
-        [Parameter(Mandatory = $true)]
-        [string]$SmtpServer,
-        [Parameter(Mandatory = $true)]
-        [string]$KeyName,
-        [Parameter(Mandatory = $true)]
-        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert,
-        [int]$Port = 2587,
-        [string]$LogFilePath
+    $actualFiles = @(
+        Get-ChildItem -LiteralPath $BackupFolder -File |
+            Select-Object -ExpandProperty Name
     )
 
-    if (-not $Cert) {
-        throw "Certificate not found in LocalMachine\My store for $KeyName."
-    }
+    $comparer = [System.StringComparer]::OrdinalIgnoreCase
+    $expectedNameSet = New-Object 'System.Collections.Generic.HashSet[string]' $comparer
+    foreach ($e in $expectedObjects) { $null = $expectedNameSet.Add([string]$e.Name) }
+    $actualSet = New-Object 'System.Collections.Generic.HashSet[string]' $comparer
+    foreach ($f in $actualFiles) { $null = $actualSet.Add($f) }
 
-    $mail = $null
-    try {
-        $mail = New-Object System.Net.Mail.MailMessage
-        $mail.From = $From
-        foreach ($recipient in $To) {
-            $mail.To.Add($recipient)
-        }
-        if ($Cc) { $mail.CC.Add($Cc) }
-        $mail.Subject = $Subject
-        $mail.Body = $Body
-        $mail.IsBodyHtml = $true
+    $missingFiles = @($expectedObjects | Where-Object { -not $actualSet.Contains([string]$_.Name) })
+    $unexpectedFiles = @($actualFiles | Where-Object { -not $expectedNameSet.Contains($_) })
 
-        $smtp = New-Object System.Net.Mail.SmtpClient($SmtpServer, $Port)
-        $smtp.EnableSsl = $true
-        $smtp.ClientCertificates.Add([System.Security.Cryptography.X509Certificates.X509Certificate2]::new($Cert))
-        $smtp.Send($mail)
-        if ($LogFilePath) {
-            Write-Log -LogString "Email sent successfully to $($To -join ', ')" -LogFilePath $LogFilePath
-        }
-        Write-Host "Email sent successfully to $($To -join ', ')"
-    }
-    catch {
-        if ($LogFilePath) {
-            Write-Log -LogString "Failed to send email to $($To -join ', '): $($_.Exception.Message)" -LogFilePath $LogFilePath
-        }
-        throw "Failed to send email: $($_.Exception.Message)"
-    }
-    finally {
-        if ($mail) {
-            $mail.Dispose()
-        }
+    return [PSCustomObject]@{
+        ExpectedFiles   = @($expectedObjects)
+        ActualFiles     = @($actualFiles)
+        MissingFiles    = @($missingFiles)
+        UnexpectedFiles = @($unexpectedFiles)
+        Passed          = ($missingFiles.Count -eq 0 -and $unexpectedFiles.Count -eq 0)
     }
 }
 
 
-function Build-AuditNotificationHtml {
-    # Contract: Heading / Footer / Sections[].Heading are plain text — this helper
-    # HtmlEncodes them. Intro and Sections[].Items are trusted HTML — caller is
-    # responsible for encoding any untrusted content inside them.
+function Get-SourceCopyTargets {
     param(
-        [Parameter(Mandatory)]
-        [string]$Heading,
-        [string]$Intro,
-        [object[]]$Sections = @(),
-        [string]$Footer = 'Please follow up and re-trigger the scheduled job once resolved.'
+        [Parameter(Mandatory = $true)]
+        [object[]]$ExpectedFiles,
+        [Parameter(Mandatory = $true)]
+        [string]$SourceFolder
     )
 
-    $encode = { param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
-
-    $lines = New-Object 'System.Collections.Generic.List[string]'
-    $lines.Add("<h3>$(& $encode $Heading)</h3>")
-    if ($Intro) { $lines.Add("<p>$Intro</p>") }
-
-    foreach ($section in $Sections) {
-        $items = @($section.Items)
-        if ($items.Count -eq 0) { continue }
-        $title = [string]$section.Heading
-        $lines.Add("<h4>$(& $encode $title) ($($items.Count))</h4><ul>")
-        foreach ($item in $items) {
-            $lines.Add("<li>$item</li>")
-        }
-        $lines.Add("</ul>")
+    $targets = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($entry in $ExpectedFiles) {
+        $name = if ($entry -is [string]) { $entry } else { [string]$entry.Name }
+        $sourcePath = Join-Path $SourceFolder $name
+        $targets.Add([PSCustomObject]@{
+            Name       = $name
+            SourcePath = $sourcePath
+            Exists     = Test-Path -LiteralPath $sourcePath -PathType Leaf
+        })
     }
-
-    if ($Footer) { $lines.Add("<p>$(& $encode $Footer)</p>") }
-    return ($lines -join "`n")
+    return @($targets.ToArray())
 }
 
