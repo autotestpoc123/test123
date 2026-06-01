@@ -1,464 +1,269 @@
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'LatestRun')]
 param(
+    [Parameter(Mandatory = $true, ParameterSetName = 'DateRange')]
     [ValidatePattern('^\d{8}$')]
-    [string]$StartDate,
-    [ValidateSet('PROD', 'QA')]
-    [string]$env = 'QA',
+    [string]$startDate,
+    [Parameter(Mandatory = $true, ParameterSetName = 'DateRange')]
+    [ValidatePattern('^\d{8}$')]
+    [string]$endDate,
     [string]$ConfigPath,
+    [string]$OutputRoot,
+    [string]$BackupFolder,
+    [Parameter(Mandatory = $true, ParameterSetName = 'SummaryPath')]
+    [string]$AnalysisSummaryPath,
+    [Parameter(Mandatory = $true, ParameterSetName = 'RunId', Position = 0)]
+    [string]$RunId,
     [ValidateSet('2', '4')]
-    [string]$ForceCurrentRunWeeks,
-    [ValidateSet('Analysis', 'Validate', 'All')]
-    [string]$Phase = 'All'
+    [string]$CurrentRunWeeks,
+    [switch]$FailOnDifference
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-$auditLogScript = Join-Path $scriptRoot 'Invoke-AuditLog.ps1'
-$auditValidateScript = Join-Path $scriptRoot 'Invoke-AuditValidate.ps1'
 $modulePath = Join-Path $scriptRoot 'wecom_analysis_comm.psm1'
 
-if (-not (Test-Path $modulePath -PathType Leaf)) { throw "Module not found: $modulePath" }
-if (-not (Test-Path $auditLogScript -PathType Leaf)) { throw "Invoke-AuditLog.ps1 not found: $auditLogScript" }
-if (-not (Test-Path $auditValidateScript -PathType Leaf)) { throw "Invoke-AuditValidate.ps1 not found: $auditValidateScript" }
+if (-not (Test-Path $modulePath -PathType Leaf)) {
+    throw "Required module not found: $modulePath"
+}
 
 Import-Module $modulePath -Force
 
 $ConfigPath = Resolve-AuditConfigPath -ConfigPath $ConfigPath -ScriptRoot $scriptRoot
-if (-not (Test-Path $ConfigPath -PathType Leaf)) { throw "Config file not found: $ConfigPath" }
+if (-not (Test-Path $ConfigPath -PathType Leaf)) {
+    throw "Config file not found: $ConfigPath"
+}
 
 $config = Import-PowerShellDataFile -Path $ConfigPath
-$cycle = Resolve-ScheduleCycle -Config $config -StartDateOverride $StartDate -ForceCurrentRunWeeks $ForceCurrentRunWeeks
-$resolvedOutputRoot = Resolve-AuditOutputRoot -Config $config -ConfigPath $ConfigPath
-$runsRoot = [System.IO.Path]::Combine($resolvedOutputRoot, 'runs')
-
-foreach ($w in $cycle.Warnings) { Write-Warning $w.Message }
-
-function Write-SchedulerBanner {
-    param([string]$Phase, [PSCustomObject]$Cycle)
-    Write-Host "=== WeCom Audit Scheduler ===" -ForegroundColor Cyan
-    Write-Host "Phase: $Phase" -ForegroundColor Cyan
-    Write-Host "Anchor: $($Cycle.Anchor.ToString('yyyyMMdd'))" -ForegroundColor Cyan
-    Write-Host "Cycle index: $($Cycle.CycleIndex)" -ForegroundColor Cyan
-    Write-Host "Date range: $($Cycle.StartDate) - $($Cycle.EndDate)" -ForegroundColor Cyan
-    Write-Host "CurrentRunWeeks: $($Cycle.CurrentRunWeeks)" -ForegroundColor Cyan
-    Write-Host ""
+$backupValidationConfig = Get-BackupValidationConfig -Config $config
+if (-not $backupValidationConfig) {
+    throw "BackupValidation configuration not found in config: $ConfigPath"
 }
 
-function Write-PreflightReport {
+$resolvedOutputRoot = Resolve-AuditOutputRoot -OutputRoot $OutputRoot -Config $config -ConfigPath $ConfigPath
+
+if (-not (Test-Path $resolvedOutputRoot)) {
+    New-Item -Path $resolvedOutputRoot -ItemType Directory -Force | Out-Null
+}
+
+$resolvedBackupFolder = $null
+
+$runsRoot = Join-Path $resolvedOutputRoot 'runs'
+New-Item -Path $runsRoot -ItemType Directory -Force | Out-Null
+$latestRunPointerPath = Join-Path $runsRoot 'latest-run.json'
+
+function Get-OptionalPropertyValue {
     param(
-        [Parameter(Mandatory)]
-        [string]$RunsRoot,
-        [Parameter(Mandatory)]
-        [string]$PreflightId,
-        [Parameter(Mandatory)]
-        [string]$Phase,
-        [Parameter(Mandatory)]
-        [string]$PreflightStatus,
-        [string]$StartDate,
-        [string]$EndDate,
-        [string]$CurrentRunWeeks,
-        [object[]]$MissingItems = @(),
-        [object[]]$InvalidItems = @(),
-        [bool]$NotificationSent = $false,
-        [string]$NotificationError
+        [Parameter(Mandatory = $true)]
+        [object]$InputObject,
+        [Parameter(Mandatory = $true)]
+        [string]$PropertyName
     )
 
-    $preflightFolder = Join-Path $RunsRoot $PreflightId
-    if (-not (Test-Path $preflightFolder)) {
-        New-Item -Path $preflightFolder -ItemType Directory -Force | Out-Null
-    }
-
-    $report = [PSCustomObject]@{
-        PreflightId       = $PreflightId
-        Phase             = $Phase
-        PreflightStatus   = $PreflightStatus
-        StartDate         = $StartDate
-        EndDate           = $EndDate
-        CurrentRunWeeks   = $CurrentRunWeeks
-        MissingItems      = $MissingItems
-        InvalidItems      = $InvalidItems
-        NotificationSent  = $NotificationSent
-        NotificationError = $NotificationError
-        Timestamp         = (Get-Date).ToString('o')
-    }
-
-    $reportPath = Join-Path $preflightFolder 'preflight-report.json'
-    $report | ConvertTo-Json -Depth 8 | Set-Content -Path $reportPath -Encoding UTF8
-
-    $pointer = [PSCustomObject]@{
-        PreflightId     = $PreflightId
-        PreflightStatus = $PreflightStatus
-        ReportPath      = $reportPath
-        UpdatedAt       = (Get-Date).ToString('o')
-    }
-    $pointerPath = Join-Path $RunsRoot 'latest-preflight.json'
-    $pointer | ConvertTo-Json -Depth 5 | Set-Content -Path $pointerPath -Encoding UTF8
-
-    return $reportPath
+    return Get-OptionalObjectPropertyValue -InputObject $InputObject -PropertyName $PropertyName
 }
 
-function Get-ValidateSummaryPath {
+function Resolve-AnalysisSummaryPathFromRunId {
     param(
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory = $true)]
         [string]$RunsRoot,
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory = $true)]
         [string]$RunId
     )
-    return (Join-Path $RunsRoot (Join-Path $RunId 'validation\backup-validation-summary.json'))
+
+    $runFolder = Join-Path $RunsRoot $RunId
+    if (-not (Test-Path -LiteralPath $runFolder -PathType Container)) {
+        throw "Run folder not found for RunId '$RunId': $runFolder"
+    }
+
+    foreach ($fileName in @('run-summary.json', 'configured-analysis-summary.json', 'configured_analysis_summary.json')) {
+        $summaryPath = Join-Path $runFolder $fileName
+        if (Test-Path -LiteralPath $summaryPath -PathType Leaf) {
+            return $summaryPath
+        }
+    }
+
+    throw "No supported analysis summary file was found under run folder: $runFolder"
 }
 
-function Write-NotificationSidecar {
+function Resolve-AnalysisSummaryPathFromLatestPointer {
     param(
-        [Parameter(Mandatory)]
-        [string]$RunsRoot,
-        [Parameter(Mandatory)]
-        [string]$RunId,
-        [Parameter(Mandatory)]
-        [string]$Type,
-        [Parameter(Mandatory)]
-        [string]$Reason
+        [Parameter(Mandatory = $true)]
+        [string]$PointerPath
     )
 
-    $validationDir = Join-Path $RunsRoot (Join-Path $RunId 'validation')
-    $sidecarPath = if (Test-Path -LiteralPath $validationDir -PathType Container) {
-        Join-Path $validationDir 'notification-failure.json'
-    }
-    else {
-        Join-Path $RunsRoot 'notification-failure.json'
+    if (-not (Test-Path -LiteralPath $PointerPath -PathType Leaf)) {
+        return $null
     }
 
-    try {
-        $sidecarDir = Split-Path -Parent $sidecarPath
-        if ($sidecarDir -and -not (Test-Path -LiteralPath $sidecarDir -PathType Container)) {
-            New-Item -ItemType Directory -Force -Path $sidecarDir | Out-Null
+    $pointerData = Get-Content -LiteralPath $PointerPath -Raw | ConvertFrom-Json
+    $runSummaryPath = Get-OptionalPropertyValue -InputObject $pointerData -PropertyName 'RunSummaryPath'
+    if ($runSummaryPath -and (Test-Path -LiteralPath $runSummaryPath -PathType Leaf)) {
+        return [PSCustomObject]@{
+            RunSummaryPath = [string]$runSummaryPath
+            BackupFolder   = [string](Get-OptionalPropertyValue -InputObject $pointerData -PropertyName 'BackupFolder')
         }
-        $payload = [PSCustomObject]@{
-            Type       = $Type
-            Reason     = $Reason
-            RunId      = $RunId
-            RecordedAt = (Get-Date).ToString('o')
-        }
-        $payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $sidecarPath -Encoding UTF8
-        Write-Warning "Notification sidecar written to '$sidecarPath'."
     }
-    catch {
-        Write-Warning "Failed to write notification sidecar '$sidecarPath': $($_.Exception.Message)"
-    }
+
+    return $null
 }
 
-function Update-SummaryNotificationBlock {
+function Resolve-LatestAnalysisSummaryPath {
     param(
-        [Parameter(Mandatory)]
-        [string]$SummaryPath,
-        [Parameter(Mandatory)]
-        [object]$Summary,
-        [Parameter(Mandatory)]
-        [hashtable]$Block
-    )
-    try {
-        $Summary | Add-Member -MemberType NoteProperty -Name 'Notification' -Value ([PSCustomObject]$Block) -Force
-        $Summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $SummaryPath -Encoding UTF8
-    }
-    catch {
-        Write-Warning "Failed to write Notification block back to summary '$SummaryPath': $($_.Exception.Message)"
-    }
-}
-
-function Send-ValidationFailureNotificationFromSummary {
-    param(
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory = $true)]
         [string]$RunsRoot,
-        [Parameter(Mandatory)]
-        [string]$RunId,
-        [Parameter(Mandatory)]
-        [hashtable]$Config,
-        [Parameter(Mandatory)]
-        [string]$Environment,
-        [Parameter(Mandatory)]
         [string]$StartDate,
-        [Parameter(Mandatory)]
         [string]$EndDate
     )
 
-    $summaryPath = Get-ValidateSummaryPath -RunsRoot $RunsRoot -RunId $RunId
-    if (-not (Test-Path -LiteralPath $summaryPath -PathType Leaf)) {
-        Write-Warning "Validation summary not found at '$summaryPath'. Skipping notification."
-        Write-NotificationSidecar -RunsRoot $RunsRoot -RunId $RunId -Type 'ValidationFailed' -Reason "Summary missing: $summaryPath"
-        return
+    if (-not (Test-Path $RunsRoot -PathType Container)) {
+        return $null
     }
 
-    $summary = $null
-    try {
-        $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
-    }
-    catch {
-        Write-Warning "Failed to parse validation summary '$summaryPath': $($_.Exception.Message)"
-        Write-NotificationSidecar -RunsRoot $RunsRoot -RunId $RunId -Type 'ValidationFailed' -Reason "Summary parse error: $($_.Exception.Message)"
-        return
-    }
-
-    $missingFiles = @()
-    $unexpectedFiles = @()
-    if ($summary.PSObject.Properties['MissingFiles'])    { $missingFiles    = @($summary.MissingFiles) }
-    if ($summary.PSObject.Properties['UnexpectedFiles']) { $unexpectedFiles = @($summary.UnexpectedFiles | ForEach-Object { [string]$_ }) }
-
-    if ($missingFiles.Count -eq 0 -and $unexpectedFiles.Count -eq 0) {
-        Write-Warning "Validation summary reports no missing or unexpected files; skipping notification."
-        return
-    }
-
-    $notificationConfig = Resolve-NotificationConfig -Config $Config -Environment $Environment
-    $attempted = $false
-    $sent = $false
-    $errorMessage = $null
-    $recipients = @()
-    $sentAt = $null
-
-    if (-not $notificationConfig -or -not $notificationConfig.Cert) {
-        $errorMessage = 'Notification config not available or cert not found.'
-        Write-Warning $errorMessage
-    }
-    else {
-        $attempted = $true
-        $recipients = @($notificationConfig.OpsTeam)
-        try {
-            $validationFolder = if ($summary.PSObject.Properties['ValidationTargetFolder']) {
-                [string]$summary.ValidationTargetFolder
-            }
-            elseif ($summary.PSObject.Properties['ValidationFolder']) {
-                [string]$summary.ValidationFolder
-            }
-            else { $null }
-            $validationReportPath = if ($summary.PSObject.Properties['ValidationTextPath'])  { [string]$summary.ValidationTextPath } else { $null }
-
-            Send-ValidationFailureNotification `
-                -NotificationConfig $notificationConfig `
-                -Environment $Environment `
-                -RunId $RunId `
-                -StartDate $StartDate `
-                -EndDate $EndDate `
-                -MissingFiles $missingFiles `
-                -UnexpectedFiles $unexpectedFiles `
-                -ValidationFolder $validationFolder `
-                -ValidationReportPath $validationReportPath `
-                -SummaryPath $summaryPath
-
-            $sent = $true
-            $sentAt = (Get-Date).ToString('o')
-            Write-Host "Validation failure notification sent to ops team." -ForegroundColor Cyan
-        }
-        catch {
-            $errorMessage = $_.Exception.Message
-            Write-Warning "Failed to send validation failure notification: $errorMessage"
-        }
-    }
-
-    Update-SummaryNotificationBlock -SummaryPath $summaryPath -Summary $summary -Block @{
-        Attempted  = $attempted
-        Sent       = $sent
-        Type       = 'ValidationFailed'
-        Recipients = $recipients
-        Error      = $errorMessage
-        SentAt     = $sentAt
-    }
-}
-
-function Send-ArchiveFailureNotificationFromSummary {
-    param(
-        [Parameter(Mandatory)]
-        [string]$RunsRoot,
-        [Parameter(Mandatory)]
-        [string]$RunId,
-        [Parameter(Mandatory)]
-        [hashtable]$Config,
-        [Parameter(Mandatory)]
-        [string]$Environment,
-        [Parameter(Mandatory)]
-        [string]$StartDate,
-        [Parameter(Mandatory)]
-        [string]$EndDate
+    $candidates = New-Object 'System.Collections.Generic.List[object]'
+    $candidateFiles = @(
+        Get-ChildItem -LiteralPath $RunsRoot -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -in @('run-summary.json', 'configured-analysis-summary.json', 'configured_analysis_summary.json') -and
+                $_.DirectoryName -notmatch '[\\/]validation(?:_[^\\/]+)?(?:[\\/]|$)'
+            } |
+            Sort-Object LastWriteTime -Descending
     )
 
-    $summaryPath = Get-ValidateSummaryPath -RunsRoot $RunsRoot -RunId $RunId
-    if (-not (Test-Path -LiteralPath $summaryPath -PathType Leaf)) {
-        Write-Warning "Validation summary not found at '$summaryPath'. Skipping archive notification."
-        Write-NotificationSidecar -RunsRoot $RunsRoot -RunId $RunId -Type 'ArchiveFailed' -Reason "Summary missing: $summaryPath"
-        return
-    }
-
-    $summary = $null
-    try {
-        $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
-    }
-    catch {
-        Write-Warning "Failed to parse validation summary '$summaryPath': $($_.Exception.Message)"
-        Write-NotificationSidecar -RunsRoot $RunsRoot -RunId $RunId -Type 'ArchiveFailed' -Reason "Summary parse error: $($_.Exception.Message)"
-        return
-    }
-
-    $archiveStatus = if ($summary.PSObject.Properties['ArchiveStatus']) { [string]$summary.ArchiveStatus } else { 'Unknown' }
-    if ($archiveStatus -notin @('BackupFailed', 'CleanupAborted', 'CleanupPartiallyFailed')) {
-        Write-Warning "ArchiveStatus '$archiveStatus' is not a failure state; skipping notification."
-        return
-    }
-
-    $notificationConfig = Resolve-NotificationConfig -Config $Config -Environment $Environment
-    $attempted = $false
-    $sent = $false
-    $errorMessage = $null
-    $recipients = @()
-    $sentAt = $null
-
-    if (-not $notificationConfig -or -not $notificationConfig.Cert) {
-        $errorMessage = 'Notification config not available or cert not found.'
-        Write-Warning $errorMessage
-    }
-    else {
-        $attempted = $true
-        $recipients = @($notificationConfig.OpsTeam)
+    foreach ($summaryFile in $candidateFiles) {
+        $summaryData = $null
         try {
-            $backupFolder = if ($summary.PSObject.Properties['BackupFolder']) { [string]$summary.BackupFolder } else { $null }
-            $archiveResult = if ($summary.PSObject.Properties['ArchiveResult']) { $summary.ArchiveResult } else { $null }
-
-            Send-ArchiveFailureNotification `
-                -NotificationConfig $notificationConfig `
-                -Environment $Environment `
-                -RunId $RunId `
-                -StartDate $StartDate `
-                -EndDate $EndDate `
-                -ArchiveStatus $archiveStatus `
-                -ArchiveResult $archiveResult `
-                -BackupFolder $backupFolder `
-                -SummaryPath $summaryPath
-
-            $sent = $true
-            $sentAt = (Get-Date).ToString('o')
-            Write-Host "Archive failure notification sent to ops team." -ForegroundColor Cyan
+            $summaryData = Get-Content -LiteralPath $summaryFile.FullName -Raw | ConvertFrom-Json
         }
         catch {
-            $errorMessage = $_.Exception.Message
-            Write-Warning "Failed to send archive failure notification: $errorMessage"
+            $summaryData = $null
         }
+
+        $matchesRequestedDates = $false
+        if ($summaryData) {
+            $summaryStartDate = if ($summaryData.PSObject.Properties['StartDate']) { [string]$summaryData.StartDate } else { $null }
+            $summaryEndDate = if ($summaryData.PSObject.Properties['EndDate']) { [string]$summaryData.EndDate } else { $null }
+            $matchesRequestedDates = ($summaryStartDate -eq $StartDate -and $summaryEndDate -eq $EndDate)
+        }
+
+        $candidates.Add([PSCustomObject]@{
+            Path                  = $summaryFile.FullName
+            DirectoryLastWrite    = $summaryFile.Directory.LastWriteTime
+            FileLastWrite         = $summaryFile.LastWriteTime
+            MatchesRequestedDates = $matchesRequestedDates
+        })
     }
 
-    Update-SummaryNotificationBlock -SummaryPath $summaryPath -Summary $summary -Block @{
-        Attempted  = $attempted
-        Sent       = $sent
-        Type       = 'ArchiveFailed'
-        Recipients = $recipients
-        Error      = $errorMessage
-        SentAt     = $sentAt
-    }
-}
-
-function Invoke-PreflightCheck {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Phase,
-        [Parameter(Mandatory)]
-        [hashtable]$Config,
-        [Parameter(Mandatory)]
-        [hashtable]$DateTokens,
-        [Parameter(Mandatory)]
-        [string]$CurrentRunWeeks,
-        [Parameter(Mandatory)]
-        [string]$RunsRoot,
-        [string]$StartDate,
-        [string]$EndDate,
-        [string]$Environment,
-        # Folder checked for ReadyBy='Validate' fixed files. Under source-mode
-        # validation this is the SOURCE folder, not the backup folder.
-        [string]$ValidationFolder,
-        [string]$SourceFolder
+    $preferredCandidates = @(
+        $candidates |
+            Where-Object { $_.MatchesRequestedDates } |
+            Sort-Object -Property FileLastWrite, DirectoryLastWrite -Descending |
+            Select-Object -First 1
     )
 
-    $preflightArgs = @{
-        Config          = $Config
-        DateTokens      = $DateTokens
-        Phase           = $Phase
-        CurrentRunWeeks = $CurrentRunWeeks
-    }
-    if ($ValidationFolder) { $preflightArgs.ValidationFolder = $ValidationFolder }
-    if ($SourceFolder)     { $preflightArgs.SourceFolder     = $SourceFolder }
-
-    $preflight = Test-PreflightReady @preflightArgs
-
-    if ($preflight.AllReady) {
-        Write-Host "Preflight check passed for Phase $Phase." -ForegroundColor Green
-        return
+    if ($preferredCandidates.Count -gt 0) {
+        return [string]$preferredCandidates[0].Path
     }
 
-    Write-Host "Preflight check FAILED for Phase $Phase." -ForegroundColor Red
-    foreach ($item in $preflight.MissingItems) {
-        Write-Host "  MISSING: [$($item.Source)] $($item.Name) - $($item.ExpectedPath)" -ForegroundColor Yellow
-    }
-    foreach ($item in $preflight.InvalidItems) {
-        Write-Host "  INVALID: [$($item.Source)] $($item.Name) - $($item.Error)" -ForegroundColor Yellow
-    }
+    $latestCandidates = @(
+        $candidates |
+            Sort-Object -Property FileLastWrite, DirectoryLastWrite -Descending |
+            Select-Object -First 1
+    )
 
-    $preflightId = "preflight_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-    $notificationSent = $false
-    $notificationError = $null
-
-    $notificationConfig = Resolve-NotificationConfig -Config $Config -Environment $Environment
-    if ($notificationConfig -and $notificationConfig.Cert) {
-        try {
-            $notifArgs = @{
-                NotificationConfig = $notificationConfig
-                Phase              = $Phase
-                StartDate          = $StartDate
-                EndDate            = $EndDate
-            }
-            if ($preflight.MissingItems.Count -gt 0) {
-                $notifArgs.MissingItems = $preflight.MissingItems
-            }
-            if ($preflight.InvalidItems.Count -gt 0) {
-                $notifArgs.InvalidItems = $preflight.InvalidItems
-            }
-            Send-PreflightNotification @notifArgs
-            $notificationSent = $true
-            Write-Host "Preflight notification sent to ops team." -ForegroundColor Cyan
-        }
-        catch {
-            $notificationError = $_.Exception.Message
-            Write-Warning "Failed to send preflight notification: $notificationError"
-        }
-    }
-    else {
-        $notificationError = 'Notification config not available or cert not found.'
-        Write-Warning $notificationError
+    if ($latestCandidates.Count -gt 0) {
+        return [string]$latestCandidates[0].Path
     }
 
-    $preflightStatus = if ($notificationError) { 'Both' } else { 'MissingInputs' }
-
-    if (-not (Test-Path $RunsRoot)) {
-        New-Item -Path $RunsRoot -ItemType Directory -Force | Out-Null
-    }
-
-    $reportPath = Write-PreflightReport `
-        -RunsRoot $RunsRoot `
-        -PreflightId $preflightId `
-        -Phase $Phase `
-        -PreflightStatus $preflightStatus `
-        -StartDate $StartDate `
-        -EndDate $EndDate `
-        -CurrentRunWeeks $CurrentRunWeeks `
-        -MissingItems $preflight.MissingItems `
-        -InvalidItems $preflight.InvalidItems `
-        -NotificationSent $notificationSent `
-        -NotificationError $notificationError
-
-    Write-Host "Preflight report: $reportPath" -ForegroundColor Yellow
-    exit 3
+    return $null
 }
 
-Write-SchedulerBanner -Phase $Phase -Cycle $cycle
+$dateParametersProvided = ($PSCmdlet.ParameterSetName -eq 'DateRange')
+if ($dateParametersProvided) {
+    $null = Convert-ExactDate $startDate
+    $null = Convert-ExactDate $endDate
+}
 
-$configuredInputRoot = Resolve-AuditInputRoot -Config $config
-$dateTokens = New-DateTokenMap -StartDate $cycle.StartDate -EndDate $cycle.EndDate
-$dateTokens.InputRoot = $configuredInputRoot
+$resolutionMode = $null
+$pointerData = $null
+$resolvedAnalysisSummaryPath = if ($AnalysisSummaryPath) {
+    $resolutionMode = 'AnalysisSummaryPath'
+    $AnalysisSummaryPath
+}
+elseif ($RunId) {
+    $resolutionMode = 'RunId'
+    Resolve-AnalysisSummaryPathFromRunId -RunsRoot $runsRoot -RunId $RunId
+}
+elseif ($dateParametersProvided) {
+    $resolutionMode = 'DateRangeAutoDiscovery'
+    Resolve-LatestAnalysisSummaryPath -RunsRoot $runsRoot -StartDate $startDate -EndDate $endDate
+}
+else {
+    $pointerData = Resolve-AnalysisSummaryPathFromLatestPointer -PointerPath $latestRunPointerPath
+    if ($pointerData) {
+        $resolutionMode = 'LatestRunPointer'
+        [string]$pointerData.RunSummaryPath
+    }
+    else {
+        $resolutionMode = 'AutoDiscovery'
+        Resolve-LatestAnalysisSummaryPath -RunsRoot $runsRoot -StartDate $startDate -EndDate $endDate
+    }
+}
+
+$resolvedRunFolder = $null
+if ($resolvedAnalysisSummaryPath) {
+    $resolvedRunFolder = Split-Path $resolvedAnalysisSummaryPath -Parent
+    Write-Host "Resolution mode: $resolutionMode" -ForegroundColor Cyan
+    Write-Host "Using analysis summary: $resolvedAnalysisSummaryPath" -ForegroundColor Cyan
+}
+else {
+    if ($dateParametersProvided) {
+        Write-Host "Resolution mode: $resolutionMode" -ForegroundColor Yellow
+        Write-Host "No analysis summary matched startDate=$startDate endDate=$endDate. Validation will continue without task summaries." -ForegroundColor Yellow
+    }
+    $resolvedRunFolder = Join-Path $runsRoot ("validation_{0}" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    Write-Host 'No matching analysis summary was found. Creating a standalone validation run folder.' -ForegroundColor Yellow
+}
+
+if (-not (Test-Path $resolvedRunFolder)) {
+    New-Item -Path $resolvedRunFolder -ItemType Directory -Force | Out-Null
+}
+
+$validationFolder = Join-Path $resolvedRunFolder 'validation'
+New-Item -Path $validationFolder -ItemType Directory -Force | Out-Null
+
+$logFilePath = Join-Path $validationFolder 'backup-validation.log'
+$validationSummaryPath = Join-Path $validationFolder 'backup-validation-summary.json'
+$validationJsonPath = Join-Path $validationFolder 'backup-folder-validation.json'
+$validationTextPath = Join-Path $validationFolder 'backup-folder-validation.txt'
+
+$analysisSummary = $null
+$taskSummaries = @{}
+if ($resolvedAnalysisSummaryPath) {
+    if (-not (Test-Path $resolvedAnalysisSummaryPath -PathType Leaf)) {
+        throw "Analysis summary not found: $resolvedAnalysisSummaryPath"
+    }
+
+    $analysisSummary = Get-Content -LiteralPath $resolvedAnalysisSummaryPath -Raw | ConvertFrom-Json
+    if (-not $dateParametersProvided) {
+        $startDate = [string](Get-OptionalPropertyValue -InputObject $analysisSummary -PropertyName 'StartDate')
+        $endDate = [string](Get-OptionalPropertyValue -InputObject $analysisSummary -PropertyName 'EndDate')
+        if (-not $startDate -or -not $endDate) {
+            throw 'Resolved analysis summary does not contain StartDate/EndDate, and they were not provided explicitly.'
+        }
+        $null = Convert-ExactDate $startDate
+        $null = Convert-ExactDate $endDate
+    }
+
+    foreach ($taskResult in @($analysisSummary.Tasks)) {
+        if (-not $taskResult.Name) {
+            continue
+        }
+
+        $taskSummaries[[string]$taskResult.Name] = Get-TaskSummaryData -TaskResult $taskResult
+    }
+}
 
 $resolvedBackupRoot = if ($env:WECOM_AUDIT_BACKUP_ROOT) {
     [string]$env:WECOM_AUDIT_BACKUP_ROOT
@@ -469,105 +274,264 @@ elseif ($config.ContainsKey('BackupRoot') -and $config.BackupRoot) {
 else {
     $resolvedOutputRoot
 }
-$resolvedBackupFolder = [System.IO.Path]::Combine($resolvedBackupRoot, $cycle.EndDate)
 
-$auditLogFolderName = Get-WeComAuditLogFolderName
-$resolvedSourceFolder = [System.IO.Path]::Combine($configuredInputRoot, $auditLogFolderName)
-
-if ($Phase -in @('Analysis', 'All')) {
-    Invoke-PreflightCheck `
-        -Phase 'Analysis' `
-        -Config $config `
-        -DateTokens $dateTokens `
-        -CurrentRunWeeks $cycle.CurrentRunWeeks `
-        -RunsRoot $runsRoot `
-        -StartDate $cycle.StartDate `
-        -EndDate $cycle.EndDate `
-        -Environment $env `
-        -SourceFolder $resolvedSourceFolder
-
-    Write-Host "--- Phase 1: Analysis ---" -ForegroundColor Cyan
-    $analysisArgs = @{
-        startDate = $cycle.StartDate
-        endDate   = $cycle.EndDate
-        env       = $env
-    }
-    if ($ConfigPath) { $analysisArgs.ConfigPath = $ConfigPath }
-
-    & $auditLogScript @analysisArgs
-    $analysisExitCode = $LASTEXITCODE
-
-    if ($analysisExitCode -ne 0) {
-        Write-Host "Analysis failed with exit code $analysisExitCode. Skipping validation." -ForegroundColor Red
-        exit $analysisExitCode
-    }
-
-    $handoff = Resolve-PhaseHandoff -RunsRoot $runsRoot -ExpectedStartDate $cycle.StartDate -ExpectedEndDate $cycle.EndDate
-    Write-Host "Analysis completed. RunId: $($handoff.RunId)" -ForegroundColor Green
-
-    if ($Phase -eq 'Analysis') {
-        Write-Host ""
-        Write-Host "=== Phase 1 completed. RunId=$($handoff.RunId) ===" -ForegroundColor Green
-        Write-Host "Ops: place all required files in source folder '$resolvedSourceFolder', then run Phase 2:" -ForegroundColor Yellow
-        Write-Host "  ./Invoke-WeComAuditScheduler.ps1 -Phase Validate -env $env" -ForegroundColor Yellow
-        exit 0
-    }
-
-    Write-Host ""
+if ($BackupFolder) {
+    $resolvedBackupFolder = $BackupFolder
+}
+else {
+    $resolvedBackupFolder = [System.IO.Path]::Combine($resolvedBackupRoot, $endDate)
 }
 
-if ($Phase -in @('Validate', 'All')) {
-    if ($Phase -eq 'Validate') {
-        $handoff = Resolve-PhaseHandoff -RunsRoot $runsRoot -ExpectedStartDate $cycle.StartDate -ExpectedEndDate $cycle.EndDate
-        Write-Host "Resolved RunId from handoff: $($handoff.RunId)" -ForegroundColor Cyan
-    }
+if (-not (Test-Path $resolvedBackupFolder -PathType Container)) {
+    New-Item -Path $resolvedBackupFolder -ItemType Directory -Force | Out-Null
+}
 
-    Invoke-PreflightCheck `
-        -Phase 'Validate' `
-        -Config $config `
-        -DateTokens $dateTokens `
-        -CurrentRunWeeks $cycle.CurrentRunWeeks `
-        -RunsRoot $runsRoot `
-        -StartDate $cycle.StartDate `
-        -EndDate $cycle.EndDate `
-        -Environment $env `
-        -ValidationFolder $resolvedSourceFolder
+$dateTokens = New-AuditTokenMap -Config $config -StartDate $startDate -EndDate $endDate
+$resolvedSourceFolder = $dateTokens.SourceFolder
 
-    Write-Host "--- Phase 2: Validation + Archive (RunId=$($handoff.RunId), CurrentRunWeeks=$($cycle.CurrentRunWeeks)) ---" -ForegroundColor Cyan
-    $validateArgs = @{
-        RunId           = $handoff.RunId
-        CurrentRunWeeks = $cycle.CurrentRunWeeks
-    }
-    if ($ConfigPath) { $validateArgs.ConfigPath = $ConfigPath }
+$sourceCleanupConfig = Resolve-SourceCleanupConfig -Config $config
 
-    & $auditValidateScript @validateArgs
-    $validateExitCode = $LASTEXITCODE
+$enabledInputDirs = @(
+    @($config.Tasks) |
+        Where-Object { $_.Enabled -eq $true -and $_.InputDirectory } |
+        ForEach-Object {
+            Resolve-TemplateText -Template ([string]$_.InputDirectory) -Tokens $dateTokens
+        } |
+        Sort-Object -Unique
+)
 
-    if ($validateExitCode -eq 1) {
-        Send-ValidationFailureNotificationFromSummary `
-            -RunsRoot $runsRoot `
-            -RunId $handoff.RunId `
-            -Config $config `
-            -Environment $env `
-            -StartDate $cycle.StartDate `
-            -EndDate $cycle.EndDate
-    }
-    elseif ($validateExitCode -eq 2) {
-        Send-ArchiveFailureNotificationFromSummary `
-            -RunsRoot $runsRoot `
-            -RunId $handoff.RunId `
-            -Config $config `
-            -Environment $env `
-            -StartDate $cycle.StartDate `
-            -EndDate $cycle.EndDate
-    }
+Assert-SourceCleanupConfig `
+    -Enabled $sourceCleanupConfig.Enabled `
+    -AllowedRoots $sourceCleanupConfig.AllowedRoots `
+    -EnabledInputDirectories $enabledInputDirs `
+    -ProtectedRoots @($resolvedBackupRoot, $resolvedOutputRoot)
 
-    if ($validateExitCode -ne 0) {
-        Write-Host "Validation/archive completed with exit code $validateExitCode." -ForegroundColor Yellow
-        exit $validateExitCode
+$currentRunWeeksSource = $null
+$effectiveCurrentRunWeeks = if ($PSBoundParameters.ContainsKey('CurrentRunWeeks') -and $CurrentRunWeeks) {
+    $currentRunWeeksSource = 'Parameter'
+    $CurrentRunWeeks
+}
+elseif ($analysisSummary -and $analysisSummary.PSObject.Properties['CurrentRunWeeks'] -and $analysisSummary.CurrentRunWeeks) {
+    $currentRunWeeksSource = 'AnalysisSummary'
+    [string]$analysisSummary.CurrentRunWeeks
+}
+elseif ($config.ContainsKey('CurrentRunWeeks') -and $config.CurrentRunWeeks) {
+    $currentRunWeeksSource = 'Config'
+    [string]$config.CurrentRunWeeks
+}
+else {
+    $currentRunWeeksSource = 'Default'
+    '2'
+}
+
+if ($effectiveCurrentRunWeeks -notin @('2', '4')) {
+    throw "Unsupported CurrentRunWeeks '$effectiveCurrentRunWeeks'. Expected '2' or '4'."
+}
+
+$dynamicSummaryTaskNames = Get-DynamicTaskNamesForWeek -BackupValidationConfig $backupValidationConfig -CurrentRunWeeks $effectiveCurrentRunWeeks
+
+$mergedSummaryData = if ($startDate -and $endDate) {
+    Get-EffectiveTaskSummariesForValidate -RunsRoot $runsRoot `
+        -StartDate $startDate -EndDate $endDate `
+        -DynamicSummaryTaskNames $dynamicSummaryTaskNames
+}
+else {
+    [PSCustomObject]@{ TaskSummaries = @{}; TaskSources = @{} }
+}
+
+# Single-run fallback: if there were no related runs or no dynamic tasks, the
+# helper returns empty hashtables - prefer the resolved-run summaries we loaded
+# at script start (preserves prior behavior).
+if (@($mergedSummaryData.TaskSummaries.Keys).Count -eq 0 -and @($taskSummaries.Keys).Count -gt 0) {
+    $mergedSummaryData = [PSCustomObject]@{
+        TaskSummaries = $taskSummaries
+        TaskSources   = @{}
     }
 }
 
-Write-Host ""
-Write-Host "=== Scheduler completed successfully ===" -ForegroundColor Green
+$effectiveTaskSummaries = if ($mergedSummaryData.TaskSummaries) { $mergedSummaryData.TaskSummaries } else { $taskSummaries }
+$usedRunIds = @(
+    @($mergedSummaryData.TaskSources.GetEnumerator()) |
+        ForEach-Object { $_.Value.RunId } |
+        Where-Object { $_ } |
+        Select-Object -Unique
+)
+$selectedRunId = if ($analysisSummary -and (Get-OptionalPropertyValue -InputObject $analysisSummary -PropertyName 'RunId')) {
+    [string]$analysisSummary.RunId
+}
+elseif ($resolvedRunFolder) {
+    Split-Path -Leaf $resolvedRunFolder
+}
+else {
+    $null
+}
+$validationMode = if ($usedRunIds.Count -gt 1 -or ($usedRunIds.Count -eq 1 -and $selectedRunId -and $usedRunIds[0] -ne $selectedRunId)) { 'aggregated' } else { 'single-run' }
+
+$expectedBackupFiles = Get-ExpectedBackupFiles -CurrentRunWeeks $effectiveCurrentRunWeeks -DateTokens $dateTokens -BackupValidationConfig $backupValidationConfig -TaskSummaries $effectiveTaskSummaries
+$backupValidation = Test-BackupFolderContent -BackupFolder $resolvedSourceFolder -ExpectedFiles $expectedBackupFiles
+$backupValidation | Add-Member -MemberType NoteProperty -Name ValidationMode -Value $validationMode -Force
+$backupValidation | Add-Member -MemberType NoteProperty -Name ValidationTargetFolder -Value $resolvedSourceFolder -Force
+$backupValidation | Add-Member -MemberType NoteProperty -Name MergedRunIds -Value @($usedRunIds) -Force
+$backupValidation | Add-Member -MemberType NoteProperty -Name MergedTaskSources -Value $mergedSummaryData.TaskSources -Force
+$backupValidation | ConvertTo-Json -Depth 8 | Set-Content -Path $validationJsonPath -Encoding UTF8
+$backupValidationText = Format-BackupValidationText -ValidationResult $backupValidation -CurrentRunWeeks $effectiveCurrentRunWeeks -BackupFolder $resolvedSourceFolder
+$backupValidationText | Set-Content -Path $validationTextPath -Encoding UTF8
+
+$effectiveFailOnDifference = if ($FailOnDifference.IsPresent) { $true } else { [bool]$backupValidationConfig.EnforceFailure }
+
+$sourceCopyTargets = @(Get-SourceCopyTargets -ExpectedFiles $expectedBackupFiles -SourceFolder $resolvedSourceFolder)
+$sourceFilePaths = @(
+    $sourceCopyTargets |
+        Where-Object { $_.Exists } |
+        ForEach-Object { [string]$_.SourcePath } |
+        Sort-Object -Unique
+)
+
+$archiveResult = $null
+$archiveStatus = 'NotAttempted'
+
+if ($backupValidation.Passed -and $sourceFilePaths.Count -gt 0) {
+    Write-Log -LogString "Validation passed. Starting archive phase: $($sourceFilePaths.Count) source file(s) to backup." -LogFilePath $logFilePath
+    Write-Host "Validation passed. Archiving $($sourceFilePaths.Count) source file(s) to backup folder..." -ForegroundColor Cyan
+
+    $backupIndex = @{}
+    $pendingDeletions = New-Object 'System.Collections.Generic.List[object]'
+    $archiveErrors = New-Object 'System.Collections.Generic.List[string]'
+
+    foreach ($sourcePath in $sourceFilePaths) {
+        try {
+            if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+                Write-Log -LogString "Archive: source file not found (already moved?): $sourcePath" -LogFilePath $logFilePath
+                continue
+            }
+
+            $resolvedSource = (Resolve-Path -LiteralPath $sourcePath).Path
+            if ($backupIndex.ContainsKey($resolvedSource)) {
+                continue
+            }
+
+            $leafName = Split-Path $resolvedSource -Leaf
+            $sourceHash = (Get-FileHash -LiteralPath $resolvedSource -Algorithm SHA256).Hash
+            $destPath = Join-Path $resolvedBackupFolder $leafName
+
+            if (Test-Path $destPath -PathType Leaf) {
+                $destHash = (Get-FileHash -LiteralPath $destPath -Algorithm SHA256).Hash
+                if ($destHash -eq $sourceHash) {
+                    $backupIndex[$resolvedSource] = $destPath
+                    Write-Log -LogString "Archive: '$leafName' already in backup (hash match)." -LogFilePath $logFilePath
+                }
+                else {
+                    Copy-Item -LiteralPath $resolvedSource -Destination $destPath -Force
+                    $backupIndex[$resolvedSource] = $destPath
+                    Write-Log -LogString "Archive: '$leafName' copied to backup (overwrite, hash mismatch)." -LogFilePath $logFilePath
+                }
+            }
+            else {
+                Copy-Item -LiteralPath $resolvedSource -Destination $destPath -Force
+                $backupIndex[$resolvedSource] = $destPath
+                Write-Log -LogString "Archive: '$leafName' copied to backup." -LogFilePath $logFilePath
+            }
+
+            $pendingDeletions.Add([PSCustomObject]@{
+                SourcePath = $resolvedSource
+                BackupPath = $destPath
+                TaskName   = $leafName
+            })
+        }
+        catch {
+            $archiveErrors.Add("Failed to backup '$sourcePath': $($_.Exception.Message)")
+            Write-Log -LogString "Archive ERROR: Failed to backup '$sourcePath': $($_.Exception.Message)" -LogFilePath $logFilePath
+        }
+    }
+
+    if ($archiveErrors.Count -gt 0) {
+        $archiveStatus = 'BackupFailed'
+        Write-Host "Archive: $($archiveErrors.Count) file(s) failed to backup. Skipping source deletion." -ForegroundColor Yellow
+    }
+    elseif ($pendingDeletions.Count -eq 0) {
+        $archiveStatus = 'NoOp'
+        Write-Log -LogString "Archive: no files needed backup (all missing or already archived)." -LogFilePath $logFilePath
+    }
+    elseif (-not $sourceCleanupConfig.Enabled) {
+        $archiveStatus = 'Success'
+        Write-Host "Archive: $($pendingDeletions.Count) source file(s) copied to backup. Source cleanup disabled - source files retained." -ForegroundColor Green
+        Write-Log -LogString "Archive: copy complete, source cleanup disabled. Retained $($pendingDeletions.Count) source file(s)." -LogFilePath $logFilePath
+    }
+    else {
+        $archiveResult = Invoke-SourceFileCleanup -PendingDeletions ([object[]]$pendingDeletions) -BackupFolder $resolvedBackupFolder -AllowedRoots $sourceCleanupConfig.AllowedRoots -LogFilePath $logFilePath
+        if ($archiveResult.Aborted) {
+            $archiveStatus = 'CleanupAborted'
+            Write-Host "Archive: source cleanup ABORTED - $($archiveResult.AbortReason)" -ForegroundColor Yellow
+        }
+        elseif ($archiveResult.FailedCount -gt 0) {
+            $archiveStatus = 'CleanupPartiallyFailed'
+            Write-Host "Archive: cleanup partially failed. Deleted=$($archiveResult.DeletedCount); Failed=$($archiveResult.FailedCount); Skipped=$($archiveResult.SkippedCount)." -ForegroundColor Yellow
+        }
+        elseif ($archiveResult.DeletedCount -gt 0) {
+            $archiveStatus = 'Success'
+            Write-Host "Archive: $($archiveResult.DeletedCount) source file(s) deleted after backup verification." -ForegroundColor Green
+        }
+        else {
+            $archiveStatus = 'NoOp'
+            Write-Log -LogString "Archive: cleanup completed but no files were actually deleted (all skipped)." -LogFilePath $logFilePath
+        }
+    }
+}
+elseif ($backupValidation.Passed) {
+    $archiveStatus = 'NoSourceFiles'
+}
+
+$summary = [PSCustomObject]@{
+    StartDate            = $startDate
+    EndDate              = $endDate
+    ConfigPath           = $ConfigPath
+    OutputRoot           = $resolvedOutputRoot
+    RunFolder            = $resolvedRunFolder
+    ValidationFolder     = $validationFolder
+    BackupFolder         = $resolvedBackupFolder
+    AnalysisSummaryPath  = $resolvedAnalysisSummaryPath
+    CurrentRunWeeks      = $effectiveCurrentRunWeeks
+    ValidationMode       = $validationMode
+    RelatedRunIds        = @($relatedRuns | ForEach-Object { $_.RunId })
+    MergedTaskSources    = $mergedSummaryData.TaskSources
+    FailOnDifference     = $effectiveFailOnDifference
+    ValidationJsonPath   = $validationJsonPath
+    ValidationTextPath   = $validationTextPath
+    ValidationPassed     = $backupValidation.Passed
+    ValidationTargetFolder = $resolvedSourceFolder
+    ExpectedFileCount    = @($expectedBackupFiles).Count
+    MissingFiles         = @($backupValidation.MissingFiles)
+    UnexpectedFiles      = @($backupValidation.UnexpectedFiles)
+    AnalysisSummaryFound = [bool]$analysisSummary
+    ArchiveStatus        = $archiveStatus
+    ArchiveResult        = $archiveResult
+}
+$summary | ConvertTo-Json -Depth 8 | Set-Content -Path $validationSummaryPath -Encoding UTF8
+
+Write-Log -LogString "Backup validation completed. Passed: $($backupValidation.Passed). ArchiveStatus: $archiveStatus. Summary path: $validationSummaryPath" -LogFilePath $logFilePath
+Write-Host "Resolved run folder: $resolvedRunFolder" -ForegroundColor Cyan
+Write-Host "Resolved backup folder: $resolvedBackupFolder" -ForegroundColor Cyan
+Write-Host "CurrentRunWeeks: $effectiveCurrentRunWeeks (source: $currentRunWeeksSource)" -ForegroundColor Cyan
+Write-Host "Validation mode: $validationMode" -ForegroundColor Cyan
+if ($validationMode -eq 'aggregated') {
+    Write-Host "Merged run sources: $($usedRunIds -join ', ')" -ForegroundColor Cyan
+}
+
+if (-not $backupValidation.Passed) {
+    Write-Host "Backup folder validation found differences. Validation report: $validationTextPath" -ForegroundColor Yellow
+    Write-Host "Validation summary: $validationSummaryPath" -ForegroundColor Yellow
+    if ($effectiveFailOnDifference) {
+        Write-Error "Backup folder validation failed. See $validationTextPath" -ErrorAction Continue
+    }
+    exit 1
+}
+
+Write-Host "Backup folder validation passed: $validationTextPath" -ForegroundColor Green
+Write-Host "Archive status: $archiveStatus" -ForegroundColor Cyan
+Write-Host "Validation summary: $validationSummaryPath" -ForegroundColor Green
+
+if ($archiveStatus -in @('CleanupAborted', 'CleanupPartiallyFailed', 'BackupFailed')) {
+    exit 2
+}
+
 exit 0
