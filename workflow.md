@@ -1,428 +1,380 @@
-# WeCom 审计日志流水线 — 工作流文档
-
-> 本文档反映**当前实现状态**,涵盖入口脚本、模块结构、完整运行流程、配置约定、退出码、部署与运维手册。英文版同义文档见 `workflow_en.md`。
-
----
-
-## 1. 项目概览
-
-PowerShell 5.1 实现的**企业微信合规审计流水线**,双 cron 触发:
-
-- **Scheduler**(主流程):每 2 周一次,Phase 1 分析日志+给 BU 发邮件,Phase 2 校验+归档+删源。
-- **Reminder**(独立提醒):cycle 当天分多个时间点检查文件是否齐全,缺则邮件提醒 ops。
-
-四阶段防御:**Preflight 守门 → 失败通知 → 退出码分级 → 删除四层保护**。
-
----
-
-## 2. 整体架构
-
-```
-analysis_task.config.psd1 (gitignored, 部署侧维护)
-            │
-            ▼
-wecom_analysis_comm.psm1  ── 单一共享模块 (~50 函数)
-            │
-   ┌────────┼────────┬───────────────┐
-   ▼        ▼        ▼               ▼
-Scheduler  AuditLog  AuditValidate   OpsReminder
-   │       (Phase1)  (Phase2)        (独立 cron)
-   │         │            │              │
-   ▼         ▼            ▼              ▼
-mail_analysis / device_analysis      发邮件给 ops
-   │
-   ▼
-Send-Mail → BU 真实邮件
-```
-
-### 入口脚本(4 个)
-
-| 文件 | 角色 |
-|---|---|
-| `Invoke-WeComAuditScheduler.ps1` | cron 主编排,`-Phase Analysis\|Validate\|All`(默认 All) |
-| `Invoke-AuditLog.ps1` | Phase 1:遍历 Tasks,调 mail/device 子脚本,产 run-summary |
-| `Invoke-AuditValidate.ps1` | Phase 2:校验 source 齐全 → 拷贝到 backup → 删源(可选) |
-| `Invoke-WeComAuditOpsReminder.ps1` | 独立 cron,cycle 当天分次提醒 ops 备料 |
-
-### 分析子脚本(2 个)
-
-| 文件 | 内容 |
-|---|---|
-| `wecom_mail_analysis.ps1` | 解析 WeCom Mail 日志 CSV,识别违规外发,给 BU 发报告邮件 |
-| `wecom_devicelog_analysis.ps1` | 解析设备登录 xlsx(经 ImportExcel 转 csv),识别非批准设备,给 BU 发报告 |
-
-### 共享模块
-
-`wecom_analysis_comm.psm1`(50 函数,按域分组):
-
-- **Date / Token**: `New-AuditTokenMap`、`New-DateTokenMap`、`Resolve-TemplateText`、`Resolve-AuditSourceFolder`(fail-fast)
-- **配置/路径解析**: `Resolve-AuditConfigPath`、`Resolve-AuditInputRoot`、`Resolve-AuditOutputRoot`
-- **Preflight / 调度**: `Test-PreflightReady`、`Get-PreflightFiles`、`Resolve-ScheduleCycle`、`Resolve-PhaseHandoff`
-- **备份校验**: `Get-ExpectedBackupFiles`、`Test-BackupFolderContent`、`Get-SourceCopyTargets`、`Format-BackupValidationText`
-- **删除四层防护**: `Get-NormalizedFullPath`、`Test-PathWithinAllowedRoots`、`Test-SafeToDeleteSourceFile`、`Remove-SourceFileWithRetry`、`Invoke-SourceFileCleanup`、`Assert-SourceCleanupConfig`
-- **通知(4 类)**: `Build-AuditNotificationHtml`(私有,共享 HTML 模板)、`Send-Mail`、`Send-PreflightNotification`、`Send-ValidationFailureNotification`、`Send-ArchiveFailureNotification`、`Send-AuditReminderNotification`
-- **LDAP / 通用**: `Get-Cert`、`Get-VaultSecret`、`New-LazyLdapConnection`、`Get-LdapUserByMail` 等
-
----
-
-## 3. 配置约定 (`analysis_task.config.psd1`)
-
-> ⚠️ 该文件被 `.gitignore`。**部署到 PROD/QA 服务器时需手工准备**。
-
-```powershell
-@{
-    ScheduleAnchor       = '20260402'                              # 一个周四,作为 biweekly 起点
-    ReminderTargetTimes  = @{ Analysis = '08:00'; Validate = '16:00' }  # 提醒邮件里的 deadline
-    CurrentRunWeeks      = '2'                                     # fallback,若 anchor 计算未给出
-    InputRoot            = 'C:\addin_deploy_cert'                  # 输入根
-    SourceFolder         = 'C:\addin_deploy_cert\wecom_audit_log\source'   # ★ source 文件夹(fail-fast)
-    LogRoot              = 'C:\SysAdmin\log'                       # 日志/runs 根
-    BackupRoot           = 'C:\addin_deploy_cert\wecom_audit_log_backup'   # ★ backup 必须是 SourceFolder 的兄弟,不能嵌套
-    SourceCleanup        = @{
-        Enabled      = $false                                       # 是否真删源文件
-        AllowedRoots = @('C:\addin_deploy_cert\wecom_audit_log')   # 删除白名单(必须覆盖 source 但不覆盖 backup)
-    }
-    BackupValidationRules = @{
-        CommonFixedFiles   = @( @{ File='...'; ReadyBy='Validate' } )
-        TwoWeekFixedFiles  = @( @{ File='...'; ReadyBy='Analysis' } )
-        FourWeekFixedFiles = @( ... )
-        DynamicFiles       = @( @{ SummaryTaskName='mail-msms'; BaseName='...' } )
-    }
-    Notification = @{
-        PROD = @{ SmtpServer='...'; Port=2587; From='wecom-audit-prod@corp.com';
-                  CertName='...'; OpsTeam=@('...'); CcRecipients=@('...') }
-        QA   = @{ ... }                                             # ★ From 必须是合法邮箱(带 @domain)
-    }
-    Tasks = @(
-        @{ Name='mail-msms'; Type='mail'; BU='MSMS'; Enabled=$true;
-           InputDirectory='{SourceFolder}'; FileNamePattern='MSMS WeCom Mail Log_{startDate}_{endDate}.csv' }
-        # 用 {SourceFolder} / {InputRoot} / {startDate} / {endDate} / {endDatePlus1MMdd} 等 token
-    )
-}
-```
-
-### 路径优先链
-
-| 项 | Param | Env Var | Config Key | Fallback |
-|---|---|---|---|---|
-| Run/log root | `-OutputRoot` | `WECOM_AUDIT_LOG_ROOT` | `LogRoot` | config 所在目录 |
-| Backup root | `-BackupRoot` | `WECOM_AUDIT_BACKUP_ROOT` | `BackupRoot` | resolved log root |
-| Input root | — | `WECOM_AUDIT_INPUT_ROOT` | `InputRoot` | `C:\addin_deploy_cert` |
-| **Source folder** | — | `WECOM_AUDIT_SOURCE_FOLDER` | `SourceFolder` | **无 — fail-fast** |
-
----
-
-## 4. 一个 cycle 日的时间线
-
-```
-07:00  Reminder #1 (Pre-Analysis, Normal)
-07:45  Reminder #2 (Pre-Analysis, Final)
-────────────────────────────────────────────────────────────
-08:00  ▼ Phase 1: Analysis
-       → mail/device 子脚本 → Send-Mail 给 BU
-       → 写 run-summary.json + latest-run.json
-────────────────────────────────────────────────────────────
-08:10  Reminder #1 (Pre-Validate, Normal)
-12:00  Reminder #2 (Pre-Validate, Normal)
-15:30  Reminder #3 (Pre-Validate, LastCall)
-────────────────────────────────────────────────────────────
-16:00  ▼ Phase 2: Validate + Archive
-       → 校验 source 齐全 → 拷贝到 backup (SHA256 dedup)
-       → SourceCleanup.Enabled? → 删源(四层防护)
-```
-
-**Reminder 时刻**:cron 设置时跟 `ReminderTargetTimes` 配置保持一致(邮件正文里告诉 ops "deadline 是 08:00/16:00")。
-
----
-
-## 5. 主流程详细
-
-### 5.1 Scheduler 启动公共步骤
-
-```
-1. Import-Module wecom_analysis_comm.psm1 -Force
-2. Resolve-AuditConfigPath → Import-PowerShellDataFile
-3. Resolve-ScheduleCycle (ScheduleAnchor + 今天 + [-StartDate / -ForceCurrentRunWeeks])
-       → cycle.{StartDate, EndDate, CurrentRunWeeks, IsOverride, Warnings}
-4. New-AuditTokenMap (date tokens + InputRoot + SourceFolder)
-       ★ 集中入口,4 个脚本共用,避免 token 漂移
-```
-
-### 5.2 Phase 1 — Analysis
-
-```
-Invoke-PreflightCheck (Phase=Analysis, SourceFolder=...)
-  └─ Test-PreflightReady
-       ├─ 任务输入文件存在(每个 enabled task 的 InputDirectory + FileNamePattern)
-       └─ ReadyBy='Analysis' 的 fixed files(从 BackupValidationRules 筛)
-缺文件? → Send-PreflightNotification → Write-PreflightReport → exit 3
-全部齐? → 继续
-       ↓
-& .\Invoke-AuditLog.ps1
-   ├─ Assert-TaskNameUniqueness (重名 task 会覆盖输出目录)
-   ├─ Assert-ConfigInputDirectories (InputDirectory 解析后必须存在)
-   ├─ foreach (enabled task):
-   │     - Type='mail'   → wecom_mail_analysis.ps1   → Send-Mail BU
-   │     - Type='device' → wecom_devicelog_analysis.ps1 → Send-Mail BU
-   │     - 写 task-summary.json (HasViolation / ViolationDivisionCount / ...)
-   ├─ Write-RunSummaryJson  (runs/<RunId>/run-summary.json)
-   └─ Write-LatestRunPointer (runs/latest-run.json,给 Phase 2 handoff 用)
-exit:
-   0 = 全部 task 成功
-   1 = 任一 task 失败 / 异常
-```
-
-### 5.3 Phase 2 — Validate + Archive
-
-```
-若 -Phase Validate 单独跑:
-  Resolve-PhaseHandoff (读 latest-run.json)
-    ├─ HANDOFF_NOT_FOUND        → Phase 1 没跑过
-    ├─ HANDOFF_NO_RUNID         → 文件损坏
-    ├─ HANDOFF_STATUS_MISMATCH  → Phase 1 失败了
-    └─ HANDOFF_DATE_MISMATCH    → cycle 日期对不上
-  → 拿到 RunId
-       ↓
-Invoke-PreflightCheck (Phase=Validate, ValidationFolder=<source folder>)
-  └─ 校验 ReadyBy='Validate' 的 fixed files
-     (典型:ops 手工补的 .msg 报告附件)
-缺文件? → Send-PreflightNotification → exit 3
-       ↓
-& .\Invoke-AuditValidate.ps1
-   ├─ Assert-SourceCleanupConfig  (白名单/受保护根校验)
-   ├─ Get-ExpectedBackupFiles     (static + dynamic 期望清单)
-   ├─ Test-BackupFolderContent    (source-mode:校验 source folder 齐不齐)
-   │    Passed=false → exit 1
-   ├─ Get-SourceCopyTargets       (源文件路径 + 是否存在)
-   ├─ 复制 source → backup        (SHA256 dedup,已存在跳过)
-   ├─ SourceCleanup.Enabled?
-   │    yes → Invoke-SourceFileCleanup (★ 四层防护)
-   │    no  → ArchiveStatus = NoOp
-   └─ 写 backup-validation-summary.json (含 ArchiveStatus + ArchiveResult)
-exit:
-   0 = 全部成功
-   1 = validation 失败(缺/多文件)→ Scheduler 触发 Send-ValidationFailureNotification
-   2 = archive 失败              → Scheduler 触发 Send-ArchiveFailureNotification
-```
-
-### 5.4 删除四层防护(`Invoke-SourceFileCleanup`)
-
-每个待删源文件按顺序过 4 关,任一失败 → 该文件不删:
-
-1. **`Get-NormalizedFullPath`** — `[System.IO.Path]::GetFullPath` 规范化(消除 `..`、`.`、长短文件名等)
-2. **`Test-PathWithinAllowedRoots`** — 严格子路径白名单(`StartsWith(root + '\')`)
-3. **Reparse-point 拒绝** — `[FileAttributes].HasFlag(ReparsePoint)` 拦截 symlink/junction
-4. **SHA256 一致性** — `Get-FileHash` 比较 source vs backup,**完全相同才删**
-
-启动时另有 `Assert-SourceCleanupConfig`:白名单**不能包含** BackupRoot / OutputRoot 的祖先,否则启动直接 throw。
-
----
-
-## 6. Reminder 流程
-
-```
-START Invoke-WeComAuditOpsReminder.ps1 -Phase Analysis|Validate
-        -Environment QA|PROD -Sequence '1/2' -Severity Normal|Final|LastCall
-        [-StartDate yyyyMMdd] [-FailOnSendError]
-       │
-       ▼
-Resolve-ScheduleCycle
-       │
-       ▼
-Cycle-day guard:
-  非 backfill 且 cycle.EndDate ≠ today
-    → Write-Warning + exit 0  (防止 cron 配错日子打扰)
-       │
-       ▼
-New-AuditTokenMap → resolvedSourceFolder
-       │
-       ▼
-Test-PreflightReady
-   Analysis 阶段 → SourceFolder = source(查 ReadyBy='Analysis' 文件)
-   Validate 阶段 → ValidationFolder = source(查 ReadyBy='Validate' 文件)
-       │
-   AllReady? ───YES──► log SKIPPED (all ready) + exit 0  (不发邮件)
-   No (缺文件)
-       │
-       ▼
-Resolve-NotificationConfig
-   cert 不可用? → log SKIPPED (no cert) + exit 0
-       │
-       ▼
-Send-AuditReminderNotification
-   To  : OpsTeam 唯一收件人(NO Cc — 提醒是内部催办)
-   Subj: [WeCom Audit][ENV] <Severity> (<Seq>) - Pre-<Phase>: N file(s) missing (<cycleEndDate>)
-         Severity: Normal → "Action Required" / Final → "FINAL CALL" / LastCall → "LAST CALL"
-         若 -StartDate → 加 [Backfill] tag
-   Body: 缺失文件清单 + source 路径 + deadline (来自 ReminderTargetTimes)
-       │
-       ▼
-catch (发送失败):
-   log FAILED
-   if -FailOnSendError → exit 1   (手动/冒烟测试用)
-   else                → exit 0   (cron 路径永远不报红)
-       │
-       ▼
-所有路径都写一行 audit log:
-   <LogRoot>/wecom_audit_log/reminders/reminder-yyyyMMdd-Phase-HHmm.log
-```
-
-**关键设计点**:
-- **独立 cron**,不嵌进 scheduler,主流程不受 reminder 故障影响
-- Reminder 只发 OpsTeam,**不带 CC**(其它三类通知保留 CC)
-- 失败默认吞下(exit 0),`-FailOnSendError` 手动测试时才让失败浮现
-
----
-
-## 7. 退出码
-
-### Scheduler
-
-| Exit | 含义 | 触发后续动作 |
-|---|---|---|
-| 0 | 全部成功 | 无 |
-| 1 | Analysis 任务失败 / Validation 失败 | exit 1 时发 ValidationFailedNotification |
-| 2 | Archive 失败(拷贝/清理) | 发 ArchiveFailedNotification |
-| 3 | Preflight 缺文件 | 发 PreflightNotification + 写 PreflightReport |
-
-### AuditValidate 内部 `ArchiveStatus` 枚举
-
-`NotAttempted` / `NoSourceFiles` / `NoOp` / `Success` / `BackupFailed` / `CleanupAborted` / `CleanupPartiallyFailed`
-
-### Reminder
-
-永远 `exit 0`(除非 `-FailOnSendError` 且真发失败 → `exit 1`)。
-
----
-
-## 8. 文件产出物
-
-```
-<LogRoot>/wecom_audit_log/
-├── runs/
-│   ├── <RunId>/                                ← yyyyMMdd_HHmmss 一次 Phase 1 一个
-│   │   ├── workflow.log
-│   │   ├── run-summary.json
-│   │   ├── run-summary.txt
-│   │   ├── tasks/<safeTaskToken>/
-│   │   │   ├── task.log
-│   │   │   ├── report.csv
-│   │   │   └── summary.json                    ← 给后续 dynamic validation 拿计数用
-│   │   └── validation/                         ← Phase 2 产出
-│   │       ├── backup-validation.log
-│   │       ├── backup-folder-validation.json
-│   │       ├── backup-folder-validation.txt
-│   │       ├── backup-validation-summary.json  ← 含 ArchiveStatus + Notification 块
-│   │       └── notification-failure.json       ← 通知失败时的兜底 sidecar
-│   ├── <PreflightId>/preflight-report.json     ← preflight 失败时
-│   ├── latest-run.json                         ← Phase 1→Phase 2 handoff 指针
-│   └── latest-preflight.json
-└── reminders/
-    └── reminder-yyyyMMdd-Phase-HHmm.log        ← reminder 每次一行式 audit log
-
-<BackupRoot>/<endDate>/                          ← 归档区,SourceFolder 的兄弟位
-└── *.csv / *.xlsx / *.msg / *.png
-```
-
----
-
-## 9. Cron 配置(Windows Task Scheduler)
-
-一个 cycle 日(每两周一次的周四)推荐 7 个任务:
-
-```
-07:00  pwsh -File Invoke-WeComAuditOpsReminder.ps1 -Phase Analysis -Environment PROD -Sequence 1/2 -Severity Normal
-07:45  pwsh -File Invoke-WeComAuditOpsReminder.ps1 -Phase Analysis -Environment PROD -Sequence 2/2 -Severity Final
-08:00  pwsh -File Invoke-WeComAuditScheduler.ps1   -Phase Analysis -env PROD
-
-08:10  pwsh -File Invoke-WeComAuditOpsReminder.ps1 -Phase Validate -Environment PROD -Sequence 1/3 -Severity Normal
-12:00  pwsh -File Invoke-WeComAuditOpsReminder.ps1 -Phase Validate -Environment PROD -Sequence 2/3 -Severity Normal
-15:30  pwsh -File Invoke-WeComAuditOpsReminder.ps1 -Phase Validate -Environment PROD -Sequence 3/3 -Severity LastCall
-16:00  pwsh -File Invoke-WeComAuditScheduler.ps1   -Phase Validate -env PROD
-```
-
-> Trigger 配置成"每两周的周四",或者每周触发但脚本里的 cycle-day guard / Resolve-ScheduleCycle 会跳过非 cycle 日。
-
----
-
-## 10. 运维操作手册
-
-### 10.1 正常流程
-ops 无需手工干预 — cron 跑、reminder 督促备料、Phase 2 自动校验归档。
-
-### 10.2 手工 catch-up(某次 cycle 漏跑)
-```powershell
-.\Invoke-WeComAuditScheduler.ps1 -StartDate 20260319 -ForceCurrentRunWeeks 2 -env PROD
-# -StartDate 触发 backfill;cycle.EndDate 自动 = StartDate + 14 天
-```
-
-### 10.3 分阶段手动跑
-```powershell
-# 只跑 Phase 1
-.\Invoke-WeComAuditScheduler.ps1 -StartDate 20260319 -Phase Analysis -env QA
-# 等 ops 补完 .msg 报告附件到 source folder
-.\Invoke-WeComAuditScheduler.ps1 -StartDate 20260319 -Phase Validate -env QA
-```
-
-### 10.4 暂时关闭源文件删除(只校验+拷贝)
-config:
-```powershell
-SourceCleanup = @{ Enabled = $false; AllowedRoots = @('...') }
-```
-
-### 10.5 Reminder 手动冒烟(让失败暴露)
-```powershell
-.\Invoke-WeComAuditOpsReminder.ps1 -Phase Analysis -Environment QA -StartDate 20260319 -FailOnSendError
-# -FailOnSendError 让发送失败以 exit 1 返回(便于脚本/CI 判断)
-```
-
----
-
-## 11. 故障排查
-
-| 现象 | 大概率原因 | 修法 |
-|---|---|---|
-| `SourceFolder is not configured. Set 'SourceFolder' ...` | config 没有 `SourceFolder` | config 加 `SourceFolder = '<source 绝对路径>'`,或设 `WECOM_AUDIT_SOURCE_FOLDER` 环境变量 |
-| `SourceCleanup AllowedRoots would expose protected path '...\backup'` | BackupRoot 嵌在 cleanup 白名单里 | 把 BackupRoot 移成 SourceFolder 的兄弟位(e.g. `wecom_audit_log_backup`),或暂时 `SourceCleanup.Enabled=$false` |
-| `Notification 'From' is not a valid email address` | config 的 `From` 没带 `@域名` | 改成真实邮箱,如 `wecom-audit-prod@corp.com`。一处修复救活 4 类通知 |
-| `Reminder skipped: today is not the cycle endDate` | reminder cron 触发了非 cycle 周 | 正常的 cycle-day guard,不需修;或加 `-StartDate` 强制 backfill |
-| `HANDOFF_NOT_FOUND / STATUS_MISMATCH / DATE_MISMATCH` | Phase 2 找不到匹配的 Phase 1 输出 | 检查 `runs/latest-run.json`;确保 Phase 1 成功跑过且日期参数一致 |
-| `Cannot find an overload for "Add" and the argument count: "1"` | 模块/缓存不同步,函数里 `$expected` 还是 hashtable | `Remove-Module wecom_analysis_comm; Import-Module ... -Force` 或重开 PowerShell |
-| `Argument types do not match` at `return @($expected)` | PS 5.1 `@()` 对 `List[object]` 装 PSCustomObject 的已知缺陷 | 已修:`return $expected.ToArray()`。同步 module 即可 |
-| Cmdlet 弹出 `Cc:` 让输入 | reminder 调 `Send-Mail` 不传 `-Cc`,但 `Send-Mail` 的 `-Cc` 还是 Mandatory | 已修:`Send-Mail` 的 `-Cc` 改可选 + `if ($Cc) { ... }`。同步 module 即可 |
-| BU 邮件每次重跑都重发 | **去重功能未实现**(已知 gap) | 计划:cycle-level guard(扫 run-summary.json,Success 则跳过,`-ForceResendBuMail` 强制) |
-
----
-
-## 12. 设计原则速览
-
-| 原则 | 体现 |
-|---|---|
-| **Fail-fast 配置** | `Resolve-AuditSourceFolder` 缺值直接 throw,不静默回退 |
-| **Token 集中化** | `New-AuditTokenMap` 一处解析,4 脚本共用,消除 drift |
-| **Source-mode 校验** | Phase 2 校验**源目录**,过了才拷贝,而不是看备份目录 |
-| **两阶段 handoff** | `latest-run.json` 携带 RunId + 日期 + 状态,Phase 2 严格校验 |
-| **删除四层防护** | 规范化 → 白名单 → 拒 reparse → SHA256 一致 |
-| **通知共享内核** | 4 类通知共用 `Build-AuditNotificationHtml`,helper 自动 encode 防 XSS |
-| **退出码分级** | 0/1/2/3 各有明确语义,便于 cron 监控 |
-| **可观测但不打断** | reminder 永远 exit 0;通知失败写 sidecar |
-| **Reminder 解耦** | 独立 cron + 独立脚本,主流程不依赖其结果 |
-
----
-
-## 13. 已知不足 / 待办
-
-| 项 | 现状 | 推荐方案 |
-|---|---|---|
-| **BU 邮件重复发送** | 重跑必重发(无 dedup) | cycle-level guard(扫 run-summary,Success 跳过,`-ForceResendBuMail` 强制)。~50 行,比 per-mail ledger 简单 10 倍 |
-| reminder 失败的 meta 通知 | 只写日志 + sidecar | 故意保持简单,如需可加 monitoring 抓 `notification-failure.json` |
-| config 部署 | gitignored,需服务器手工维护 | 维持现状(config 含 cert 名/SMTP 信息,不进版本库是对的) |
-
----
-
-## 14. 相关文档
-
-- `CLAUDE.md` — 给 Claude Code 的项目导览(架构 + 配置 + coding notes)
-- `workflow_en.md` — 英文版工作流文档(早期版本,部分对齐)
-- `wecom_audit_pipeline.drawio` — 同等内容的可视化流程图(3 个 Page)
-- `tests/Unit/wecom_analysis_comm.Tests.ps1` — Pester 单元测试(当前 50/50 通过)
+
+● QA 部署详细步骤(systemid = test_abc)
+
+  ▎ 假设 systemid test_abc 用于:cert 名 + SMTP 发件人前缀 + Vault key 前缀 + LDAP credential key。本文档以此为占位贯穿。
+
+  ---
+  0. 前置检查清单(到 QA 服务器先确认)
+
+  ┌────────────────┬─────────────────────────────────────────────────────────────────────────────────────┬──────────────────────────────────────┐
+  │       项       │                                     命令 / 操作                                     │                 期望                 │
+  ├────────────────┼─────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────┤
+  │ OS             │ Get-CimInstance Win32_OperatingSystem | Select Caption                              │ Windows Server 2019 / 2022           │
+  ├────────────────┼─────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────┤
+  │ PowerShell     │ $PSVersionTable.PSVersion                                                           │ ≥ 5.1(不要用 PS 7,代码针对 5.1 设计) │
+  ├────────────────┼─────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────┤
+  │ .NET Framework │ Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' Release │ ≥ 461808(4.7.2+)                     │
+  ├────────────────┼─────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────┤
+  │ 网络           │ Test-NetConnection mailhost.ms.com -Port 2587                                       │ TCP 通(SMTP)                         │
+  ├────────────────┼─────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────┤
+  │ 网络           │ Test-NetConnection <vault-host> -Port <vault-port>                                  │ TCP 通(如用 Vault)                   │
+  ├────────────────┼─────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────┤
+  │ LDAP           │ Test-NetConnection <ldap-host> -Port 636                                            │ TCP 通(若 LDAPS)                     │
+  ├────────────────┼─────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────┤
+  │ 服务账号       │ 决定用哪个账号跑 cron(本文档假设 CORP\svc-wecom-qa)                                 │ 有该账号                             │
+  ├────────────────┼─────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────┤
+  │ 文件系统       │ Test-Path 'C:\addin_deploy_cert' Test-Path 'C:\SysAdmin\log'                        │ 可创建/已存在                        │
+  └────────────────┴─────────────────────────────────────────────────────────────────────────────────────┴──────────────────────────────────────┘
+
+  ---
+  1. 准备目录骨架
+
+  在服务器以 admin 身份开 PowerShell:
+
+  # Source 文件夹(ops 投放原始日志)
+  New-Item -Path 'C:\addin_deploy_cert\wecom_audit_log\source' -ItemType Directory -Force | Out-Null
+
+  # Backup 文件夹(必须是 source 的兄弟,不能嵌套)
+  New-Item -Path 'C:\addin_deploy_cert\wecom_audit_log_backup' -ItemType Directory -Force | Out-Null
+
+  # Log 根(runs/ + reminders/ 会在其下)
+  New-Item -Path 'C:\SysAdmin\log\wecom_audit_log\runs' -ItemType Directory -Force | Out-Null
+  New-Item -Path 'C:\SysAdmin\log\wecom_audit_log\reminders' -ItemType Directory -Force | Out-Null
+
+  # 部署目录
+  New-Item -Path 'C:\addin_deploy_cert\wecom_audit_log\V3' -ItemType Directory -Force | Out-Null
+
+  ---
+  2. 准备并导入 SMTP 证书
+
+  证书名 = systemid(test_abc),从 cert 管理员获取 .pfx,然后:
+
+  # 导入到 LocalMachine\My(脚本里 Get-Cert 默认查这里)
+  $pfxPath = 'C:\path\to\test_abc.pfx'
+  $pwd     = Read-Host -AsSecureString -Prompt 'PFX password'
+  Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\LocalMachine\My -Password $pwd
+
+  # 确认:Friendly Name / Subject 含 'test_abc',脚本通过 CertName 来查
+  Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.FriendlyName -like '*test_abc*' -or $_.Subject -like '*test_abc*' }
+
+  # 给服务账号读取私钥权限(关键!否则 Send-Mail 会 401)
+  $cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.FriendlyName -eq 'test_abc' } | Select-Object -First 1
+  $rsaCert = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+  $keyFile = "$env:ProgramData\Microsoft\Crypto\Keys\$($rsaCert.Key.UniqueName)"
+  $acl = Get-Acl $keyFile
+  $rule = New-Object System.Security.AccessControl.FileSystemAccessRule('CORP\svc-wecom-qa','Read','Allow')
+  $acl.AddAccessRule($rule)
+  Set-Acl -Path $keyFile -AclObject $acl
+
+  ---
+  3. 部署代码文件
+
+  从仓库(开发机)拷贝到 QA 服务器的 V3 目录:
+
+  # 在开发机上(或 jump server)
+  $src = 'C:\Users\<dev>\workspace\UI_wecom_log'
+  $dst = '\\<qa-server>\C$\addin_deploy_cert\wecom_audit_log\V3'
+
+  Copy-Item "$src\Invoke-WeComAuditScheduler.ps1"    $dst -Force
+  Copy-Item "$src\Invoke-AuditLog.ps1"               $dst -Force
+  Copy-Item "$src\Invoke-AuditValidate.ps1"          $dst -Force
+  Copy-Item "$src\Invoke-WeComAuditOpsReminder.ps1"  $dst -Force
+  Copy-Item "$src\wecom_analysis_comm.psm1"          $dst -Force
+  Copy-Item "$src\wecom_mail_analysis.ps1"           $dst -Force
+  Copy-Item "$src\wecom_devicelog_analysis.ps1"      $dst -Force
+
+  # 捆绑模块(ImportExcel,设备分析用)
+  Copy-Item "$src\modules" "$dst\modules" -Recurse -Force
+
+  # tests/ 可选,部署核心运行不依赖,但带上方便服务器侧 Pester
+  Copy-Item "$src\tests" "$dst\tests" -Recurse -Force
+
+  注意:analysis_task.config.psd1 不要 copy,下一步在 QA 现场创建。
+
+  ---
+  4. 创建 QA config(关键 — 含 test_abc 替换点)
+
+  在 C:\addin_deploy_cert\wecom_audit_log\V3\analysis_task.config.psd1 创建:
+
+  @{
+      ScheduleAnchor       = '20260402'                                       # 第一个 cycle 周四(按 ops 实际定)
+      ReminderTargetTimes  = @{ Analysis = '08:00'; Validate = '16:00' }
+      CurrentRunWeeks      = '2'
+      ExecutionMode        = 'FailFast'
+      EnforceBackupValidation = $false
+
+      InputRoot    = 'C:\addin_deploy_cert'
+      SourceFolder = 'C:\addin_deploy_cert\wecom_audit_log\source'            # ★ fail-fast,必填
+      LogRoot      = 'C:\SysAdmin\log'
+      BackupRoot   = 'C:\addin_deploy_cert\wecom_audit_log_backup'            # ★ 必须 SourceFolder 的兄弟
+
+      SourceCleanup = @{
+          Enabled      = $false                                                # QA 先关删除,稳定后再开
+          AllowedRoots = @('C:\addin_deploy_cert\wecom_audit_log\source')
+      }
+
+      BackupValidationRules = @{
+          CommonFixedFiles = @(
+              @{ File = 'COD WeCom Login to Non-Approved Devices FID BU - Report({startDate} - {endDate}).msg'; ReadyBy = 'Validate' }
+          )
+          DynamicFiles = @(
+              @{ SummaryTaskName = 'device-msms'; BaseName = 'COD WeCom Login to Non-Approved Devices IM BU - Report({startDate} - {endDate}).msg' }
+              @{ SummaryTaskName = 'mail-msms';   BaseName = 'COD WeCom Mail Data Leakage Manual Review - from {startDate} to {endDate}.msg' }
+          )
+          TwoWeekFixedFiles  = @(
+              @{ File = 'MSMS WeCom Mail Log_{startDate}_{endDate}.csv'; ReadyBy = 'Analysis' }
+              # ... 按业务补 ...
+          )
+          FourWeekFixedFiles = @(
+              @{ File = 'Conduct WeCom Log Audit file uploaded.msg'; ReadyBy = 'Validate' }
+              # ... 按业务补 ...
+          )
+      }
+
+      # ===== systemid = test_abc 注入点 =====
+      Notification = @{
+          QA = @{
+              SmtpServer   = 'mailhost.ms.com'
+              Port         = 2587
+              From         = 'test_abc@infradev.mocktest.com.cn'              # ★ systemid 作发件人 local-part
+              CertName     = 'test_abc'                                        # ★ cert 名,Get-Cert 据此查 LocalMachine\My
+              OpsTeam      = @('ling.gu@infradev.mocktest.com.cn')             # 通知收件人(QA 测试邮箱)
+              CcRecipients = @('ling.gu@infradev.mocktest.com.cn')
+          }
+          PROD = @{
+              # PROD 占位,部署 QA 时不需要,但保留 schema 一致
+              SmtpServer   = 'mailhost.ms.com'
+              Port         = 2587
+              From         = 'wecom-audit-prod@corp.com'
+              CertName     = 'wecom-audit-prod'
+              OpsTeam      = @('ops-team@corp.com')
+              CcRecipients = @('admin@corp.com')
+          }
+      }
+
+      Tasks = @(
+          @{ Name='mail-msms';   Type='mail';   BU='MSMS';  Enabled=$true;
+             InputDirectory='{SourceFolder}'; FileNamePattern='MSMS WeCom Mail Log_{startDate}_{endDate}.csv' }
+          @{ Name='device-msms'; Type='device'; BU='MSMS';  Enabled=$false;   # QA 初期可只开一个
+             InputDirectory='{SourceFolder}'; FileNamePattern='msms_device_log.xlsx' }
+          # 按需补 ...
+      )
+  }
+
+  替换点检查:
+
+  ┌───────────────────────────────────┬──────────────────────────────┬──────────────────────────┐
+  │              占位符               │            替换为            │         文件位置         │
+  ├───────────────────────────────────┼──────────────────────────────┼──────────────────────────┤
+  │ test_abc@infradev.mocktest.com.cn │ systemid + 真实域名          │ Notification.QA.From     │
+  ├───────────────────────────────────┼──────────────────────────────┼──────────────────────────┤
+  │ test_abc                          │ systemid(cert friendly name) │ Notification.QA.CertName │
+  ├───────────────────────────────────┼──────────────────────────────┼──────────────────────────┤
+  │ ling.gu@...                       │ 真实 ops 测试邮箱            │ OpsTeam / CcRecipients   │
+  ├───────────────────────────────────┼──────────────────────────────┼──────────────────────────┤
+  │ 20260402                          │ 部署后第一个真实 cycle 周四  │ ScheduleAnchor           │
+  └───────────────────────────────────┴──────────────────────────────┴──────────────────────────┘
+
+  ---
+  5. 配置 Vault / LDAP credential(若 mail/device 子脚本用)
+
+  wecom_mail_analysis.ps1 / wecom_devicelog_analysis.ps1 用 $prodid 与 Get-VaultSecret 取 LDAP credential。
+
+  # 假设 Vault key 命名也是 systemid: test_abc
+  # 在 Vault 管理界面里创建 secret:
+  #   path: secret/wecom-audit/test_abc/ldap
+  #   data: username = ...
+  #          password = ...
+  #
+  # 服务器侧需要 Vault client 配好,或通过 Get-VaultSecret 内置逻辑(走 cert auth)
+  # 验证:
+  Import-Module 'C:\addin_deploy_cert\wecom_audit_log\V3\wecom_analysis_comm.psm1'
+  $ldapCred = Get-VaultSecret -KeyName 'test_abc'  # 具体签名按 Get-VaultSecret 实际定义
+  # 应返回 PSCredential 对象,不报错
+
+  ▎ 若环境暂无 Vault,可在子脚本里临时改用 Get-Credential 交互式或环境变量。这是临时手段,生产必须走 Vault。
+
+  ---
+  6. 验证步骤(逐项跑,任一失败就停)
+
+  6.1 语法 / 模块加载
+
+  cd 'C:\addin_deploy_cert\wecom_audit_log\V3'
+
+  # 7 个 PS 文件语法
+  foreach ($f in Get-ChildItem *.ps1,*.psm1) {
+      $null = [System.Management.Automation.PSParser]::Tokenize((Get-Content -Raw $f.FullName), [ref]$null)
+      "OK: $($f.Name)"
+  }
+
+  # 模块导入
+  Import-Module .\wecom_analysis_comm.psm1 -Force -Verbose
+  # 应看到 ~57 个函数导入,无 error
+
+  6.2 Pester(若 copy 了 tests/)
+
+  Install-Module Pester -RequiredVersion 3.4.0 -Force -Scope CurrentUser    # 仅首次
+  Invoke-Pester -Script .\tests\Unit\wecom_analysis_comm.Tests.ps1
+  # 期望:Passed=64 Failed=0
+
+  6.3 Cert / SMTP / Vault 联通
+
+  # 证书可读
+  $cert = Get-Cert -KeyName 'test_abc'
+  $cert.Thumbprint    # 不应为空
+
+  # SMTP 连通(不真发)
+  Test-NetConnection mailhost.ms.com -Port 2587
+
+  # Vault(若适用)
+  $cred = Get-VaultSecret -KeyName 'test_abc'
+
+  6.4 Reminder 干跑(backfill,看是否能识别缺文件)
+
+  QA 的 cycle 还没到时,用 backfill 模式触发:
+
+  # 选一个合理的 backfill 日期(不影响真实数据,只是看流程)
+  .\Invoke-WeComAuditOpsReminder.ps1 `
+      -Phase Validate `
+      -Environment QA `
+      -StartDate 20260514 `
+      -Sequence '1/3' `
+      -Severity Normal
+  # 期望:打印 "preflight reports N missing"(N>0 正常),日志写入 reminders/
+  # 期望:看见 ops 测试邮箱收到 reminder 邮件(主题含 [WeCom Audit][QA] Action Required)
+
+  6.5 Scheduler 干跑(backfill,Phase=Analysis 单步)
+
+  往 source folder 放最少一份必要的 .csv 文件(满足 Analysis 阶段的 ReadyBy='Analysis' fixed file),然后:
+
+  .\Invoke-WeComAuditScheduler.ps1 `
+      -StartDate 20260514 `
+      -ForceCurrentRunWeeks 2 `
+      -Phase Analysis `
+      -env QA
+  # 期望:preflight pass → Phase 1 跑 → BU 邮件发往 QA 测试邮箱 → 写 run-summary.json
+  # 检查:
+  ls 'C:\SysAdmin\log\wecom_audit_log\runs\' | Sort-Object LastWriteTime -Descending | Select-Object -First 3
+  # 应看见新建的 <yyyyMMdd_HHmmss>/ 目录,里头有 run-summary.json + tasks/
+
+  6.6 Scheduler Validate 阶段(等 ops 补齐 .msg 后)
+
+  # 假设已经把 3 个 .msg(static FID + dynamic IM BU + dynamic Mail Leakage)补到 source
+  .\Invoke-WeComAuditScheduler.ps1 `
+      -StartDate 20260514 `
+      -ForceCurrentRunWeeks 2 `
+      -Phase Validate `
+      -env QA
+  # 期望:exit 0,backup-validation-summary.json 显示 Passed=true,backup/<endDate>/ 出现拷贝
+  # 因为 SourceCleanup.Enabled=$false → 源文件保留(QA 验证期望)
+
+  ---
+  7. Cron / Task Scheduler 配置(7 个任务)
+
+  在 Windows Task Scheduler 注册 7 个任务,所有任务用服务账号 CORP\svc-wecom-qa 运行,触发器都设成"每两周的周四"(根据 ScheduleAnchor):
+
+  $workDir = 'C:\addin_deploy_cert\wecom_audit_log\V3'
+  $svcAcct = 'CORP\svc-wecom-qa'
+  $pwsh    = 'powershell.exe'   # 走 PS 5.1
+
+  function Register-WeComTask {
+      param([string]$Name, [string]$Time, [string]$ArgString)
+      $action  = New-ScheduledTaskAction -Execute $pwsh `
+                    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$workDir\$($ArgString.Split(' ',2)[0])`" $($ArgString.Split(' ',2)[1])" `
+                    -WorkingDirectory $workDir
+      $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Thursday -WeeksInterval 2 -At $Time
+      $principal = New-ScheduledTaskPrincipal -UserId $svcAcct -LogonType Password -RunLevel Highest
+      Register-ScheduledTask -TaskName "WeComAudit-QA-$Name" -Action $action -Trigger $trigger -Principal $principal -Force
+  }
+
+  # Pre-Analysis
+  Register-WeComTask 'PreAnalysisR1'  '07:00' 'Invoke-WeComAuditOpsReminder.ps1 -Phase Analysis -Environment QA -Sequence 1/2 -Severity Normal'
+  Register-WeComTask 'PreAnalysisR2'  '07:45' 'Invoke-WeComAuditOpsReminder.ps1 -Phase Analysis -Environment QA -Sequence 2/2 -Severity Final'
+  # Phase 1
+  Register-WeComTask 'Analysis'       '08:00' 'Invoke-WeComAuditScheduler.ps1 -Phase Analysis -env QA'
+  # Pre-Validate
+  Register-WeComTask 'PreValidateR1'  '08:10' 'Invoke-WeComAuditOpsReminder.ps1 -Phase Validate -Environment QA -Sequence 1/3 -Severity Normal'
+  Register-WeComTask 'PreValidateR2'  '12:00' 'Invoke-WeComAuditOpsReminder.ps1 -Phase Validate -Environment QA -Sequence 2/3 -Severity Normal'
+  Register-WeComTask 'PreValidateR3'  '15:30' 'Invoke-WeComAuditOpsReminder.ps1 -Phase Validate -Environment QA -Sequence 3/3 -Severity LastCall'
+  # Phase 2
+  Register-WeComTask 'Validate'       '16:00' 'Invoke-WeComAuditScheduler.ps1 -Phase Validate -env QA'
+
+  ▎ Register 时会提示输入服务账号密码;一次输入,Task Scheduler 缓存。
+
+  ---
+  8. ACL / 权限(关键 — 不漏)
+
+  $svc = 'CORP\svc-wecom-qa'
+
+  # Source folder:ops 写、服务账号读写
+  icacls 'C:\addin_deploy_cert\wecom_audit_log\source' /grant "$svc:(OI)(CI)M" /T
+
+  # Backup folder:服务账号写,其他人只读
+  icacls 'C:\addin_deploy_cert\wecom_audit_log_backup' /grant "$svc:(OI)(CI)M" /T
+
+  # Log root:服务账号写
+  icacls 'C:\SysAdmin\log\wecom_audit_log' /grant "$svc:(OI)(CI)M" /T
+
+  # 部署目录:服务账号读取
+  icacls 'C:\addin_deploy_cert\wecom_audit_log\V3' /grant "$svc:(OI)(CI)RX" /T
+
+  # Cert 私钥:已在步骤 2 处理
+
+  ---
+  9. 首轮 cycle 上线验证
+
+  QA 第一个 cycle 周四前一天:
+
+  ┌─────────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │    时刻     │                                                         检查                                                          │
+  ├─────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 当天 07:01  │ ops 邮箱应收到 Pre-Analysis Reminder #1(若 source 还没文件)。ls C:\SysAdmin\log\wecom_audit_log\reminders\ 应见新 log │
+  ├─────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 08:00 后    │ Task Scheduler WeComAudit-QA-Analysis 显示"上次运行结果:0x0";runs\ 出现新 <RunId>;QA 测试邮箱收到 BU 报告测试邮件     │
+  ├─────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 08:11 后    │ Pre-Validate Reminder #1 收到,提示缺 3 个 .msg(2 dynamic + 1 static)                                                  │
+  ├─────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ ops 补 .msg │ 后续 reminder 不再发(AllReady=true)                                                                                   │
+  ├─────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 16:00 后    │ Validate Task 成功,backup\<endDate>\ 出现 4 个文件(static + 3 .msg)                                                   │
+  └─────────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  若任一环节失败 → 看对应 log:
+  - runs\<RunId>\workflow.log
+  - runs\<RunId>\validation\backup-validation.log
+  - reminders\reminder-<日期>-<phase>-<时间>.log
+
+  ---
+  10. 部署清单 / 切换 PROD checklist
+
+  QA 跑稳 ≥ 2 个 cycle 后才推 PROD。PROD 切换前必做:
+
+  - config 的 Notification.PROD 部分填真实值(From / CertName / OpsTeam / CcRecipients)
+  - PROD systemid 的 cert 已导入 Cert:\LocalMachine\My
+  - PROD Vault credential 已配
+  - SourceCleanup.Enabled = $true(PROD 通常需要自动删源)+ AllowedRoots 确认正确
+  - Task Scheduler 注册 PROD 版本的 7 个任务(脚本传 -Environment PROD / -env PROD)
+  - PROD BackupRoot 指向真实 NAS(\\<nas>\<share>\wecom_audit_log_backup)而不是本地盘
+  - PROD 服务账号有 NAS 写权限
+
+  ---
+  关键提醒
+
+  ┌──────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────┐
+  │                          ⚠️ 易踩坑                           │                        修法                         │
+  ├──────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ SourceFolder 缺失 → 启动直接 throw                           │ config 必须有 SourceFolder = '...'                  │
+  ├──────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ BackupRoot 嵌在 SourceCleanup.AllowedRoots 之内 → 启动 throw │ BackupRoot 必须是 SourceFolder 的兄弟(_backup 后缀) │
+  ├──────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ From 不带 @domain → 通知发不出                               │ 必须真实邮箱格式                                    │
+  ├──────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ 服务账号没 cert 私钥权限 → Send-Mail 401                     │ 步骤 2 ACL 必须做                                   │
+  ├──────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ 模块改动后 Import-Module 不重载 → 修了等于没修               │ 改完关 PowerShell 重开,或 -Force 重新导入           │
+  ├──────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ 上线后 cron 不报红但邮件没发                                 │ 看 reminders/*.log 的 Action: FAILED 行             │
+  └──────────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────┘
+
+  ---
+  按此 1~9 顺序执行,QA 系统(systemid=test_abc)就部署完成,可以跑首轮 cycle 了。任何一步卡住把对应 log/输出贴给我,我帮定位。
