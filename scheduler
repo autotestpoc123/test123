@@ -336,16 +336,18 @@ $mergedSummaryData = if ($startDate -and $endDate) {
         -DynamicSummaryTaskNames $dynamicSummaryTaskNames
 }
 else {
-    [PSCustomObject]@{ TaskSummaries = @{}; TaskSources = @{} }
+    [PSCustomObject]@{ TaskSummaries = @{}; TaskSources = @{}; RelatedRuns = @() }
 }
 
 # Single-run fallback: if there were no related runs or no dynamic tasks, the
 # helper returns empty hashtables - prefer the resolved-run summaries we loaded
-# at script start (preserves prior behavior).
+# at script start (preserves prior behavior). Keep RelatedRuns intact so the
+# downstream RelatedRunIds audit field still reflects what was scanned.
 if (@($mergedSummaryData.TaskSummaries.Keys).Count -eq 0 -and @($taskSummaries.Keys).Count -gt 0) {
     $mergedSummaryData = [PSCustomObject]@{
         TaskSummaries = $taskSummaries
         TaskSources   = @{}
+        RelatedRuns   = @($mergedSummaryData.RelatedRuns)
     }
 }
 
@@ -492,7 +494,7 @@ $summary = [PSCustomObject]@{
     AnalysisSummaryPath  = $resolvedAnalysisSummaryPath
     CurrentRunWeeks      = $effectiveCurrentRunWeeks
     ValidationMode       = $validationMode
-    RelatedRunIds        = @($relatedRuns | ForEach-Object { $_.RunId })
+    RelatedRunIds        = @(@($mergedSummaryData.RelatedRuns) | ForEach-Object { $_.RunId })
     MergedTaskSources    = $mergedSummaryData.TaskSources
     FailOnDifference     = $effectiveFailOnDifference
     ValidationJsonPath   = $validationJsonPath
