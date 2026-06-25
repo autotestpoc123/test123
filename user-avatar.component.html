@@ -1,0 +1,12 @@
+<span class="user-avatar" [ngClass]="[size, shape]" [class.clickable]="clickable"
+  [attr.role]="clickable ? 'button' : null" [attr.tabindex]="clickable ? 0 : null"
+  [attr.aria-label]="clickable ? ('View photo of ' + (fullName || msid || '')) : null"
+  (click)="onClick($event)" (keydown)="onKeydown($event)">
+  @if (loaded && photoUrl) {
+    <img [src]="photoUrl" [alt]="fullName || msid || ''" />
+  } @else if (loaded) {
+    <span class="avatar-initials" [style.backgroundColor]="bgColor">{{ initials }}</span>
+  } @else {
+    <span class="avatar-initials placeholder" [style.backgroundColor]="bgColor"></span>
+  }
+</span>
