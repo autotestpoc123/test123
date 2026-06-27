@@ -1,131 +1,132 @@
-import {
-  Component,
-  ElementRef,
-  EventEmitter,
-  Input,
-  OnChanges,
-  OnDestroy,
-  OnInit,
-  Output,
-  SimpleChanges,
-} from '@angular/core';
-import { SafeUrl } from '@angular/platform-browser';
-import { Subscription } from 'rxjs';
-import { UserPhotoService } from '../../../service/user-photo.service';
+import { HttpClient, HttpErrorResponse } from '@angular/common/http';
+import { Injectable, OnDestroy } from '@angular/core';
+import { DomSanitizer, SafeUrl } from '@angular/platform-browser';
+import { Observable, of } from 'rxjs';
+import { catchError, map, shareReplay } from 'rxjs/operators';
+import { URL_GET_USER_PHOTO } from '../data/constants';
 
-type AvatarSize = 'sm' | 'md' | 'lg' | 'xl';
-type AvatarShape = 'circle' | 'square';
+const MAX_CACHE_SIZE = 200;
+const NEGATIVE_CACHE_MS = 30_000;
+const REVOKE_DELAY_MS = 5_000;
 
-@Component({
-  selector: 'user-avatar',
-  templateUrl: './user-avatar.component.html',
-  styleUrl: './user-avatar.component.css',
-  standalone: false,
-})
-export class UserAvatarComponent implements OnInit, OnChanges, OnDestroy {
-  @Input() msid?: string;
-  @Input() fullName?: string;
-  @Input() size: AvatarSize = 'sm';
-  @Input() shape: AvatarShape = 'circle';
-  @Input() clickable = false;
-  @Output() avatarClick = new EventEmitter<Event>();
+interface PhotoCacheEntry {
+  observable: Observable<SafeUrl | null>;
+  objectUrl?: string;
+}
 
-  photoUrl: SafeUrl | null = null;
-  loaded = false;
+@Injectable({ providedIn: 'root' })
+export class UserPhotoService implements OnDestroy {
+  private cache = new Map<string, PhotoCacheEntry>();
+  private readonly unloadHandler = () => this.releaseAll();
 
-  private sub?: Subscription;
-  private observer?: IntersectionObserver;
-
-  constructor(
-    private host: ElementRef<HTMLElement>,
-    private photoSvc: UserPhotoService
-  ) {}
-
-  ngOnInit(): void {
-    if (typeof IntersectionObserver === 'undefined') {
-      this.load();
-      return;
-    }
-    this.observer = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((e) => e.isIntersecting)) {
-          this.load();
-          this.observer?.disconnect();
-          this.observer = undefined;
-        }
-      },
-      { rootMargin: '100px' }
-    );
-    this.observer.observe(this.host.nativeElement);
-  }
-
-  ngOnChanges(changes: SimpleChanges): void {
-    if (!changes['msid'] || changes['msid'].firstChange) {
-      return;
-    }
-    if (this.loaded) {
-      this.loaded = false;
-      this.photoUrl = null;
-      this.load();
+  constructor(private http: HttpClient, private sanitizer: DomSanitizer) {
+    if (typeof window !== 'undefined') {
+      window.addEventListener('beforeunload', this.unloadHandler);
     }
   }
 
-  private load(): void {
-    this.sub?.unsubscribe();
-    this.sub = this.photoSvc.getPhoto(this.msid).subscribe({
-      next: (url) => {
-        this.photoUrl = url;
-        this.loaded = true;
-      },
-      error: () => {
-        this.photoUrl = null;
-        this.loaded = true;
-      },
+  getPhoto(msid: string | undefined | null): Observable<SafeUrl | null> {
+    if (!msid || !/^[A-Za-z0-9]{2,20}$/.test(msid)) {
+      return of(null);
+    }
+    const key = msid.toLowerCase();
+
+    const cached = this.cache.get(key);
+    if (cached) {
+      // refresh LRU position: move hot entry to the end of insertion order
+      this.cache.delete(key);
+      this.cache.set(key, cached);
+      return cached.observable;
+    }
+
+    const entry: PhotoCacheEntry = { observable: of(null) };
+
+    const request$ = this.http
+      .get(URL_GET_USER_PHOTO + encodeURIComponent(msid), {
+        responseType: 'blob',
+        observe: 'response',
+      })
+      .pipe(
+        map((resp) => {
+          if (resp.status === 204 || !resp.body || resp.body.size === 0) {
+            return null;
+          }
+          const objectUrl = URL.createObjectURL(resp.body);
+          entry.objectUrl = objectUrl;
+          return this.sanitizer.bypassSecurityTrustUrl(objectUrl);
+        }),
+        catchError((err: HttpErrorResponse) => {
+          if (err.status === 404 || err.status === 204 || err.status === 403) {
+            return of(null);
+          }
+          console.warn('[user-photo] request failed', {
+            msid,
+            status: err.status,
+            message: err.message,
+          });
+          setTimeout(() => this.cache.delete(key), NEGATIVE_CACHE_MS);
+          return of(null);
+        }),
+        shareReplay(1)
+      );
+
+    entry.observable = request$;
+    this.cache.set(key, entry);
+    this.enforceLru();
+    return request$;
+  }
+
+  private enforceLru(): void {
+    // Only evict the cache entry; do NOT revoke objectUrl here because
+    // already-rendered <img> elements still reference it. Revocation only
+    // happens on explicit invalidate() or page unload.
+    while (this.cache.size > MAX_CACHE_SIZE) {
+      const oldestKey = this.cache.keys().next().value;
+      if (!oldestKey) {
+        break;
+      }
+      this.cache.delete(oldestKey);
+    }
+  }
+
+  /**
+   * Drop cached photo for msid and schedule blob URL revocation.
+   * Contract: caller should only invoke this after any in-flight request
+   * for this msid has settled (e.g. after a successful upload response).
+   * Calling during an in-flight request will leak the resulting blob URL
+   * until page unload.
+   */
+  invalidate(msid: string | undefined | null): void {
+    if (!msid) {
+      return;
+    }
+    const key = msid.toLowerCase();
+    const entry = this.cache.get(key);
+    if (!entry) {
+      return;
+    }
+    this.cache.delete(key);
+    const url = entry.objectUrl;
+    if (url) {
+      // Delay revoke so callers swapping <img src> after invalidate()
+      // don't see a broken image during the DOM transition.
+      setTimeout(() => URL.revokeObjectURL(url), REVOKE_DELAY_MS);
+    }
+  }
+
+  private releaseAll(): void {
+    this.cache.forEach((entry) => {
+      if (entry.objectUrl) {
+        URL.revokeObjectURL(entry.objectUrl);
+      }
     });
-  }
-
-  get initials(): string {
-    if (!this.fullName) {
-      return '?';
-    }
-    const parts = this.fullName.trim().split(/\s+/).filter(Boolean);
-    if (parts.length === 0) {
-      return '?';
-    }
-    const first = parts[0][0] ?? '';
-    const last = parts.length > 1 ? parts[parts.length - 1][0] : '';
-    return (first + last).toUpperCase() || '?';
-  }
-
-  onClick(event: Event): void {
-    if (this.clickable) {
-      this.avatarClick.emit(event);
-    }
-  }
-
-  onKeydown(event: KeyboardEvent): void {
-    if (!this.clickable) {
-      return;
-    }
-    if (event.key === 'Enter' || event.key === ' ') {
-      event.preventDefault();
-      this.avatarClick.emit(event);
-    }
-  }
-
-  get bgColor(): string {
-    const seed = this.msid || this.fullName || '';
-    let hash = 0;
-    for (let i = 0; i < seed.length; i++) {
-      hash = (hash << 5) - hash + seed.charCodeAt(i);
-      hash |= 0;
-    }
-    const hue = Math.abs(hash) % 360;
-    return `hsl(${hue}, 45%, 50%)`;
+    this.cache.clear();
   }
 
   ngOnDestroy(): void {
-    this.observer?.disconnect();
-    this.sub?.unsubscribe();
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('beforeunload', this.unloadHandler);
+    }
+    this.releaseAll();
   }
 }
