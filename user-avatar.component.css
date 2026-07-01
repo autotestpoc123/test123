@@ -1,99 +1,52 @@
-.user-avatar {
-  display: inline-block;
-  vertical-align: middle;
-  overflow: hidden;
-  flex-shrink: 0;
-  line-height: 0;
-}
+找到 root cause 了！看 image #20 的 outerHTML 有两处硬伤：
 
-.user-avatar.sm {
-  width: 24px;
-  height: 24px;
-}
+  证据 1：<a> 上缺 org-user-link class
 
-.user-avatar.md {
-  width: 48px;
-  height: 48px;
-}
+  编译出来的 DOM（第 2 行）：
+  <a _ngcontent-ng-c1024168314="" class="user-profile-link" ...>
 
-.user-avatar.lg {
-  width: 96px;
-  height: 96px;
-}
+  当前源码 org-user-item.component.html 第 2 行：
+  <a class="user-profile-link org-user-link" [routerLink]="...">
 
-.user-avatar.xl {
-  width: 126px;
-  height: 126px;
-}
+  org-user-link 从源码里存在，但没编译进 DOM —— 编译的是旧版本模板。
 
-.user-avatar.clickable {
-  cursor: pointer;
-}
+  证据 2：内层 <span class="user-avatar"> 缺 sm class
 
-.user-avatar.clickable:focus-visible {
-  outline: 2px solid #0070c0;
-  outline-offset: 2px;
-}
+  编译出来的 DOM（第 5 行）：
+  <span class="user-avatar circle" ng-reflect-ng-class="circle">
 
-.user-avatar.circle,
-.user-avatar.circle img,
-.user-avatar.circle .avatar-default,
-.user-avatar.circle .avatar-placeholder {
-  border-radius: 50%;
-}
+  当前源码 user-avatar.component.html 第 1 行：
+  <span class="user-avatar" [ngClass]="[size, shape]" ...>
 
-.user-avatar.square,
-.user-avatar.square img,
-.user-avatar.square .avatar-default,
-.user-avatar.square .avatar-placeholder {
-  border-radius: 4px;
-}
+  如果编译对了，[ngClass]="[size, shape]" 里 size='sm'、shape='circle'，ng-reflect-ng-class 应该反射成 sm,circle。实际反射的只是 circle —— 说明编译的是旧版
+  [ngClass]="shape"（那个只绑定 shape 不绑定 size 的老版本）。
 
-.user-avatar img {
-  width: 100%;
-  height: 100%;
-  max-width: 100%;
-  max-height: 100%;
-  object-fit: cover;
-  display: block;
-}
+  同时 <user-avatar size="sm"> 属性有传 sm，ng-reflect-size="sm" 也说明 component 收到了 sm 输入 —— 但内层 template 没把 sm 应用到 class，所以 .user-avatar.sm { width: 24px;
+  height: 24px } 匹配不到任何元素。
 
-.user-avatar.xl img {
-  object-position: center top;
-}
+  为什么变成大黑圆
 
-.avatar-default {
-  width: 100%;
-  height: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background-color: transparent;
-  color: #2b2b2b;
-  line-height: 1;
-}
+  没有 .sm class → CSS 里 width: 24px 不生效 → 内层 span 无尺寸约束 → .user-avatar img { width: 100%; height: 100% } 里的 100% 变成"我妈没定尺寸，我按我 blob 原图渲染" → mock
+  server 返回的假 JPG 原始尺寸就撑满了。
 
-.avatar-default .fa {
-  font-size: 22px;
-  margin: 0;
-  cursor: inherit;
-}
+  同样，.org-user-link 匹配不到 <a>，我加的 flex 规则整个不生效 → avatar 和 name 不在一行。
 
-.user-avatar.md .avatar-default .fa {
-  font-size: 56px;
-}
+  Root cause 结论
 
-.user-avatar.lg .avatar-default .fa {
-  font-size: 112px;
-}
+  Dev server 的 build cache（.angular/）部分失效 —— 外层 div 的 main-user class 是新的（编译进去了），但两个 template 里的关键新增部分（org-user-link class、size ngClass
+  绑定）没被重编译。这是 Angular CLI 已知的 fine-grained 缓存 bug，改多次 template + 快速保存容易触发。
 
-.user-avatar.xl .avatar-default .fa {
-  font-size: 150px;
-}
+  修复步骤（必须完整执行）
 
-.avatar-placeholder {
-  width: 100%;
-  height: 100%;
-  display: block;
-  background-color: #e9ecef;
-}
+  # 1. 在跑 ng serve 的终端里 Ctrl+C，等它完全退出（有时按两次）
+  # 2. 删掉整个 .angular（不只是 cache 子目录）和 dist
+  Remove-Item -Recurse -Force .angular
+  Remove-Item -Recurse -Force dist
+  # 3. 重新启动
+  npm start
+
+  等 "Compiled successfully" 后关掉整个浏览器再重开（比 Ctrl+Shift+R 更彻底），访问 UserC 页面。
+
+  验证方法：在 DevTools Elements 面板重新检查同一个位置，看 <a> 上有没有 org-user-link，内层 <span> 有没有 sm circle 两个 class。如果都有了，问题解决。
+
+  之后我会把之前塞到 src/styles.css 里的兜底规则移回 org-user-item.component.css（归属正确位置）。请先按上面清缓存重启，告诉我 DOM 是否包含了 org-user-link 和 sm 这两个 class。
