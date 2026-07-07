@@ -1,0 +1,58 @@
+[System.IO.File]::ReadAllBytes('原始文件.xls')[0..3] | ForEach-Object { $_.ToString('X2') }
+
+50 4B 03 04（"PK..."，ZIP 魔数）→ 内容就是 xlsx，走下面的自动改名方案，问题解决；
+D0 CF 11 E0（OLE2 头）→ 真 BIFF .xls，改名理论上不该能用——如果运维改名后确实能跑通，说明他们改的和分析读的不是同一个文件，需要先理清流程；这种情况的处理放在最后说。
+
+以运维"改名就能用"的现状判断，几乎可以肯定是第一种。
+自动改名的归一化函数（带魔数守卫）
+在 scheduler 的 Stage 1 preflight 之前插入。核心安全点：只有验明内容确实是 OOXML 才改名，绝不盲改——这样即使某天上游真的换成了 BIFF 导出，系统会明确报错而不是让一个假 xlsx 流进分析：
+powershell<#
+上游把 OOXML 内容导出成 .xls 扩展名。对每个期望的 .xlsx 输入，若同名 .xls
+存在且魔数为 ZIP(PK)，改名为 .xlsx。幂等；真 BIFF 文件报错拒收。
+改名不改变一个字节，归档文件即原始证据，无需另存 raw 副本。
+#>
+function Rename-MislabeledXlsInputs {
+    param(
+        [Parameter(Mandatory)][string]$SourceFolder,
+        [Parameter(Mandatory)][string[]]$ExpectedXlsxNames
+    )
+
+    $renamed = @()
+    foreach ($xlsxName in ($ExpectedXlsxNames | Where-Object { $_ -like '*.xlsx' })) {
+        $xlsxPath = Join-Path $SourceFolder $xlsxName
+        $xlsPath  = Join-Path $SourceFolder ($xlsxName -replace '\.xlsx$', '.xls')
+
+        if (Test-Path -LiteralPath $xlsxPath -PathType Leaf) { continue }   # 已就位，幂等
+        if (-not (Test-Path -LiteralPath $xlsPath -PathType Leaf)) { continue }
+
+        $fs = [System.IO.File]::OpenRead($xlsPath)
+        try {
+            $head = New-Object byte[] 4
+            $null = $fs.Read($head, 0, 4)
+        }
+        finally { $fs.Dispose() }
+
+        if ($head[0] -eq 0x50 -and $head[1] -eq 0x4B) {
+            # 内容是 OOXML，扩展名标错了 —— 纠正即可
+            Rename-Item -LiteralPath $xlsPath -NewName $xlsxName
+            $renamed += $xlsxName
+        }
+        elseif ($head[0] -eq 0xD0 -and $head[1] -eq 0xCF) {
+            throw ("Input '{0}' is a genuine legacy BIFF .xls (not OOXML). " +
+                   "Renaming will NOT make it readable. Ask the upstream to " +
+                   "export .xlsx or .csv.") -f $xlsPath
+        }
+        # 其他魔数（比如 HTML 伪装的表格）不动它，留给 preflight 报 missing
+    }
+    return $renamed
+}
+scheduler 里 Analysis 的 Test-StagePreflight 前一行调用，期望文件名从 preflight 清单取。运维从此连改名都不用做——把上游给的 .xls 原样丢进 source 目录即可。
+三个集成细节都比转换方案更干净：改名不动内容，所以归档的文件在字节上就是上游原件，审计证据链完整（不存在"转换有损"问题，也不需要 raw\ 子目录）；改名对轮询 watcher 是一次目录活动，会引发一次无害的重踢（守卫兜住）；Test-SafeToDeleteSourceFile 的哈希比对不受影响，因为比对发生在改名之后的稳定状态。
+如果魔数验出来真是 BIFF（预案，大概率用不上）
+不许装 LibreOffice 也不许装 Office 时，剩下的路按优先级：
+
+推上游改导出格式为 .xlsx 或 .csv——你们的流水线拿到 Excel 后第一件事就是 Import-Excel | Export-Csv 转成 csv 再分析，上游若能直接给 csv 反而少一道转换，这是最该争取的方向；
+NPOI 类库：纯 .NET DLL，随脚本目录 xcopy 部署，不是"安装软件"（无注册表、无系统改动），能直接读 BIFF 或做 xls→xlsx 转换。是否可行取决于贵司对引入第三方二进制的管控口径，需要先问安全团队；
+都不行 → 退回人工环节，但把动作从"改名"变成"用 Excel 另存为 .xlsx"——注意真 BIFF 场景下改名本来就是无效操作，运维现在的做法能 work 恰恰反证了不是这个场景。
+
+先跑那条魔数检查，结果贴给我；是 PK 的话我就把 Rename-MislabeledXlsInputs 连同 scheduler 插入点打进交付包。Want to be notified when Claude responds?
