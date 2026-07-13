@@ -1,5 +1,0 @@
- $cred = Get-Credential CORP\svc-wecom-prod     # 输入新密码
-  Get-ScheduledTask -TaskName 'WeComAudit-PROD-*' | ForEach-Object {
-      Set-ScheduledTask -TaskName $_.TaskName -TaskPath $_.TaskPath `
-          -User $cred.UserName -Password $cred.GetNetworkCredential().Password
-  }
