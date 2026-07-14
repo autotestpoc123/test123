@@ -13,3 +13,23 @@ function Save-AnalysisSummary {
             ViolationDivisionCount = $ViolationDivisionCount
         }) -Depth 4
 }
+
+驱逐时不立即 revoke，而是排队等 30-60 秒后 revoke。假设任何 <img> 从消费到彻底不用完不会超过这个窗口：
+
+  while (this.cache.size > MAX_CACHE_SIZE) {
+  驱逐时不立即 revoke，而是排队等 30-60 秒后 revoke。假设任何 <img> 从消费到彻底不用完不会超过这个窗口：
+
+  while (this.cache.size > MAX_CACHE_SIZE) {
+
+  驱逐时不立即 revoke，而是排队等 30-60 秒后 revoke。假设任何 <img> 从消费到彻底不用完不会超过这个窗口：
+
+  while (this.cache.size > MAX_CACHE_SIZE) {
+    const oldestKey = this.cache.keys().next().value;
+    if (!oldestKey) break;
+    const evicted = this.cache.get(oldestKey)!;
+    this.cache.delete(oldestKey);
+    if (evicted.objectUrl) {
+      const url = evicted.objectUrl;
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    }
+  }
