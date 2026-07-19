@@ -1,12 +1,12 @@
-# WeCom Audit Pipeline — Workflow
+# ABBCom Audit Pipeline — Workflow
 
-This document describes the end-to-end runtime workflow of the biweekly WeCom
+This document describes the end-to-end runtime workflow of the biweekly ABBCom
 (WeChat Work) audit-log automation. For architecture/coding guidance see
-[`CLAUDE.md`](./CLAUDE.md).
+
 
 ## Overview
 
-The system runs, unattended, a **biweekly audit** of WeCom device-login and
+The system runs, unattended, a **biweekly audit** of ABBCom device-login and
 mail-leakage logs per business unit (BU). Each cycle it:
 
 1. Waits for source log files to arrive in a watched folder.
@@ -22,28 +22,28 @@ idempotent no-ops.
 
 | Component | Role |
 |-----------|------|
-| `Watch-WeComAuditSource.ps1` | Polls source folder; kicks the state machine when files settle. |
-| `Invoke-WeComAuditScheduler.ps1` | **The single production entry point.** Zero-parameter state machine. |
+| `Watch-ABBComAuditSource.ps1` | Polls source folder; kicks the state machine when files settle. |
+| `Invoke-ABBComAuditScheduler.ps1` | **The single production entry point.** Zero-parameter state machine. |
 | `Invoke-AuditLog.ps1` | Analysis stage — per-BU analysis + BU emails. |
 | `Invoke-AuditValidate.ps1` | Validate + archive stage. |
-| `wecom_analysis_comm.psm1` | Shared module (facade over `modules/internal/*.ps1`). |
+| `ABBCom_analysis_comm.psm1` | Shared module (facade over `modules/internal/*.ps1`). |
 | `analysis_task_config.psd1` | Per-machine config (dates, env, paths, tasks, rules). |
 | `run-now.cmd` | Manual kick of the state machine. |
 
 ## Scheduled tasks (the triggers)
 
-Registered **only** via `Register-WeComAuditTasks.ps1` (run as admin). Never
+Registered **only** via `Register-ABBComAuditTasks.ps1` (run as admin). Never
 hand-build them in Task Scheduler — the biweekly phase would be wrong.
 
 | Task | Trigger | Action |
 |------|---------|--------|
-| `WeComAudit-AutoCycle` | On-demand (no time trigger) | Runs the state machine. Kicked by watcher / final check / `run-now.cmd`. |
-| `WeComAudit-SourceWatcher` | Every 2nd Thursday **10:00**, exits 18:00 | Polls source folder; kicks AutoCycle when files are present & byte-stable. |
-| `WeComAudit-FinalCheck` | Every 2nd Thursday **18:00** | Runs the state machine with `-Escalate` (finish last-minute work, else send the single deadline-escalation email). |
+| `ABBComAudit-AutoCycle` | On-demand (no time trigger) | Runs the state machine. Kicked by watcher / final check / `run-now.cmd`. |
+| `ABBComAudit-SourceWatcher` | Every 2nd Thursday **10:00**, exits 18:00 | Polls source folder; kicks AutoCycle when files are present & byte-stable. |
+| `ABBComAudit-FinalCheck` | Every 2nd Thursday **18:00** | Runs the state machine with `-Escalate` (finish last-minute work, else send the single deadline-escalation email). |
 
 ## The state machine
 
-`Invoke-WeComAuditScheduler.ps1` takes **no** date/phase/environment
+`Invoke-ABBComAuditScheduler.ps1` takes **no** date/phase/environment
 parameters. Every invocation evaluates on-disk state for the current cycle:
 
 ```
@@ -59,7 +59,7 @@ Both done                       -> no-op, exit 0
   machine) — no `-env` flag, so QA config can't run on a PROD box by typo.
 - **Idempotency / send-once** is enforced by cycle guards
   (`Test-AnalysisCycleAlreadyComplete`, `Test-ValidateCycleAlreadyComplete`),
-  a machine-wide **mutex** (`Global\WeComAudit`), and a **mail ledger**
+  a machine-wide **mutex** (`Global\ABBComAudit`), and a **mail ledger**
   (SHA256 of email Subject+Body) that rejects re-sends.
 
 **Exit codes:** `0` = work done or nothing to do; `3` = preflight not ready
@@ -72,8 +72,8 @@ Both done                       -> no-op, exit 0
                             │
                             ▼
               ┌──────────────────────────────┐
-              │  WeComAudit-SourceWatcher     │
-              │  Watch-WeComAuditSource.ps1   │
+              │  ABBComAudit-SourceWatcher     │
+              │  Watch-ABBComAuditSource.ps1   │
               │  polls source folder snapshot │
               └──────────────┬────────────────┘
         fast path │  slow path │  retry channel
@@ -82,8 +82,8 @@ Both done                       -> no-op, exit 0
                   │  activity) │
                   ▼            ▼            ▼
               ┌──────────────────────────────┐
-              │  WeComAudit-AutoCycle         │
-              │  Invoke-WeComAuditScheduler   │◄──── run-now.cmd (manual)
+              │  ABBComAudit-AutoCycle         │
+              │  Invoke-ABBComAuditScheduler   │◄──── run-now.cmd (manual)
               │  (zero-param state machine)   │◄──── FinalCheck 18:00 (-Escalate)
               └──────────────┬────────────────┘
                              │ evaluates on-disk state
@@ -106,7 +106,7 @@ Both done                       -> no-op, exit 0
 
 ## Stage detail
 
-### 1. Watcher — `Watch-WeComAuditSource.ps1`
+### 1. Watcher — `Watch-ABBComAuditSource.ps1`
 
 Polls a **directory snapshot** (NAS-safe; deliberately not
 `FileSystemWatcher`). Three trigger channels:
@@ -128,12 +128,12 @@ Iterates `config.Tasks`, each with a `Type` (`mail` or `device`) and a `BU`:
 
 - **Device tasks** convert `.xlsx` input to CSV via the vendored
   `modules\ImportExcel`.
-- Both types hand off to workers `wecom_mail_analysis.ps1` /
-  `wecom_devicelog_analysis.ps1`, which do LDAP lookups, build the
+- Both types hand off to workers `ABBCom_mail_analysis.ps1` /
+  `ABBCom_devicelog_analysis.ps1`, which do LDAP lookups, build the
   **deterministic** BU email, and send it through the ledger
   (`Send-AuditBuMail`).
 
-Output: `<LogRoot>\<wecom_audit_log>\runs\<RunId>\` with `run-summary.json`,
+Output: `<LogRoot>\<ABBCom_audit_log>\runs\<RunId>\` with `run-summary.json`,
 per-task `tasks/<name>/summary.json`, and `latest-run.json`.
 `ExecutionMode` is `FailFast` or `ContinueOnError`.
 
@@ -166,30 +166,24 @@ per-task `tasks/<name>/summary.json`, and `latest-run.json`.
 
 ```powershell
 # Load the shared module
-Import-Module .\wecom_analysis_comm.psm1 -Force
+Import-Module .\ABBCom_analysis_comm.psm1 -Force
 
 # Production entry point (state machine)
-.\Invoke-WeComAuditScheduler.ps1
-.\Invoke-WeComAuditScheduler.ps1 -Escalate     # 18:00 FinalCheck mode
+.\Invoke-ABBComAuditScheduler.ps1
+.\Invoke-ABBComAuditScheduler.ps1 -Escalate     # 18:00 FinalCheck mode
 
 # Register the three scheduled tasks (admin)
-.\Register-WeComAuditTasks.ps1 -ServiceAccount 'DOMAIN\svc-account'
+.\Register-ABBComAuditTasks.ps1 -ServiceAccount 'DOMAIN\svc-account'
 
 # Run sub-stages directly (scheduler normally drives these)
 .\Invoke-AuditLog.ps1 -startDate 20260402 -endDate 20260415 -env QA
 .\Invoke-AuditValidate.ps1 -RunId <yyyyMMdd_HHmmss> -CurrentRunWeeks 2
 
 # Watcher (normally launched by the SourceWatcher task)
-.\Watch-WeComAuditSource.ps1
+.\Watch-ABBComAuditSource.ps1
 
 # Verifiers (exit 0 = pass)
 powershell -NoProfile -File tools\Test-WatcherFastPath.ps1
 powershell -NoProfile -File tools\Verify-ContentHashStability.ps1
 ```
 
-## Reference docs
-
-- [`CLAUDE.md`](./CLAUDE.md) — architecture & coding conventions.
-- [`QA_DEPLOYMENT_AND_TEST_GUIDE.md`](./QA_DEPLOYMENT_AND_TEST_GUIDE.md) — QA deploy/validation steps.
-- [`OFFDAY_QA_TEST_GUIDE.md`](./OFFDAY_QA_TEST_GUIDE.md) — testing on non-cycle days.
-- [`OFFDAY_WATCHER_QA_RUNBOOK.md`](./OFFDAY_WATCHER_QA_RUNBOOK.md) — watcher QA runbook.
