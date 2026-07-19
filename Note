@@ -1,0 +1,26 @@
+
+  现状
+
+  navigation-bar.component.html:92-95 的右上角个人区块里已经嵌入了头像组件：
+
+  <user-avatar [msid]="meta.loginUser?.UserAccount?.MSID"
+               [fullName]="meta.loginUser?.UserAccount?.FullName"
+               size="sm" style="margin-right:4px;"></user-avatar>
+  <a routerLink="user">{{this.meta.loginUser?.UserAccount?.FullName || ''}}</a>
+
+  数据链路是通的：
+
+  1. NavigationBarComponent.ngOnInit()（navigation-bar.component.ts:46-54）在 OIDC 认证完成后，用 token 里的邮箱调 getLoginUserInfo()，把结果写入共享的 profile
+  单例（meta.loginUser）。
+  2. 返回的 UserFull.UserAccount 上有 MSID 和 FullName 字段（user.ts:7,11），正好是 user-avatar 需要的两个输入。
+  3. UserAvatarComponent 拿到 msid 后通过 UserPhotoService.getPhoto() 请求 /photos/ 接口（带 LRU 缓存和懒加载）；拿不到照片时自动降级为"姓名首字母 + 根据 msid
+  哈希出的背景色"的圆形占位头像。照片接口的 Bearer token 由 OidcAuthorizationInterceptor 自动附加，所以登录后请求头像没有权限问题。
+
+  需要注意的两点
+
+  - 登录完成前头像不会显示。meta.loginUser 是异步填充的，认证完成前 msid 为 undefined，此时组件只渲染占位（fullName 也为空时是空白圆圈）。这是预期行为，登录完成后会自动出现。
+  - 如果你指的是登录前的 /auth 页面（真正的"login 界面"），那在右上角显示头像不可行：用户尚未认证，前端既不知道用户是谁（拿不到 msid），也没有 access token
+  去调照片接口。头像只能在认证完成之后显示。
+
+  如果你在本地跑起来没看到头像，可能的原因是：用 mock 后端时，msid 首字母在 n–z 范围会故意返回 204（走首字母降级显示），这是 mock 的既定行为，不是
+  bug。如果你实际看到的效果和预期不符（比如只显示首字母、或者完全空白），告诉我具体现象，我可以进一步排查。
