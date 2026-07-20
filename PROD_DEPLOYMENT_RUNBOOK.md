@@ -1,4 +1,4 @@
-# ABBCom Audit Log Pipeline — PROD Deployment Runbook
+# WeCom Audit Log Pipeline — PROD Deployment Runbook
 
 **Applies to:** current zero-parameter scheduler/state-machine implementation  
 **Environment:** PROD  
@@ -9,7 +9,7 @@
 
 ## 1. Scope and production workflow
 
-The production entry point is `Invoke-ABBComAuditScheduler.ps1`. It does not accept
+The production entry point is `Invoke-WeComAuditScheduler.ps1`. It does not accept
 date, phase, or environment parameters. Dates are derived from `ScheduleAnchor`,
 the environment comes from the configuration file, and the next action is derived
 from persisted run state:
@@ -23,16 +23,16 @@ Cycle complete                      -> no-op, exit 0
 Do not call the scheduler with legacy parameters such as `-env` or `-Phase`.
 
 Production uses three scheduled tasks, registered only by
-`Register-ABBComAuditTasks.ps1`:
+`Register-WeComAuditTasks.ps1`:
 
 | Task | Trigger | Action |
 |---|---|---|
-| `ABBComAudit-AutoCycle` | On demand only | Runs the state machine |
-| `ABBComAudit-SourceWatcher` | Every second Thursday at 10:00 | Watches source activity and starts AutoCycle after files stabilize; exits at 18:00 |
-| `ABBComAudit-FinalCheck` | Every second Thursday at 18:00 | Runs the same state machine with `-Escalate` |
+| `WeComAudit-AutoCycle` | On demand only | Runs the state machine |
+| `WeComAudit-SourceWatcher` | Every second Thursday at 10:00 | Watches source activity and starts AutoCycle after files stabilize; exits at 18:00 |
+| `WeComAudit-FinalCheck` | Every second Thursday at 18:00 | Runs the same state machine with `-Escalate` |
 
 `run-now.cmd` is an optional operator recovery button. It starts
-`ABBComAudit-AutoCycle`; it is not a routine deployment or cycle step.
+`WeComAudit-AutoCycle`; it is not a routine deployment or cycle step.
 
 ---
 
@@ -59,18 +59,18 @@ Deployment is **NO-GO** if any of the following is unresolved:
 ## 3. Deployment package
 
 Preserve the following layout under one release directory, for example
-`D:\Apps\ABBCom_audit\current`:
+`D:\Apps\wecom_audit\current`:
 
 ```text
-Invoke-ABBComAuditScheduler.ps1
+Invoke-WeComAuditScheduler.ps1
 Invoke-AuditLog.ps1
 Invoke-AuditValidate.ps1
-Watch-ABBComAuditSource.ps1
-Register-ABBComAuditTasks.ps1
+Watch-WeComAuditSource.ps1
+Register-WeComAuditTasks.ps1
 run-now.cmd
-ABBCom_mail_analysis.ps1
-ABBCom_devicelog_analysis.ps1
-ABBCom_analysis_comm.psm1
+wecom_mail_analysis.ps1
+wecom_devicelog_analysis.ps1
+wecom_analysis_comm.psm1
 analysis_task.config.psd1
 modules\
   ImportExcel\
@@ -98,10 +98,10 @@ analysis_task.config.psd1
 The repository source may be named `analysis_task_config.psd1`. Copy it into the
 release directory using the default dotted name.
 
-Although `Register-ABBComAuditTasks.ps1` accepts `-ConfigPath`, the current task
+Although `Register-WeComAuditTasks.ps1` accepts `-ConfigPath`, the current task
 actions do not carry that argument forward. Therefore, do not rely only on a
 non-default path passed during registration. For this release, use the default
-dotted filename beside the scripts. A machine-level `ABBCom_AUDIT_CONFIG_PATH`
+dotted filename beside the scripts. A machine-level `WECOM_AUDIT_CONFIG_PATH`
 may be used only if it is deliberately managed and verified under the scheduled-
 task service account.
 
@@ -111,15 +111,15 @@ Run from the staged release directory:
 
 ```powershell
 $required = @(
-    'Invoke-ABBComAuditScheduler.ps1',
+    'Invoke-WeComAuditScheduler.ps1',
     'Invoke-AuditLog.ps1',
     'Invoke-AuditValidate.ps1',
-    'Watch-ABBComAuditSource.ps1',
-    'Register-ABBComAuditTasks.ps1',
+    'Watch-WeComAuditSource.ps1',
+    'Register-WeComAuditTasks.ps1',
     'run-now.cmd',
-    'ABBCom_mail_analysis.ps1',
-    'ABBCom_devicelog_analysis.ps1',
-    'ABBCom_analysis_comm.psm1',
+    'wecom_mail_analysis.ps1',
+    'wecom_devicelog_analysis.ps1',
+    'wecom_analysis_comm.psm1',
     'analysis_task.config.psd1',
     'modules\ImportExcel',
     'modules\internal\Core.ps1',
@@ -161,7 +161,7 @@ Verify the actual configured certificate names, for example:
 ```powershell
 Get-ChildItem Cert:\LocalMachine\My |
     Where-Object {
-        $_.Subject -match 'ABBCom-audit-prod-cert|cod_ABBCom_ntfy_prod'
+        $_.Subject -match 'wecom-audit-prod-cert|cod_wecom_ntfy_prod'
     } |
     Select-Object Subject, Thumbprint, NotBefore, NotAfter, HasPrivateKey
 ```
@@ -223,10 +223,9 @@ record.
       PROD values.
 - [ ] `Notification.PROD.OpsTeam` contains only approved PROD operations
       recipients.
-- [ ] `Notification.PROD.CcRecipients` contains only approved recipients.
 - [ ] Top-level `EscalationCc` contains the approved escalation recipients.
-- [ ] Hard-coded PROD recipient mappings in `ABBCom_mail_analysis.ps1` and
-      `ABBCom_devicelog_analysis.ps1` have been peer-reviewed.
+- [ ] Hard-coded PROD recipient mappings in `wecom_mail_analysis.ps1` and
+      `wecom_devicelog_analysis.ps1` have been peer-reviewed.
 - [ ] No QA/test/placeholder address remains in any effective PROD recipient list.
 
 ### 5.2 Schedule checks
@@ -241,7 +240,7 @@ record.
 Preview the effective cycle without starting the scheduler:
 
 ```powershell
-Import-Module .\ABBCom_analysis_comm.psm1 -Force
+Import-Module .\wecom_analysis_comm.psm1 -Force
 $config = Import-PowerShellDataFile .\analysis_task.config.psd1
 $cycle = Resolve-ScheduleCycle -Config $config
 $cycle | Format-List Anchor, CycleIndex, StartDate, EndDate, CurrentRunWeeks, OffsetDays, Warnings
@@ -307,11 +306,11 @@ Check for stale machine-level overrides:
 
 ```powershell
 $names = @(
-    'ABBCom_AUDIT_CONFIG_PATH',
-    'ABBCom_AUDIT_LOG_ROOT',
-    'ABBCom_AUDIT_INPUT_ROOT',
-    'ABBCom_AUDIT_SOURCE_FOLDER',
-    'ABBCom_AUDIT_BACKUP_ROOT'
+    'WECOM_AUDIT_CONFIG_PATH',
+    'WECOM_AUDIT_LOG_ROOT',
+    'WECOM_AUDIT_INPUT_ROOT',
+    'WECOM_AUDIT_SOURCE_FOLDER',
+    'WECOM_AUDIT_BACKUP_ROOT'
 )
 
 $names | ForEach-Object {
@@ -334,7 +333,7 @@ process.
 
 Before changing files:
 
-- disable the three existing ABBCom Audit scheduled tasks;
+- disable the three existing WeCom Audit scheduled tasks;
 - confirm no scheduler or watcher process is running;
 - export the existing scheduled tasks to XML;
 - copy the existing release directory to a versioned rollback directory;
@@ -348,7 +347,7 @@ Copy the new release into a versioned directory, preserving module subfolders.
 If Windows marked the files as downloaded:
 
 ```powershell
-Get-ChildItem -LiteralPath 'D:\Apps\ABBCom_audit\<release>' -Recurse -File |
+Get-ChildItem -LiteralPath 'D:\Apps\wecom_audit\<release>' -Recurse -File |
     Unblock-File
 ```
 
@@ -388,11 +387,11 @@ if ([string]$config.Environment -ne 'PROD') {
     throw "Deployment config is not PROD."
 }
 
-Import-Module .\ABBCom_analysis_comm.psm1 -Force -ErrorAction Stop
+Import-Module .\wecom_analysis_comm.psm1 -Force -ErrorAction Stop
 Import-Module .\modules\ImportExcel -Force -ErrorAction Stop
 ```
 
-If the module was produced by `Split-ABBComModule.ps1`, retain the associated
+If the module was produced by `Split-WeComModule.ps1`, retain the associated
 `Verify-ModuleSplit.ps1` result from the build/change process. Do not invent an
 `-OriginalPath` comparison during deployment unless the approved pre-split module
 is available.
@@ -422,8 +421,8 @@ Before PROD activation, confirm the isolated QA/off-day evidence covers:
 4. Register all three tasks:
 
 ```powershell
-.\Register-ABBComAuditTasks.ps1 `
-    -ServiceAccount 'DOMAIN\svc-ABBCom-audit-prod' `
+.\Register-WeComAuditTasks.ps1 `
+    -ServiceAccount 'DOMAIN\svc-wecom-audit-prod' `
     -ConfigPath .\analysis_task.config.psd1
 ```
 
@@ -434,9 +433,9 @@ already been preserved.
 
 ```powershell
 $taskNames = @(
-    'ABBComAudit-AutoCycle',
-    'ABBComAudit-SourceWatcher',
-    'ABBComAudit-FinalCheck'
+    'WeComAudit-AutoCycle',
+    'WeComAudit-SourceWatcher',
+    'WeComAudit-FinalCheck'
 )
 
 Get-ScheduledTask -TaskName $taskNames |
@@ -466,8 +465,8 @@ Confirm:
 
 ## 8. Production smoke test
 
-There is no dry-run mode. Starting `Invoke-ABBComAuditScheduler.ps1` or
-`ABBComAudit-AutoCycle` can perform real Analysis, send BU email, write the mail
+There is no dry-run mode. Starting `Invoke-WeComAuditScheduler.ps1` or
+`WeComAudit-AutoCycle` can perform real Analysis, send BU email, write the mail
 ledger, validate/archive files, and—if enabled—delete source files.
 
 Perform a production smoke test only in the approved change window after:
@@ -484,9 +483,9 @@ Perform a production smoke test only in the approved change window after:
 Preferred task-identity test:
 
 ```powershell
-Start-ScheduledTask -TaskName 'ABBComAudit-AutoCycle'
+Start-ScheduledTask -TaskName 'WeComAudit-AutoCycle'
 Start-Sleep -Seconds 5
-Get-ScheduledTaskInfo -TaskName 'ABBComAudit-AutoCycle' |
+Get-ScheduledTaskInfo -TaskName 'WeComAudit-AutoCycle' |
     Format-List LastRunTime, LastTaskResult, NextRunTime
 ```
 
@@ -500,7 +499,7 @@ Expected common results:
 | Exit/task result `0` | Work completed successfully or the cycle was already complete |
 | Exit/task result `3` | Required preflight files were missing/invalid; ops notification is throttled |
 | Exit/task result `1` or other nonzero | Real failure; inspect workflow/task logs |
-| Warning that mutex `Global\ABBComAudit` is held | Another state-machine invocation is running; do not start another |
+| Warning that mutex `Global\WeComAudit` is held | Another state-machine invocation is running; do not start another |
 
 The current scheduler does not use exit code 2 for an already-complete cycle; it
 returns 0.
@@ -514,7 +513,7 @@ has completed.
 
 ### 9.1 Watcher
 
-- [ ] `ABBComAudit-SourceWatcher` starts at 10:00 under the service account.
+- [ ] `WeComAudit-SourceWatcher` starts at 10:00 under the service account.
 - [ ] `<resolved output root>\watcher\watcher-<yyyyMMdd>.log` is created.
 - [ ] File activity and stabilization are logged.
 - [ ] AutoCycle is kicked only after the expected Analysis set is stable, or after
@@ -525,7 +524,7 @@ has completed.
 
 - [ ] The scheduler banner reports `Environment: PROD` and the intended cycle.
 - [ ] A timestamped run folder is created under
-      `<LogRoot>\ABBCom_audit_log\runs`.
+      `<LogRoot>\wecom_audit_log\runs`.
 - [ ] `run-summary.json` shows every enabled task successful.
 - [ ] BU email recipients match the approved lists.
 - [ ] `sent-emails.json` and `ledger\mail-ledger.jsonl` contain the expected audit
@@ -546,7 +545,7 @@ has completed.
 
 ### 9.4 FinalCheck and escalation
 
-- [ ] `ABBComAudit-FinalCheck` starts at 18:00 with `-Escalate`.
+- [ ] `WeComAudit-FinalCheck` starts at 18:00 with `-Escalate`.
 - [ ] If the cycle completed, no deadline escalation is sent.
 - [ ] If the cycle is genuinely incomplete on its end date, exactly one approved
       deadline-escalation path is exercised.
@@ -562,7 +561,7 @@ failure:
 1. Diagnose and fix the named dependency, missing file, permission, or network
    problem.
 2. Confirm no AutoCycle instance is still running.
-3. Start `run-now.cmd` or the `ABBComAudit-AutoCycle` task.
+3. Start `run-now.cmd` or the `WeComAudit-AutoCycle` task.
 4. Inspect logs and artifacts; do not treat the command's “triggered” message as
    proof of completion.
 
@@ -584,9 +583,9 @@ authorize rerunning or resending a completed Analysis cycle.
 1. Disable these three tasks:
 
    ```text
-   ABBComAudit-AutoCycle
-   ABBComAudit-SourceWatcher
-   ABBComAudit-FinalCheck
+   WeComAudit-AutoCycle
+   WeComAudit-SourceWatcher
+   WeComAudit-FinalCheck
    ```
 
 2. Confirm that no scheduler or watcher PowerShell process from the release is
@@ -596,7 +595,7 @@ authorize rerunning or resending a completed Analysis cycle.
 4. Restore the previous approved release directory and configuration.
 5. Confirm the previous release can read the existing run-state and ledger schema.
 6. Re-register the three tasks from the restored release using
-   `Register-ABBComAuditTasks.ps1`.
+   `Register-WeComAuditTasks.ps1`.
 7. Recheck each action, working directory, service account, trigger, and
    StartBoundary.
 8. Review current-cycle guards and artifacts before manually starting AutoCycle.
