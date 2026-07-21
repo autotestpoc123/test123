@@ -1,250 +1,41 @@
-当前设计允许非周四手工测试，不需要修改代码：
-Invoke-WeComAuditScheduler.ps1：非周四可以运行，只会显示 warning，并使用最近一个周期周四。
-Invoke-AuditLog.ps1：可以直接指定任意合法的 StartDate/EndDate。
-Watch-WeComAuditSource.ps1：有严格的周四门禁，非周四会直接退出，因此测试时不要启动 Watcher。
-run-now.cmd：任何日期都能触发 AutoCycle，但它使用 Scheduled Task 中配置的默认 config，不适合隔离 QA 测试。
-以当前日期 2026-07-14 和当前 ScheduleAnchor=20260402 计算：
-StartDate:       20260625
-EndDate:         20260709
-CurrentRunWeeks: 4
-OffsetDays:      5
-也就是说，今天运行 Scheduler 会测试截至 20260709 的四周周期。
-推荐：隔离的完整 Scheduler 测试
-1. 打开测试 PowerShell
-在 QA Server 上进入部署目录：
-cd C:\addin_deploy_cert\wecom_audit_log\V3
-powershell.exe -NoProfile -ExecutionPolicy Bypass
-不要在 PROD server 上执行以下步骤。
-2. 创建独立 QA 配置
-Copy-Item `
-    .\analysis_task_config.psd1 `
-    .\analysis_task_config.offday-qa.psd1
-编辑 analysis_task_config.offday-qa.psd1，至少隔离这些路径：
-Environment  = 'QA'
-InputRoot    = 'C:\wecom_audit_offday_test'
-SourceFolder = 'C:\wecom_audit_offday_test\source'
-LogRoot      = 'C:\wecom_audit_offday_test\state'
-BackupRoot   = 'C:\wecom_audit_offday_test\backup'
+  第一层：注册动作本身是否成功（几分钟内可验证）
 
-SourceCleanup = @{
-    Enabled      = $false
-    AllowedRoots = @('C:\wecom_audit_offday_test\source')
-}
-保持：
-ScheduleAnchor = '20260402'
-不要把 ScheduleAnchor 改成当天日期，因为 Anchor 必须是周四。
-创建目录：
-$testRoot = 'C:\wecom_audit_offday_test'
+  Get-ScheduledTask -TaskName WeComAudit-AutoCycle, WeComAudit-SourceWatcher, WeComAudit-FinalCheck |
+      Select-Object TaskName, State, @{n='User';e={$_.Principal.UserId}},
+          @{n='Args';e={$_.Actions.Arguments}}
+  确认：三个任务都存在且 Enabled/Ready；User 是预期的 PROD 服务账号；AutoCycle 没有触发器；SourceWatcher/FinalCheck 的 StartBoundary 落在正确的 cycle 周四；FinalCheck 的参数带
+  -Escalate。这只能证明"任务被创建对了"，不能证明"服务能跑通"。
 
-New-Item -ItemType Directory -Force -Path `
-    "$testRoot\source", `
-    "$testRoot\incoming", `
-    "$testRoot\state", `
-    "$testRoot\backup"
-使用独立 LogRoot 很重要，否则测试会读到正式的：
-latest-run.json
-mail-ledger.jsonl
-已完成周期状态
-notification throttle 状态
-3. 确认所有 QA 邮件收件人
-Scheduler 的 Ops 通知收件人在 config 中，但 BU 邮件收件人目前硬编码在：
-wecom_mail_analysis.ps1 的 QA 分支
-wecom_devicelog_analysis.ps1 的 QA 分支
-测试前确认所有地址都是测试邮箱：
-Select-String `
-    -Path .\wecom_mail_analysis.ps1,.\wecom_devicelog_analysis.ps1 `
-    -Pattern '@'
-当前项目没有真正的 DryRun 邮件模式。执行完整 Analysis 会发送 QA 邮件，因此不能只依赖：
-Environment = 'QA'
-还必须人工确认 QA 分支内没有真实 BU 收件人。
-4. 预览 Scheduler 将选择的周期
-Import-Module .\wecom_analysis_comm.psm1 -Force
+  第二层：交给 SRE 无人值守前必须做的检查
 
-$config = Import-PowerShellDataFile `
-    .\analysis_task_config.offday-qa.psd1
+  A. 先堵住已知会炸的坑（现在就该做，不是可选项）
 
-$cycle = Resolve-ScheduleCycle -Config $config
+  1. LDAP 函数：Get-Command New-LdapOrFilter,Split-LdapBatches,Resolve-LdapSearchBase,Get-LdapUserByMail,Get-LdapUserById 五个必须全部能解析到——目前解析不到，这是硬阻断。
+  2. 配置文件名：Runbook 3.1 节要求把仓库里的 analysis_task_config.psd1 复制成 analysis_task.config.psd1（点号）放在发布目录，因为 Register-WeComAuditTasks.ps1 注册的任务动作不会把 -ConfigPath
+  传下去，跑的是默认解析规则。
+  3. ImportExcel 模块：modules\ImportExcel 是否随包部署、能否 Import-Excel（device 任务硬依赖）。
 
-$cycle | Format-List `
-    Anchor,CycleIndex,StartDate,EndDate,CurrentRunWeeks,OffsetDays
-今天预期看到：
-StartDate       : 20260625
-EndDate         : 20260709
-CurrentRunWeeks : 4
-OffsetDays      : 5
-OffsetDays=5 是预期结果，不是错误。
-5. 查看 Analysis 阶段需要哪些文件
-$tokens = New-AuditTokenMap `
-    -Config $config `
-    -StartDate $cycle.StartDate `
-    -EndDate $cycle.EndDate
+  B. 身份/权限——必须用服务账号身份测，不能用管理员交互式会话测
 
-$preflight = Test-PreflightReady `
-    -Config $config `
-    -DateTokens $tokens `
-    -Phase Analysis `
-    -CurrentRunWeeks $cycle.CurrentRunWeeks `
-    -SourceFolder $tokens.SourceFolder
+  - 证书私钥可读：Get-ChildItem Cert:\LocalMachine\My | Where Subject -match '<prod cert>'，HasPrivateKey=True 且服务账号能读私钥。
+  - SourceFolder/InputRoot 读、LogRoot/BackupRoot 读写创建、SMTP(2587)/Vault(443)/LDAP 连通性——用 Test-NetConnection 和实际用服务账号跑一次任务来验证，不要只用管理员账号测。
 
-$preflight.MissingItems |
-    Select-Object Name,ExpectedPath,Source |
-    Format-Table -AutoSize
-按照 ExpectedPath 准备真实测试文件。不要自行猜测文件名，因为四周周期和两周周期的文件集合不同。
-当前配置通常会涉及：
-C:\wecom_audit_offday_test\source\
-C:\wecom_audit_offday_test\incoming\
-再次检查：
-$preflight = Test-PreflightReady `
-    -Config $config `
-    -DateTokens $tokens `
-    -Phase Analysis `
-    -CurrentRunWeeks $cycle.CurrentRunWeeks `
-    -SourceFolder $tokens.SourceFolder
+  C. 一次真实的 AutoCycle 冒烟测试之后要看什么，而不是只看"任务启动了"
 
-$preflight | Format-List AllReady
-$preflight.MissingItems
-$preflight.InvalidItems
-必须得到：
-AllReady : True
-6. 在非周四运行完整 Scheduler
-使用子 PowerShell，这样能够正确取得退出码：
-powershell.exe `
-    -NoProfile `
-    -ExecutionPolicy Bypass `
-    -File .\Invoke-WeComAuditScheduler.ps1 `
-    -ConfigPath .\analysis_task_config.offday-qa.psd1
+  Start-ScheduledTask -TaskName WeComAudit-AutoCycle
+  Get-ScheduledTaskInfo -TaskName WeComAudit-AutoCycle | Format-List LastTaskResult
+  - LastTaskResult 是 0（成功/无事可做）还是 3（预检文件缺失，已限流通知）还是别的非零值（真失败）。
+  - 打开 <LogRoot>\wecom_audit_log\runs\<RunId>\run-summary.json，确认每个 enabled task 都 Success,不是"进程退出码是 0 就完事"。
+  - 检查 ledger\mail-ledger.jsonl 和 sent-emails.json，确认邮件确实发到了预期收件人（不是发了但收件人配置成 QA 地址)。
+  - Validate 阶段看 validation\backup-validation-summary.json，backup 是否哈希校验通过；如果开了 SourceCleanup，确认删除的文件数和 SkippedCount 是否为 0，且删除范围没有超出 AllowedRoots。
+  - 重复触发一次 AutoCycle，确认是幂等 no-op、不会重复发送同一封邮件（验证 mail ledger 去重生效）。
 
-$LASTEXITCODE
-正常情况下可能得到：
-0
-或者：
-3
-如果 Analysis 成功，但 .msg 和四周归档文件还没准备好，退出码 3 是预期行为：
-Analysis 成功
-→ BU QA 邮件发送
-→ summary 写入
-→ Validate preflight 发现 .msg/archive 文件尚未准备
-→ 退出 3，等待补文件
-非周四不会发送 18:00 manager escalation，因为代码要求：
-today == cycle.EndDate
-7. 检查 Analysis 结果
-$resolvedOutputRoot = Resolve-AuditOutputRoot `
-    -Config $config `
-    -ConfigPath .\analysis_task_config.offday-qa.psd1
+  D. 移交 SRE 前的"能不能无人值守"验证
 
-$runsRoot = Join-Path $resolvedOutputRoot 'runs'
+  - 完整跑一个真实 cycle：Watcher 10:00 启动 → 文件到齐后 fast path 触发 AutoCycle → Analysis 成功 → Validate/归档成功 → 18:00 FinalCheck
+  不重复发邮件（因为已完成）。这一整链路都要在非交互、纯靠计划任务触发的情况下跑通一次，而不是靠人手动 Start-ScheduledTask。
+  - 故意制造一次"文件没按时到"，确认 18:00 FinalCheck 只发一次升级邮件、不会重复报警。
+  - 确认 ops 通知（Send-PreflightNotification/Send-ValidationFailureNotification）真的能送达 SRE 值班渠道，而不是发到测试邮箱。
 
-$latest = Get-Content `
-    (Join-Path $runsRoot 'latest-run.json') `
-    -Raw |
-    ConvertFrom-Json
-
-$latest | Format-List
-检查本次 run：
-Get-Content $latest.RunSummaryPath -Raw |
-    ConvertFrom-Json |
-    ConvertTo-Json -Depth 8
-必须确认：
-RunStatus = Success
-StartDate = 20260625
-EndDate   = 20260709
-Environment = QA
-8. 计算 Validate 阶段的准确文件清单
-不要手工推算违规 BU 对应多少个 .msg，直接读取本次 summary：
-$bvc = Get-BackupValidationConfig -Config $config
-
-$requirements = Resolve-DynamicSummaryTaskRequirements `
-    -Config $config `
-    -BackupValidationConfig $bvc `
-    -CurrentRunWeeks $cycle.CurrentRunWeeks
-
-$summaries = Get-TaskSummariesByRunId `
-    -RunsRoot $runsRoot `
-    -RunId $latest.RunId `
-    -RequiredTaskNames $requirements.RequiredTaskNames `
-    -Strict
-
-$expected = Get-ExpectedBackupFiles `
-    -CurrentRunWeeks $cycle.CurrentRunWeeks `
-    -DateTokens $tokens `
-    -BackupValidationConfig $bvc `
-    -TaskSummaries $summaries
-
-$expected |
-    Select-Object Name,Source,ProducedBy |
-    Format-Table -AutoSize
-按照输出名称，把以下文件放入测试 SourceFolder：
-保存的 BU 邮件 .msg
-四周周期的 conduct admin log
-mini-app evidence
-其他 FourWeekFixedFiles
-无违规时，每条 Dynamic rule 仍然需要默认的一份 .msg。
-9. 再次运行 Scheduler
-powershell.exe `
-    -NoProfile `
-    -ExecutionPolicy Bypass `
-    -File .\Invoke-WeComAuditScheduler.ps1 `
-    -ConfigPath .\analysis_task_config.offday-qa.psd1
-
-$LASTEXITCODE
-这次预期行为：
-Analysis cycle guard 检测到已成功
-→ 不重新分析
-→ 不重复发送 BU 邮件
-→ 使用原 RunId
-→ Validate
-→ Archive
-预期退出码：
-0
-10. 第三次运行，验证幂等性
-再次执行完全相同的命令：
-powershell.exe `
-    -NoProfile `
-    -ExecutionPolicy Bypass `
-    -File .\Invoke-WeComAuditScheduler.ps1 `
-    -ConfigPath .\analysis_task_config.offday-qa.psd1
-预期输出类似：
-Analysis already completed
-Validate/archive already completed
-Cycle fully complete. Nothing to do.
-不应再次发送 BU 邮件，也不应新增相同 ledger 记录。
-11. 检查 ledger 是否重复
-$ledgerPath = Get-MailLedgerPath `
-    -Config $config `
-    -ConfigPath .\analysis_task_config.offday-qa.psd1
-
-$ledger = Get-Content $ledgerPath |
-    ForEach-Object { $_ | ConvertFrom-Json }
-
-$ledger |
-    Group-Object Cycle,Task,BU |
-    Where-Object Count -gt 1 |
-    Format-Table Count,Name
-正常情况下不应出现重复发送记录。
-只测试 Analysis，不测试 Scheduler
-如果只想验证指定日期的 mail/device 分析，可以直接运行：
-powershell.exe `
-    -NoProfile `
-    -ExecutionPolicy Bypass `
-    -File .\Invoke-AuditLog.ps1 `
-    -StartDate 20260625 `
-    -EndDate 20260709 `
-    -env QA `
-    -ConfigPath .\analysis_task_config.offday-qa.psd1 `
-    -RunMode all
-这条命令不检查今天是不是周四，但仍会发送 QA BU 邮件，因此仍必须使用隔离 config 和测试收件人。
-可以缩小测试范围：
--RunMode mail
-或：
--RunMode device
-也可以限制 BU：
--IncludeBU MSMS
-但这种 partial run 不应被当作完整 Scheduler 周期成功结果。
-不建议的做法
-不要把系统日期临时改成周四。
-不要把 ScheduleAnchor 改成非周四。
-不要修改 Watcher 来绕过 Thursday gate。
-不要在 QA 测试中复用 PROD LogRoot 或 mail ledger。
-不要使用 -Escalate 做普通测试。
-不要使用 run-now.cmd 测隔离 config，除非 Scheduled Task action 已明确指向该测试 config。
-不要删除正式 ledger 来重复测试；使用独立 QA LogRoot。
+  一句话总结：注册脚本本身没问题，但当前代码库里 mail/device 两类分析任务都会因为缺失的 LDAP 函数而在运行时崩溃，这是移交 SRE 前必须先修的硬阻断，其余检查项 Runbook 第 6–9 节已经写得很完整，按那个 checklist
+  走一遍即可。
