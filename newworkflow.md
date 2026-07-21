@@ -1,13 +1,13 @@
-# WeCom Audit Pipeline — Workflow
+# ABBCom Audit Pipeline — Workflow
 
 This document describes the current end-to-end runtime workflow of the
-biweekly WeCom audit-log automation. For production deployment and rollback,
+biweekly ABBCom audit-log automation. For production deployment and rollback,
 see [`PROD_DEPLOYMENT_RUNBOOK.md`](./PROD_DEPLOYMENT_RUNBOOK.md). For coding
 and architecture guidance, see [`CLAUDE.md`](./CLAUDE.md).
 
 ## Overview
 
-The system runs an unattended biweekly audit of WeCom device-login and
+The system runs an unattended biweekly audit of ABBCom device-login and
 mail-leakage logs per business unit (BU). Each cycle it:
 
 1. Watches the configured source folder for file activity.
@@ -31,22 +31,22 @@ deploy it unchanged to PROD. Complete the checks in
 
 | Component | Role |
 |---|---|
-| `Watch-WeComAuditSource.ps1` | Polls `SourceFolder` and starts AutoCycle through Fast, Slow, or Retry channels |
-| `Invoke-WeComAuditScheduler.ps1` | Single production state-machine entry point |
+| `Watch-ABBComAuditSource.ps1` | Polls `SourceFolder` and starts AutoCycle through Fast, Slow, or Retry channels |
+| `Invoke-ABBComAuditScheduler.ps1` | Single production state-machine entry point |
 | `Invoke-AuditLog.ps1` | Analysis stage: enabled task execution, reports, BU emails, and run artifacts |
 | `Invoke-AuditValidate.ps1` | Validate, backup, hash verification, and guarded source cleanup |
-| `wecom_analysis_comm.psm1` | Facade that loads `modules\internal\*.ps1` |
+| `ABBCom_analysis_comm.psm1` | Facade that loads `modules\internal\*.ps1` |
 | `analysis_task.config.psd1` | Default deployed per-machine configuration filename |
-| `Register-WeComAuditTasks.ps1` | Registers all three production scheduled tasks |
+| `Register-ABBComAuditTasks.ps1` | Registers all three production scheduled tasks |
 | `run-now.cmd` | Optional manual recovery trigger for AutoCycle |
 
 The repository source config may be named `analysis_task_config.psd1`, but the
 runtime default resolved by `Resolve-AuditConfigPath` is
 `analysis_task.config.psd1`. Production deployment must either provide the
 default dotted filename or deliberately configure and verify a machine-level
-`WECOM_AUDIT_CONFIG_PATH`.
+`ABBCom_AUDIT_CONFIG_PATH`.
 
-`Register-WeComAuditTasks.ps1` currently does not embed its supplied
+`Register-ABBComAuditTasks.ps1` currently does not embed its supplied
 `-ConfigPath` into the registered task actions. Passing a non-default config
 path only during registration is therefore insufficient.
 
@@ -55,15 +55,15 @@ contain it even if a working-tree checkout does not.
 
 ## Scheduled tasks
 
-Register the tasks only through `Register-WeComAuditTasks.ps1` in an elevated
+Register the tasks only through `Register-ABBComAuditTasks.ps1` in an elevated
 Windows PowerShell 5.1 session. Do not hand-build them in Task Scheduler; the
 biweekly StartBoundary and task settings are part of the implementation.
 
 | Task | Trigger | Action |
 |---|---|---|
-| `WeComAudit-AutoCycle` | On demand only | Runs `Invoke-WeComAuditScheduler.ps1` |
-| `WeComAudit-SourceWatcher` | Every second Thursday at 10:00 | Polls until 18:00 and starts AutoCycle when appropriate |
-| `WeComAudit-FinalCheck` | Every second Thursday at 18:00 | Runs the Scheduler directly with `-Escalate` |
+| `ABBComAudit-AutoCycle` | On demand only | Runs `Invoke-ABBComAuditScheduler.ps1` |
+| `ABBComAudit-SourceWatcher` | Every second Thursday at 10:00 | Polls until 18:00 and starts AutoCycle when appropriate |
+| `ABBComAudit-FinalCheck` | Every second Thursday at 18:00 | Runs the Scheduler directly with `-Escalate` |
 
 AutoCycle is started by the Watcher or `run-now.cmd`. FinalCheck does not start
 the AutoCycle task; it invokes the same Scheduler script directly with the
@@ -93,12 +93,12 @@ added to the production Watcher action.
 
 ## State machine
 
-`Invoke-WeComAuditScheduler.ps1` does not accept business date, phase, or
+`Invoke-ABBComAuditScheduler.ps1` does not accept business date, phase, or
 environment parameters. Environment comes from the configuration. Its normal
 decision flow is:
 
 ```text
-Acquire Global\WeComAudit mutex
+Acquire Global\ABBComAudit mutex
   |
   +-- normalize eligible mislabeled .xls inputs to .xlsx
   |
@@ -134,7 +134,7 @@ the Validate notification or deadline escalation.
 
 The following controls work together:
 
-- `Global\WeComAudit` permits at most one Scheduler instance per machine.
+- `Global\ABBComAudit` permits at most one Scheduler instance per machine.
 - `Test-AnalysisCycleAlreadyComplete` reuses the successful Analysis RunId.
 - `Test-ValidateCycleAlreadyComplete` treats successful/no-op archive results as
   complete.
@@ -147,7 +147,7 @@ condition.
 
 ## Watcher behavior
 
-`Watch-WeComAuditSource.ps1` polls a directory snapshot rather than using
+`Watch-ABBComAuditSource.ps1` polls a directory snapshot rather than using
 `FileSystemWatcher`, which makes the behavior predictable on network shares.
 Each snapshot records filename, length, and `LastWriteTimeUtc`.
 
@@ -213,8 +213,8 @@ exits and FinalCheck directly invokes the Scheduler with `-Escalate`.
 name, type, BU, input directory, and filename pattern.
 
 - Device tasks import spreadsheet input through `modules\ImportExcel` and hand
-  off to `wecom_devicelog_analysis.ps1`.
-- Mail tasks hand off to `wecom_mail_analysis.ps1`.
+  off to `ABBCom_devicelog_analysis.ps1`.
+- Mail tasks hand off to `ABBCom_mail_analysis.ps1`.
 - Workers perform task-specific parsing, enrichment/LDAP lookup where required,
   deterministic email construction, and ledger-guarded sending through
   `Send-AuditBuMail`.
@@ -223,7 +223,7 @@ name, type, BU, input directory, and filename pattern.
 Artifacts are written under:
 
 ```text
-<LogRoot>\wecom_audit_log\
+<LogRoot>\ABBCom_audit_log\
   ledger\
     mail-ledger.jsonl
   runs\
@@ -285,7 +285,7 @@ that is already considered complete; it never reruns or resends Analysis mail.
 
 - Preflight notifications are throttled through state under `runs`.
 - Validation and archive failures use separate notification content.
-- `WeComAudit-FinalCheck` invokes the Scheduler with `-Escalate` at 18:00.
+- `ABBComAudit-FinalCheck` invokes the Scheduler with `-Escalate` at 18:00.
 - Deadline escalation is sent only if the cycle remains incomplete and today's
   date equals the cycle EndDate.
 - Off-day `-Escalate` invocations log that escalation was skipped and do not page
@@ -334,16 +334,16 @@ PROD recovery.
 
 ```powershell
 # Load the shared module
-Import-Module .\wecom_analysis_comm.psm1 -Force
+Import-Module .\ABBCom_analysis_comm.psm1 -Force
 
 # Normal state-machine entry point
-.\Invoke-WeComAuditScheduler.ps1
+.\Invoke-ABBComAuditScheduler.ps1
 
 # FinalCheck semantics only; not a routine manual command
-.\Invoke-WeComAuditScheduler.ps1 -Escalate
+.\Invoke-ABBComAuditScheduler.ps1 -Escalate
 
 # Register the three production tasks (elevated session)
-.\Register-WeComAuditTasks.ps1 `
+.\Register-ABBComAuditTasks.ps1 `
     -ServiceAccount 'DOMAIN\svc-account' `
     -ConfigPath .\analysis_task.config.psd1
 
