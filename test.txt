@@ -1,0 +1,28 @@
+function Resolve-ValidateFastPathExpectedNames {
+    <#
+    Mirrors the scheduler's own Validate-preflight resolution
+    (Invoke-WeComAuditScheduler.ps1's $summariesForPreflight): dynamic .msg
+    rules only expand to the real per-BU file count once the completed
+    Analysis run's task summaries are readable. Throws on any resolution
+    failure (RunId not fully written yet, a required task summary missing or
+    malformed, etc.) - the caller treats that as "not ready yet, retry next
+    poll", never as a reason to take the watcher down.
+
+    Emits one filename per pipeline item. The caller is the single owner of
+    array materialization (`@(Resolve-ValidateFastPathExpectedNames ...)`) and
+    records completion separately in ValidateManifestResolved. Keeping array
+    wrapping at only one boundary avoids producing a nested Object[] that can
+    never match a real filename.
+    #>
+    param([Parameter(Mandatory)][string]$RunId)
+
+    $bvcForValidate = Get-BackupValidationConfig -Config $config
+    $summaryRequirements = Resolve-DynamicSummaryTaskRequirements `
+        -Config $config -BackupValidationConfig $bvcForValidate -CurrentRunWeeks $cycle.CurrentRunWeeks
+    $taskSummaries = Get-TaskSummariesByRunId `
+        -RunsRoot $runsRoot -RunId $RunId `
+        -RequiredTaskNames $summaryRequirements.RequiredTaskNames -Strict
+    Get-PreflightFiles -BackupValidationConfig $bvcForValidate -Phase 'Validate' `
+        -CurrentRunWeeks $cycle.CurrentRunWeeks -DateTokens $dateTokens -TaskSummaries $taskSummaries |
+        ForEach-Object { $_.Name }
+}
