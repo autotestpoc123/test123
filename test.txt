@@ -1,28 +1,145 @@
-function Resolve-ValidateFastPathExpectedNames {
-    <#
-    Mirrors the scheduler's own Validate-preflight resolution
-    (Invoke-WeComAuditScheduler.ps1's $summariesForPreflight): dynamic .msg
-    rules only expand to the real per-BU file count once the completed
-    Analysis run's task summaries are readable. Throws on any resolution
-    failure (RunId not fully written yet, a required task summary missing or
-    malformed, etc.) - the caller treats that as "not ready yet, retry next
-    poll", never as a reason to take the watcher down.
-
-    Emits one filename per pipeline item. The caller is the single owner of
-    array materialization (`@(Resolve-ValidateFastPathExpectedNames ...)`) and
-    records completion separately in ValidateManifestResolved. Keeping array
-    wrapping at only one boundary avoids producing a nested Object[] that can
-    never match a real filename.
-    #>
-    param([Parameter(Mandatory)][string]$RunId)
-
-    $bvcForValidate = Get-BackupValidationConfig -Config $config
-    $summaryRequirements = Resolve-DynamicSummaryTaskRequirements `
-        -Config $config -BackupValidationConfig $bvcForValidate -CurrentRunWeeks $cycle.CurrentRunWeeks
-    $taskSummaries = Get-TaskSummariesByRunId `
-        -RunsRoot $runsRoot -RunId $RunId `
-        -RequiredTaskNames $summaryRequirements.RequiredTaskNames -Strict
-    Get-PreflightFiles -BackupValidationConfig $bvcForValidate -Phase 'Validate' `
-        -CurrentRunWeeks $cycle.CurrentRunWeeks -DateTokens $dateTokens -TaskSummaries $taskSummaries |
-        ForEach-Object { $_.Name }
+1. 准备部署目录
+进入包含以下文件的release目录：
+Register-WeComAuditTasks.ps1
+Invoke-WeComAuditScheduler.ps1
+Watch-WeComAuditSource.ps1
+wecom_analysis_comm.psm1
+analysis_task.config.psd1
+modules\
+例如：
+Set-Location 'D:\Apps\wecom_audit\current'
+确认关键文件存在：
+@(
+    '.\Register-WeComAuditTasks.ps1'
+    '.\Invoke-WeComAuditScheduler.ps1'
+    '.\Watch-WeComAuditSource.ps1'
+    '.\wecom_analysis_comm.psm1'
+    '.\analysis_task.config.psd1'
+) | ForEach-Object {
+    [pscustomobject]@{
+        Path   = $_
+        Exists = Test-Path -LiteralPath $_
+    }
 }
+2. 以管理员身份打开PowerShell
+开始菜单搜索：
+Windows PowerShell
+选择：
+Run as administrator
+脚本包含：
+#Requires -RunAsAdministrator
+非管理员执行会直接失败。
+3. 检查PROD配置
+运行：
+$config = Import-PowerShellDataFile .\analysis_task.config.psd1
+
+$config |
+    Select-Object Environment, ScheduleAnchor, SourceFolder,
+        LogRoot, BackupRoot |
+    Format-List
+PROD至少应确认：
+Environment    : PROD
+ScheduleAnchor : 20260611
+再确认周期：
+Import-Module .\wecom_analysis_comm.psm1 -Force
+
+$cycle = Resolve-ScheduleCycle -Config $config
+
+$cycle |
+    Format-List Anchor,CycleIndex,StartDate,EndDate,
+        CurrentRunWeeks,OffsetDays
+对于 2026-07-23，预期：
+CycleIndex      : 3
+StartDate       : 20260709
+EndDate         : 20260723
+CurrentRunWeeks : 4
+OffsetDays      : 0
+4. 注册任务
+普通domain service account：
+.\Register-WeComAuditTasks.ps1 `
+    -ServiceAccount 'DOMAIN\svc-wecom-audit-prod' `
+    -ConfigPath .\analysis_task.config.psd1
+脚本会弹出凭据窗口：
+Password for scheduled-task account DOMAIN\svc-wecom-audit-prod
+输入该服务账号的密码。
+脚本会注册或替换：
+WeComAudit-AutoCycle
+WeComAudit-SourceWatcher
+WeComAudit-FinalCheck
+成功输出应包含：
+Registered WeComAudit-AutoCycle.
+Registered WeComAudit-SourceWatcher.
+Registered WeComAudit-FinalCheck.
+All three tasks registered.
+All task actions pinned to config: <absolute config path>
+5. 验证注册结果
+$taskNames = @(
+    'WeComAudit-AutoCycle'
+    'WeComAudit-SourceWatcher'
+    'WeComAudit-FinalCheck'
+)
+
+Get-ScheduledTask -TaskName $taskNames |
+    Select-Object TaskName,State,
+        @{n='User';e={$_.Principal.UserId}},
+        @{n='Arguments';e={$_.Actions.Arguments}},
+        @{n='WorkingDirectory';e={$_.Actions.WorkingDirectory}} |
+    Format-List
+重点检查：
+三个任务都使用正确的PROD service account；
+WorkingDirectory指向当前release；
+三个任务都包含同一个绝对-ConfigPath；
+FinalCheck包含-Escalate。
+查看trigger：
+Get-ScheduledTask -TaskName $taskNames |
+    ForEach-Object {
+        [pscustomobject]@{
+            TaskName      = $_.TaskName
+            StartBoundary = @($_.Triggers).StartBoundary
+            WeeksInterval = @($_.Triggers).WeeksInterval
+            DaysOfWeek    = @($_.Triggers).DaysOfWeek
+        }
+    } |
+    Format-List
+预期：
+AutoCycle    : 无定时trigger
+SourceWatcher: 每2周周四10:00
+FinalCheck   : 每2周周四18:00
+6. 检查任务身份和登录权限
+服务账号必须拥有：
+Log on as a batch job
+并且不能位于：
+Deny log on as a batch job
+否则可能报：
+1385: Logon Failure
+同时需要：
+读取release和config；
+读取SourceFolder/InputRoot；
+写入LogRoot和BackupRoot；
+cleanup启用时删除SourceFolder文件；
+读取通知证书private key；
+访问SMTP、LDAP、Vault和SMB。
+7. 谨慎进行任务测试
+注意：启动AutoCycle不是dry-run，可能：
+执行Analysis；
+发送BU邮件；
+写mail ledger；
+backup文件；
+删除source文件。
+确认输入和收件人后才能运行：
+Start-ScheduledTask -TaskName 'WeComAudit-AutoCycle'
+
+Start-Sleep -Seconds 5
+
+Get-ScheduledTaskInfo -TaskName 'WeComAudit-AutoCycle' |
+    Format-List LastRunTime,LastTaskResult
+常见结果：
+0  = 成功或cycle已完成
+3  = preflight文件未齐
+99 = child script未处理异常
+1/2 = validation或archive失败
+如果只是验证注册，不要启动AutoCycle，只检查task definition和trigger即可。
+当前脚本使用“账号+密码”模式，不适用于gMSA。如果要使用gMSA，需要先实施gMSA版本的注册逻辑。
+
+
+9:34 PM
