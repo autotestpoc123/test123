@@ -68,3 +68,46 @@
   一条硬规则
 
   无论怎么选,记住:secure: false 只在 target 是 localhost 时可以接受;绝不要在 target 指向远程主机时用 secure:false——那才是真正的 MITM 风险。
+
+  011
+   这次情况变了——你已经给 web.config 加上了完整的安全头段(包括 CSP),所以 FIND-011 现在指向的是真实存在的配置了。我重新分析这条实际的 CSP:
+
+  default-src 'self';
+  script-src 'self';                         ← 关键:脚本已锁死,没有 unsafe-inline ✅
+  style-src 'self' 'unsafe-inline';          ← 报告针对的这条
+  img-src 'self' data: hettps:;              ← ⚠️ 拼写错误 "hettps:"
+  font-src 'self' data:;
+  connect-src 'self' https: wss:;
+  object-src 'non';                          ← ⚠️ 拼写错误 "'non'"
+  base-uri 'self'; form-action 'self'; frame-ancestors 'self'
+
+  style-src 'unsafe-inline' 是不是安全问题?——理论上算,但本场景低危、且基本是必要妥协
+
+  判断要点:
+
+  1. 最关键的 script-src 已经锁死为 'self',没有 unsafe-inline。这才是防 XSS 的核心防线,你配对了。内联脚本无法执行,<script> 注入被 CSP 挡住。
+  2. style-src 'unsafe-inline' 只是允许内联样式。它的真实风险是 CSS 注入类攻击(通过属性选择器 + 背景 URL 做数据外泄、UI 伪装),严重度远低于脚本类的 unsafe-inline。在 script-src 已锁死、Angular
+  又自带模板转义的前提下,可利用的注入面很小。
+  3. 对 Angular 来说这几乎是必要妥协。Angular 默认把组件样式作为运行时 <style> 注入,要去掉 style-src 的 unsafe-inline,得改用 CSP nonce(ngCspNonce + 服务端每请求注入 nonce)。而你们是 IIS 静态托管
+  index.html——静态托管没法给每个请求动态生成 nonce,所以 nonce 方案在这里不可行。因此保留 style-src 'unsafe-inline' 是绝大多数 Angular 应用的常规选择。
+
+  结论:这条是"可接受的纵深防御小缺口",不是需要紧急堵的漏洞。定级 Medium 偏高,真实风险低。
+
+  但更该修的是 CSP 里的两个拼写 bug(扫描器都没发现)
+
+  1. img-src ... hettps: —— hettps: 不是合法 scheme,浏览器会当作永不匹配的源忽略掉。结果:如果你本意是允许加载 https 图片,这些图片会被 CSP 拦掉加载不出来。应改为 https:。
+  2. object-src 'non' —— 应为 'none'。'non' 是无效关键字,浏览器会忽略它;虽然"无有效源"碰巧也等于阻止所有 object,但这是靠巧合生效,规范写法必须是 'none',否则会有 console 警告、语义不清。
+
+  这两个是实打实的配置 bug,比 unsafe-inline 更值得改。
+
+  建议的修复
+
+  推荐:保留 style-src 'unsafe-inline'(Angular + 静态 IIS 的现实约束),但修掉两个拼写错误。 改成:
+
+  <add name="Content-Security-Policy" value="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https: wss:;
+  object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'" />
+
+  即:hettps: → https:,'non' → 'none',style-src 维持不变。
+
+  如果你确实想彻底去掉 style-src 的 unsafe-inline,那需要引入构建期/服务端的 nonce 机制,对静态 IIS 托管是笔不小的改造,收益(把一个低危项降为更低)与成本不成正比,我不建议现在做。
+
