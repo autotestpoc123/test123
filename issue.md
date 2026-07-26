@@ -111,3 +111,27 @@
 
   如果你确实想彻底去掉 style-src 的 unsafe-inline,那需要引入构建期/服务端的 nonce 机制,对静态 IIS 托管是笔不小的改造,收益(把一个低危项降为更低)与成本不成正比,我不建议现在做。
 
+  012
+  
+  HSTS 的作用是告诉浏览器"今后一段时间内只准用 HTTPS 访问本站",防的是 SSL-stripping / 协议降级 MITM(攻击者把用户的首次 HTTP 请求降级、劫持)。判断:
+
+  - 值得加:你已经在认真配安全头了,HSTS 是这套头里标准的一员,补上它逻辑一致、成本极低。
+  - 但有几个前提/注意点:
+    a. HSTS 只在 HTTPS 下生效——浏览器收到 HTTP 响应里的 HSTS 头会直接忽略。所以它只对"生产环境走 HTTPS"才有意义(你们生产应该是 HTTPS,符合)。
+    b. includeSubDomains 要谨慎——加了它就意味着"本域所有子域也必须全程 HTTPS"。只有当你确认所有子域都上了 HTTPS 才加,否则会把某些子域访问搞挂。
+    c. 不要随便加 preload——preload 会把域名提交到浏览器内置列表,很难撤销,不建议现在加。
+    d. 注意部署架构:如果 TLS 是在边缘/反向代理/负载均衡层终结的,HSTS 有时统一在那一层配。放在 web.config 也完全可以(只要客户端连接是 HTTPS,头能透传到浏览器)。
+
+  修复方法
+
+  在 customHeaders 段里,和其他头一样先 remove 再 add(保持你现有的幂等写法):
+
+  <!-- 在 remove 区块补一行 -->
+  <remove name="Strict-Transport-Security" />
+
+  <!-- 在 add 区块补一行 -->
+  <add name="Strict-Transport-Security" value="max-age=31536000; includeSubDomains" />
+
+  max-age=31536000 是 1 年(标准值)。如果你想稳妥上线,也可以先用一个较短的值(比如 max-age=86400,1 天)观察一段时间没问题再调到 1 年。能否用 includeSubDomains 取决于你们所有子域是否都已
+  HTTPS——不确定的话先去掉它,只留 max-age。
+
