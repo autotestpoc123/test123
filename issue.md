@@ -26,3 +26,45 @@
   修法(和报告一致):删掉调试 console.*,或包在环境判断里:
   if (!environment.production) { console.log('debug info'); }
   更彻底的是用一个可在生产构建中被剥离的 logging service。
+
+  确认了:现在 target 确实是 https://localhost:7195/,配 secure: false。而且我核对了 package.json 和 angular.json——这个代理没有被默认启用,只有手动给 ng serve 传 --proxy-config proxy.config.json
+  时才生效(CLAUDE.md 里也提到默认 npm start 是直连 apiUrl、不走代理)。
+
+  是不是 security issue?——实际上仍然不是(即使现在是 https)
+
+  关键看三点,结论是这在本场景下风险极低,接近误报:
+
+  1. 目标是 localhost 回环地址。secure: false 的作用是"代理到 https 目标时不拒绝无效/自签名证书"。流量走的是开发机 → 本机 loopback,根本不出网卡。报告说的"同网段的网络攻击者可截获"对 localhost
+  不成立——回环流量别人抓不到,谈不上 MITM。
+  2. secure: false 对本地自签名证书是标准做法。本地 https 后端(比如 ASP.NET Core 的 dev 证书)用的就是自签名证书,不受系统信任。如果不设
+  secure:false,代理会因为证书不被信任而直接拒绝连接、把开发环境搞坏。所以这几乎是所有本地 https 开发的常规配置。
+  3. 它是开发专用、不会进生产。ng serve 的 dev-server 代理只在开发时存在,production 构建里没有这东西。
+
+  真正会变成问题的场景只有一个:target 指向的是远程 https 主机(而非 localhost)、且走不可信网络——那时 secure:false 会盲目接受伪造证书,MITM 就可能了。但你现在是 localhost,不属于这种情况。
+
+  如果你想修(满足扫描器 / 做规范)
+
+  按成本从低到高:
+
+  方案 A(推荐,零改动):保持现状。 对 localhost 开发代理,secure:false 是可接受的正常配置。想消除误报噪音,可以在文件里加一行注释说明"仅本地自签名证书、dev-only"。
+
+  方案 B(想让 secure:true 且不破坏开发):先信任本地证书,再打开校验。
+  {
+    "/api": {
+      "target": "https://localhost:7195/",
+      "secure": true,          // 证书被信任后即可校验
+      "changeOrigin": true,
+      "logLevel": "debug"
+    }
+  }
+  前提是让系统信任后端的本地证书,二选一:
+  - ASP.NET Core 后端:dotnet dev-certs https --trust
+  - 或用 mkcert 生成受信任的 localhost 证书
+
+  这样证书链能验证通过,secure:true 不会断连,扫描器也不再报。
+
+  方案 C(如果后端本地其实是 HTTP):把 target 改回 http://localhost:7195/ 并删掉 secure。 你之前这个文件就是 http 版本——如果后端本地并没跑 https,改成 https 反而没必要,回退更简单。
+
+  一条硬规则
+
+  无论怎么选,记住:secure: false 只在 target 是 localhost 时可以接受;绝不要在 target 指向远程主机时用 secure:false——那才是真正的 MITM 风险。
