@@ -135,3 +135,7 @@
   max-age=31536000 是 1 年(标准值)。如果你想稳妥上线,也可以先用一个较短的值(比如 max-age=86400,1 天)观察一段时间没问题再调到 1 年。能否用 includeSubDomains 取决于你们所有子域是否都已
   HTTPS——不确定的话先去掉它,只留 max-age。
 
+- HSTS 只在 HTTPS 下生效:浏览器收到 HTTP 响应里的这个头会忽略,所以它对生产 HTTPS 环境才起作用——这符合预期,本地 ng serve(HTTP)不受影响。
+  - 后续如需收紧:等你确认所有子域都已 HTTPS,可以再加回 includeSubDomains;preload 仍不建议加(难撤销)。
+
+  这个改动只影响生产 IIS 部署时的响应头,不影响本地开发和构建。如果你想在真实部署上验证这些头是否生效,可以部署后用浏览器 DevTools 的 Network 面板或 curl -I https://<你的站点> 查看响应头。
