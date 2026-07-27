@@ -273,3 +273,11 @@
 
   这两个都不是我引入的,但都会阻断编译。要我把 user-view.component.ts:69 的 getUserByEmailorId 改成正确的 getUserByEmailOrId 吗?cache.interceptor.ts
   那个需要你确认它是否还在用——如果是废弃文件可以删,如果在用则要补回缺失的两个模块。这两处要怎么处理,你定一下。
+
+
+  CWE = Common Weakness Enumeration(通用弱点枚举),由 MITRE 维护的一套软件/硬件安全弱点的分类目录。每一类弱点有一个编号,比如报告里出现的:
+  - CWE-79 = 跨站脚本(XSS)
+  - CWE-352 = 跨站请求伪造(CSRF)
+  - CWE-200 = 敏感信息泄露
+  - CWE-312 = 明文存储敏感信息
+  - CWE-22 = 路径遍历
