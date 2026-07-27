@@ -216,6 +216,30 @@
   user-view.component.ts:69 的报错这次变成了 Property 'getUserByEmailorId' does not exist ... Did you mean 'getUserByEmailOrId'?——说明你在改这行时把方法名写成了 getUserByEmailorId(小写的 or),正确的是
   getUserByEmailOrId(大写 O)。这仍是个大小写拼写问题,会让项目编译不过。
 
+015:
+确认完毕,FIND-015 不需要修改代码。证据链完整:
+
+  1. 鉴权是纯 Bearer token:oidc.authorization.interceptor.ts:37-38 通过 Authorization: Bearer <token> 注入。浏览器不会自动附带 Authorization 头,这正是 Bearer 天然抗 CSRF 的原因。
+  2. 请求不携带 cookie:全项目搜索 withCredentials 零命中——HttpClient 发往 API 的请求不会带上 cookie。CSRF 的前提是"浏览器自动携带凭证",这里根本不成立。
+  3. 那个 cookie.service.ts 与鉴权无关:它只是个通用的 get/set cookie 工具类,而且我搜了整个 src/app,没有任何地方在用它——是段死代码,不参与认证。
+
+  所以前端这一侧不存在可被 CSRF 利用的面,也没有可加的有意义的 CSRF 防护(CSRF token 是服务端机制,SameSite 针对 cookie 鉴权——两者在这个纯 Bearer 前端都用不上)。
+
+  结论
+
+  ┌──────────────────┬──────────────────────────────────────────────────────────────┐
+  │        项        │                             结论                             │
+  ├──────────────────┼──────────────────────────────────────────────────────────────┤
+  │ 前端是否要改代码 │ 不用                                                         │
+  ├──────────────────┼──────────────────────────────────────────────────────────────┤
+  │ 原因             │ Bearer-only 鉴权 + 无 withCredentials + CookieService 未使用 │
+  ├──────────────────┼──────────────────────────────────────────────────────────────┤
+  │ 唯一遗留动作     │ (运维/后端)核对后端不接受会话 cookie 作为替代鉴权            │
+  └──────────────────┴──────────────────────────────────────────────────────────────┘
+
+  唯一需要确认的是后端是否除了 Bearer 之外还接受 session cookie 鉴权——如果接受,那需要在后端加 CSRF token / 设 SameSite,但那和这个 Angular 前端仓库无关,不是这里能改的。
+
+  顺带一提:那个没人使用的 cookie.service.ts 可以作为死代码清理掉,但这属于代码整洁范畴,和 CSRF 无关。要不要我帮你删掉它是另一回事,你决定。
   另外 cache.interceptor.ts 那两个缺失模块(ccm.constants、cache.service)也还在。
 
   这两个都不是我引入的,但都会阻断编译。要我把 user-view.component.ts:69 的 getUserByEmailorId 改成正确的 getUserByEmailOrId 吗?cache.interceptor.ts
