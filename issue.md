@@ -242,5 +242,34 @@
   顺带一提:那个没人使用的 cookie.service.ts 可以作为死代码清理掉,但这属于代码整洁范畴,和 CSRF 无关。要不要我帮你删掉它是另一回事,你决定。
   另外 cache.interceptor.ts 那两个缺失模块(ccm.constants、cache.service)也还在。
 
+  016L
+  生产是安全的——production 没开 source map。问题只在 qa/uat/dev/local 四个配置。
+
+  要不要修?——分环境看,取决于 qa/uat 是否对外可达
+
+  1. development / local:不用改,也不该改。这是开发机本地用的配置,source map 是调试必需品,关掉反而妨碍开发。它们不会部署到服务器。
+  2. qa / uat:是否修取决于这两个环境是否公网可达。
+    - source map(.map 文件)是静态资源,而且 SPA 的 JS bundle 在登录前就会被浏览器加载(先加载壳再跳转 OIDC),所以任何能访问到该服务器的人无需登录就能下到 bundle 及其 .map,还原出原始 TypeScript。
+    - 风险等级仍是 Low:泄露源码有助于攻击者踩点,但不是直接可利用的漏洞;前端源码里本来也不该有任何密钥。对一个内部通讯录来说,源码算不上机密。
+    - 判断:如果 qa/uat 只在公司内网/VPN 内可达 → 低优先级,可选;如果对公网开放 → 建议关掉,成本极低。
+
+  修复方法(只动 qa/uat)
+
+  把 qa 和 uat 的 sourceMap 设为 false:
+  "qa":  { ..., "sourceMap": false, ... },
+  "uat": { ..., "sourceMap": false, ... }
+
+  如果你希望保留 map 用于线上错误排查、但不通过浏览器暴露,可以用 hidden 模式(生成 map 但去掉 //# sourceMappingURL 注释,DevTools 不会自动加载):
+  "sourceMap": { "scripts": true, "hidden": true }
+  没有接错误监控服务的话,直接 false 最省事。
+
+  顺带一个非安全的观察
+
+  qa/uat 都是 optimization: false,意味着代码未压缩/未优化——这不仅比 source map 暴露得更多,还有个测试保真度问题:QA/UAT 本应尽量贴近生产,但你们测的是未优化的 bundle,和真正上线的优化版行为可能有差异。是否给
+  qa/uat 打开 optimization 是个行为改动(会改变构建产物),我不建议和本次一起顺手做,单独评估更稳妥。
+
+  ---
+  要我把 qa 和 uat 的 sourceMap 改成 false 吗(dev/local 保持不变)?如果你更倾向保留 map 做错误排查,我就用 { scripts: true, hidden: true }。告诉我哪种,或者如果 qa/uat 只在内网、你想先不动也可以。
+
   这两个都不是我引入的,但都会阻断编译。要我把 user-view.component.ts:69 的 getUserByEmailorId 改成正确的 getUserByEmailOrId 吗?cache.interceptor.ts
   那个需要你确认它是否还在用——如果是废弃文件可以删,如果在用则要补回缺失的两个模块。这两处要怎么处理,你定一下。
