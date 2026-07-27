@@ -139,3 +139,84 @@
   - 后续如需收紧:等你确认所有子域都已 HTTPS,可以再加回 includeSubDomains;preload 仍不建议加(难撤销)。
 
   这个改动只影响生产 IIS 部署时的响应头,不影响本地开发和构建。如果你想在真实部署上验证这些头是否生效,可以部署后用浏览器 DevTools 的 Network 面板或 curl -I https://<你的站点> 查看响应头。
+
+  014：
+   拦截器完整结构看清了。当前逻辑是"GET 且非 photo"才加缓存头。修复方案:把加头条件改成"所有非 photo 请求"(GET/POST/PUT/DELETE 都加),同时保留 photo 请求的排除(CLAUDE.md 明确要求
+  photo 绕过缓存头和 loading 计数)。顺便把重复的两个分支合并掉。
+
+● Update(src\app\interceptor\custom-request-interceptor.service.ts)
+  ⎿  Added 16 lines, removed 24 lines
+      22        this.setLoadingStatus(true);
+      23      }
+      24
+      25 -    if (request.method == 'GET' && !isPhotoRequest) {
+      26 -      const customRequest = request.clone({
+      27 -        headers: request.headers.set('Cache-Control', 'no-cache')
+      28 -          .set('Pragma', 'no-cache')
+      29 -      });
+      30 -      return next.handle(customRequest).pipe(
+      31 -        catchError((error: HttpErrorResponse) => {
+      32 -          return this.handleError(error);
+      33 -        }),
+      34 -        finalize(() => {
+      25 +    const outgoing = isPhotoRequest
+      26 +      ? request
+      26 +      ? request
+      27 +      : request.clone({
+      28 +          headers: request.headers.set('Cache-Control', 'no-cache')
+      29 +            .set('Pragma', 'no-cache')
+      30 +        });
+      31 +
+      32 +    return next.handle(outgoing).pipe(
+      33 +      catchError((error: HttpErrorResponse) => {
+      34 +        return this.handleError(error);
+      35 +      }),
+      36 +      finalize(() => {
+      37 +        if (!isPhotoRequest) {
+      38            this.setLoadingStatus(false);
+      36 -        })
+      37 -      );
+      38 -    } else {
+      39 -      return next.handle(request).pipe(
+      40 -        catchError((error: HttpErrorResponse) => {
+      41 -          return this.handleError(error);
+      42 -        }),
+      43 -        finalize(() => {
+      44 -          if (!isPhotoRequest) {
+      45 -            this.setLoadingStatus(false);
+      46 -          }
+      47 -        })
+      48 -      );
+      49 -    }
+      39 +        }
+      40 +      })
+      41 +    );
+      42    }
+      43
+      44    setLoadingStatus(isLoading: boolean) {
+
+● 改动完成。我跑一次类型检查,确认没有引入新错误(之前那 3 个是既存的、与本次无关):
+
+● Bash(cd "C:\Users\lxzxc\workspace\ui" && npx tsc --noEmit -p tsconfig.json 2>&1 | head -20; echo "EXIT: ${PIPESTATUS[0]}")
+  ⎿  src/app/components/user-view/user-view.component.ts(69,70): error TS2551: Property 'getUserByEmailorId' does not exist on type 'UserService'. Did you mean 'getUserByEmailOrId'?
+     src/app/interceptor/cache.interceptor.ts(4,34): error TS2307: Cannot find module '../service/ccm.constants' or its corresponding type declarations.
+     src/app/interceptor/cache.interceptor.ts(5,30): error TS2307: Cannot find module '../service/cache.service' or its corresponding type declarations.
+     EXIT: 2
+  ⎿  (timeout 3m)
+
+● FIND-014 修复完成,类型检查确认我的改动没有引入任何新错误——剩下的 3 个报错都是之前就存在、与本次无关的。
+
+  本次改动(FIND-014)
+
+  custom-request-interceptor.service.ts 的 intercept():把加缓存头的条件从"GET 且非 photo"改成"所有非 photo 请求"。现在 POST/PUT/DELETE 也会带上 Cache-Control: no-cache 和 Pragma: no-cache,而 photo
+  请求依然被排除(符合 CLAUDE.md 里"photo 绕过缓存头"的要求)。同时把原来重复的 GET/else 两个分支合并成一条 next.handle(...) 管道,loading 计数逻辑保持不变(photo 仍不计数)。
+
+  顺带提醒:那个 build 报错又变了
+
+  user-view.component.ts:69 的报错这次变成了 Property 'getUserByEmailorId' does not exist ... Did you mean 'getUserByEmailOrId'?——说明你在改这行时把方法名写成了 getUserByEmailorId(小写的 or),正确的是
+  getUserByEmailOrId(大写 O)。这仍是个大小写拼写问题,会让项目编译不过。
+
+  另外 cache.interceptor.ts 那两个缺失模块(ccm.constants、cache.service)也还在。
+
+  这两个都不是我引入的,但都会阻断编译。要我把 user-view.component.ts:69 的 getUserByEmailorId 改成正确的 getUserByEmailOrId 吗?cache.interceptor.ts
+  那个需要你确认它是否还在用——如果是废弃文件可以删,如果在用则要补回缺失的两个模块。这两处要怎么处理,你定一下。
