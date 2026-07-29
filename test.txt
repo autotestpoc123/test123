@@ -1,145 +1,139 @@
-1. 准备部署目录
-进入包含以下文件的release目录：
-Register-WeComAuditTasks.ps1
-Invoke-WeComAuditScheduler.ps1
-Watch-WeComAuditSource.ps1
-wecom_analysis_comm.psm1
-analysis_task.config.psd1
-modules\
-例如：
-Set-Location 'D:\Apps\wecom_audit\current'
-确认关键文件存在：
-@(
-    '.\Register-WeComAuditTasks.ps1'
-    '.\Invoke-WeComAuditScheduler.ps1'
-    '.\Watch-WeComAuditSource.ps1'
-    '.\wecom_analysis_comm.psm1'
-    '.\analysis_task.config.psd1'
-) | ForEach-Object {
-    [pscustomobject]@{
-        Path   = $_
-        Exists = Test-Path -LiteralPath $_
-    }
-}
-2. 以管理员身份打开PowerShell
-开始菜单搜索：
-Windows PowerShell
-选择：
-Run as administrator
-脚本包含：
-#Requires -RunAsAdministrator
-非管理员执行会直接失败。
-3. 检查PROD配置
-运行：
-$config = Import-PowerShellDataFile .\analysis_task.config.psd1
+. 静态确认：没有代码依赖 datejs
+当前检索结果显示：
+datejs 只出现在 package.json、package-lock.json 和 angular.json。
+项目日期格式化使用 date-fns。
+没发现 Date.today()、Date.addDays()、Date.parseExact() 等 datejs 特有 API。
+删除并执行 npm install 后，运行：
+rg -n -i "datejs|Date\.today|Date\.parseExact|addDays|addWeeks|next\(\)" package.json package-lock.json angular.json src
+npm ls datejs
+验收标准：
+rg 没有发现 datejs 配置或特有 API。
+npm ls datejs 不再显示已安装的 datejs。
+同时确认三处都已删除：
+// package.json
+- "datejs": "^0.0.2",
 
-$config |
-    Select-Object Environment, ScheduleAnchor, SourceFolder,
-        LogRoot, BackupRoot |
-    Format-List
-PROD至少应确认：
-Environment    : PROD
-ScheduleAnchor : 20260611
-再确认周期：
-Import-Module .\wecom_analysis_comm.psm1 -Force
+// angular.json
+"scripts": [
+  "node_modules/jquery/dist/jquery.min.js",
+  "node_modules/bootstrap/dist/js/bootstrap.bundle.min.js",
+  "node_modules/print-js/dist/print.js"
+- "node_modules/datejs/lib/date.js"
+]
+并确认 package-lock.json 中不再有：
+node_modules/datejs
+2. 补充真正的日期单元测试
+当前 [date-formatter.pipe.spec.ts](C:/Users/lxzxc/workspace/ui/src/app/pipes/date-formatter.pipe.spec.ts) 只测试了能否创建实例：
+expect(pipe).toBeTruthy();
+它无法检测日期回归。建议至少增加：
+import { DateFormatterPipe } from './date-formatter.pipe';
 
-$cycle = Resolve-ScheduleCycle -Config $config
+describe('DateFormatterPipe', () => {
+  let pipe: DateFormatterPipe;
 
-$cycle |
-    Format-List Anchor,CycleIndex,StartDate,EndDate,
-        CurrentRunWeeks,OffsetDays
-对于 2026-07-23，预期：
-CycleIndex      : 3
-StartDate       : 20260709
-EndDate         : 20260723
-CurrentRunWeeks : 4
-OffsetDays      : 0
-4. 注册任务
-普通domain service account：
-.\Register-WeComAuditTasks.ps1 `
-    -ServiceAccount 'DOMAIN\svc-wecom-audit-prod' `
-    -ConfigPath .\analysis_task.config.psd1
-脚本会弹出凭据窗口：
-Password for scheduled-task account DOMAIN\svc-wecom-audit-prod
-输入该服务账号的密码。
-脚本会注册或替换：
-WeComAudit-AutoCycle
-WeComAudit-SourceWatcher
-WeComAudit-FinalCheck
-成功输出应包含：
-Registered WeComAudit-AutoCycle.
-Registered WeComAudit-SourceWatcher.
-Registered WeComAudit-FinalCheck.
-All three tasks registered.
-All task actions pinned to config: <absolute config path>
-5. 验证注册结果
-$taskNames = @(
-    'WeComAudit-AutoCycle'
-    'WeComAudit-SourceWatcher'
-    'WeComAudit-FinalCheck'
-)
+  beforeEach(() => {
+    pipe = new DateFormatterPipe();
+  });
 
-Get-ScheduledTask -TaskName $taskNames |
-    Select-Object TaskName,State,
-        @{n='User';e={$_.Principal.UserId}},
-        @{n='Arguments';e={$_.Actions.Arguments}},
-        @{n='WorkingDirectory';e={$_.Actions.WorkingDirectory}} |
-    Format-List
-重点检查：
-三个任务都使用正确的PROD service account；
-WorkingDirectory指向当前release；
-三个任务都包含同一个绝对-ConfigPath；
-FinalCheck包含-Escalate。
-查看trigger：
-Get-ScheduledTask -TaskName $taskNames |
-    ForEach-Object {
-        [pscustomobject]@{
-            TaskName      = $_.TaskName
-            StartBoundary = @($_.Triggers).StartBoundary
-            WeeksInterval = @($_.Triggers).WeeksInterval
-            DaysOfWeek    = @($_.Triggers).DaysOfWeek
-        }
-    } |
-    Format-List
-预期：
-AutoCycle    : 无定时trigger
-SourceWatcher: 每2周周四10:00
-FinalCheck   : 每2周周四18:00
-6. 检查任务身份和登录权限
-服务账号必须拥有：
-Log on as a batch job
-并且不能位于：
-Deny log on as a batch job
-否则可能报：
-1385: Logon Failure
-同时需要：
-读取release和config；
-读取SourceFolder/InputRoot；
-写入LogRoot和BackupRoot；
-cleanup启用时删除SourceFolder文件；
-读取通知证书private key；
-访问SMTP、LDAP、Vault和SMB。
-7. 谨慎进行任务测试
-注意：启动AutoCycle不是dry-run，可能：
-执行Analysis；
-发送BU邮件；
-写mail ledger；
-backup文件；
-删除source文件。
-确认输入和收件人后才能运行：
-Start-ScheduledTask -TaskName 'WeComAudit-AutoCycle'
+  it('formats the default yyyyMMdd input', () => {
+    expect(pipe.transform('20260729'))
+      .toBe('29 Jul 2026');
+  });
 
-Start-Sleep -Seconds 5
+  it('ignores time data following the date portion', () => {
+    expect(pipe.transform('20260729153045'))
+      .toBe('29 Jul 2026');
+  });
 
-Get-ScheduledTaskInfo -TaskName 'WeComAudit-AutoCycle' |
-    Format-List LastRunTime,LastTaskResult
-常见结果：
-0  = 成功或cycle已完成
-3  = preflight文件未齐
-99 = child script未处理异常
-1/2 = validation或archive失败
-如果只是验证注册，不要启动AutoCycle，只检查task definition和trigger即可。
-当前脚本使用“账号+密码”模式，不适用于gMSA。如果要使用gMSA，需要先实施gMSA版本的注册逻辑。
+  it('supports explicit input and output formats', () => {
+    expect(pipe.transform('29/07/2026', 'dd/MM/yyyy', 'yyyy-MM-dd'))
+      .toBe('2026-07-29');
+  });
+
+  it('returns an empty string for values shorter than eight characters', () => {
+    expect(pipe.transform('202607'))
+      .toBe('');
+  });
+});
+然后运行：
+npm test -- --watch=false --browsers=ChromeHeadless
+这些测试直接覆盖 [date-formatter.pipe.ts (line 16)](C:/Users/lxzxc/workspace/ui/src/app/pipes/date-formatter.pipe.ts:16) 的 date-fns 解析，不依赖 datejs。
+3. 构建并检查浏览器产物
+至少构建实际部署的配置：
+npm run build -- --configuration production
+npm run build -- --configuration qa
+如果 UAT 环境文件补齐后，再运行：
+npm run build -- --configuration uat
+构建后检查：
+rg -n -i "datejs|Date\.today|Date\.parseExact" dist
+Get-ChildItem -Recurse dist -Filter "scripts-*.js"
+验收标准：
+所有构建成功。
+产物中没有 datejs。
+scripts-*.js 仍包含 jQuery、Bootstrap 和 print-js，但不再包含 datejs。
+scripts bundle 大小应有所下降。
+为了排除旧产物影响，应确保检查的是这次构建产生的目录。
+4. 页面冒烟测试
+重点测试真正涉及日期和时间的功能。
+邮件组日期显示
+打开包含以下字段的 group 页面：
+UpdateTimeStamp
+CreateTimeStamp
+确认页面显示类似：
+Last Update 29 Jul 2026
+Created on 28 Jul 2026
+测试以下情况：
+只有 CreateTimeStamp；
+只有 UpdateTimeStamp；
+两者都有；
+字符串包含时间部分，例如 20260729153045；
+时间戳缺失时页面不报错。
+对应模板是 [group-view.component.html (line 19)](C:/Users/lxzxc/workspace/ui/src/app/components/group-view/group-view.component.html:19)。
+Cookie 到期时间
+[cookie.service.ts](C:/Users/lxzxc/workspace/ui/src/app/service/cookie.service.ts) 使用 date-fns/addMonths 设置三个月后的过期时间。
+在浏览器开发者工具的 Application → Cookies 中确认：
+Cookie 能正常创建；
+Expires 大约为当前日期后三个月；
+刷新页面后 Cookie 仍正常；
+没有 Invalid Date。
+Excel 文件名
+下载一次 Excel，确认文件名仍包含当天日期：
+<filename>_20260729.xlsx
+对应逻辑在 [download-excel.service.ts (line 26)](C:/Users/lxzxc/workspace/ui/src/app/service/download-excel.service.ts:26)。
+登录和 token 刷新
+虽然应用代码没有直接依赖 datejs，但 datejs 原来修改的是浏览器全局 Date，理论上也可能影响 OIDC 库。因此还应检查：
+正常登录；
+页面刷新后会话恢复；
+silent renew/token refresh；
+token 过期后的处理；
+注销。
+这是容易被忽略但很重要的运行时验证。
+浏览器控制台辅助检查
+移除前，datejs 可能给 Date 增加额外方法。移除后可以在控制台检查：
+typeof Date.today
+typeof Date.parseExact
+预期结果：
+"undefined"
+"undefined"
+同时验证标准 ISO 日期仍能解析：
+const timestamp = Date.parse('2026-07-29T10:30:00Z');
+Number.isNaN(timestamp);
+预期为：
+false
+不要用 07/29/2026、29-Jul-2026 等非标准格式证明兼容性，因为不同浏览器对非 ISO 字符串的原生解析可能不同；项目代码应继续使用 date-fns 明确指定格式。
+最终验收标准
+满足以下条件即可较有把握地认为没有回归：
+datejs 已从依赖、锁文件和 Angular scripts 中删除。
+源码和构建产物中不存在 datejs。
+日期 pipe 的实际输入输出测试通过。
+Production 和 QA 构建通过。
+Group 创建/更新时间显示正确。
+Cookie 到期时间正确。
+Excel 文件日期正确。
+OIDC 登录、刷新和退出正常。
+浏览器中 Date.today、Date.parseExact 不再存在。
+浏览器控制台没有 Invalid Date 或日期相关异常。
+其中最关键的是补充日期 pipe 测试和执行登录/token refresh 冒烟测试；只运行 npm run build 不足以证明移除全局 Date 补丁没有行为回归。
 
 
-9:34 PM
+12:31 PM
