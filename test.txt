@@ -1,3 +1,42 @@
+ 原因
+
+  在应用 findings 修改时，group-view 模板的外层分支控制被改坏了。
+
+  原本是三个互斥的分支:
+
+  @if(groupFound && group && group.MailGroup) { …显示数据… }
+  @else if(groupFound == false) { Group not found }
+  @else { Loading… }          ← groupFound 为 null(加载中)
+
+  被改成了下面这样:
+
+  <div *ngIf="groupFound && group && group.MailGroup">
+      …显示数据…
+      @if(!groupFound && groupFound !== null){ not found }   ← 跑到 *ngIf 内部了!
+      @if(groupFound==undefined){ Loading… }                  ← 跑到 *ngIf 内部了!
+  </div>
+
+  not-found 和 loading 这两个分支被错误地嵌套进了 *ngIf="有数据" 的内部,导致:
+
+  - 加载中(groupFound=null)→ *ngIf 为 false → 包括加载动画在内全部不显示 → 空白页
+  - 未找到分组(groupFound=false)→ 同样全部不显示 → 空白页
+
+  因为语法上仍然能编译通过,所以不容易发现;但在数据加载完成之前或加载失败时,页面什么都不显示。
+
+  修改内容(仅 group-view.component.html,.ts 未改动)
+
+  1. 第 2 行:<div *ngIf=…> → 还原为 @if(…) {
+  2. 第 240 行:@if(!groupFound && groupFound !== null){ → } @else if(groupFound === false){(先关闭数据分支再进入 not-found)
+  3. 第 243 行:@if(groupFound==undefined){ → } @else {(loading 分支)
+  4. 第 250 行:删掉多出来的、原本用于闭合 *ngIf 的 </div>
+
+  这样三个分支重新变回互斥的兄弟节点,也和文件里其他地方使用的 @if 写法保持一致。构建已通过,无报错。
+
+  想实际打开分组页面确认显示效果的话,可以执行 ! npm run start:with-mock。
+
+
+
+
 . 静态确认：没有代码依赖 datejs
 当前检索结果显示：
 datejs 只出现在 package.json、package-lock.json 和 angular.json。
