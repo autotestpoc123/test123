@@ -1,178 +1,65 @@
- 原因
+import { Injectable } from '@angular/core';
+import * as XLSX from 'xlsx';
+import * as FileSaver from 'file-saver';
+import { DatePipe } from '@angular/common';
 
-  在应用 findings 修改时，group-view 模板的外层分支控制被改坏了。
+const EXCEL_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;charset=UTF-8';
+const EXCEL_EXTENSION = '.xlsx';
 
-  原本是三个互斥的分支:
+@Injectable({
+  providedIn: 'root'
+})
+export class DownloadExcelService {
 
-  @if(groupFound && group && group.MailGroup) { …显示数据… }
-  @else if(groupFound == false) { Group not found }
-  @else { Loading… }          ← groupFound 为 null(加载中)
+  constructor(private datePipe: DatePipe) { }
 
-  被改成了下面这样:
+  exportToExcel(json:any[], excelfileName:string, headers?:string[]): void {
+    const flattened = (json || []).map(row => this.flattenRow(row));
+    const worksheet: XLSX.WorkSheet = XLSX.utils.json_to_sheet(flattened, {header: headers});
+    this.neutralizeFormulas(worksheet);
+    const workbook: XLSX.WorkBook = { Sheets : {'data':worksheet}, SheetNames:['data'] };
+    const excelBuffer: any = XLSX.write(workbook, {bookType: 'xlsx', type:'array'});
+    this.saveAsExcelFile(excelBuffer, excelfileName);
+  }
 
-  <div *ngIf="groupFound && group && group.MailGroup">
-      …显示数据…
-      @if(!groupFound && groupFound !== null){ not found }   ← 跑到 *ngIf 内部了!
-      @if(groupFound==undefined){ Loading… }                  ← 跑到 *ngIf 内部了!
-  </div>
+  // A worksheet cell can only hold a scalar. Array-valued fields — e.g. several
+  // PersonalMobilePhone numbers — are otherwise dropped by json_to_sheet and the
+  // data is silently lost. Join them into one comma-separated string so every
+  // value lands in a single cell (matching how the UI renders multi-value fields).
+  private flattenRow(row:any): any {
+    if (row === null || typeof row !== 'object' || Array.isArray(row)) {
+      return row;
+    }
+    const flat:any = {};
+    for (const key of Object.keys(row)) {
+      const value = row[key];
+      flat[key] = Array.isArray(value) ? value.join(', ') : value;
+    }
+    return flat;
+  }
 
-  not-found 和 loading 这两个分支被错误地嵌套进了 *ngIf="有数据" 的内部,导致:
+  // Defend against CSV/Excel formula injection (CWE-1236) WITHOUT mutating the
+  // exported values. In the .xlsx format a formula must be declared with an
+  // explicit <f> element; a value beginning with = + - @ that is stored as an
+  // explicit string cell ('s') is kept and displayed as literal text and is never
+  // evaluated when the workbook is opened. Forcing the string type (and stripping
+  // any formula binding) therefore neutralizes injection without adding a leading
+  // apostrophe, so exported columns keep their original data intact — phone
+  // numbers stay "+8613..." rather than becoming "'+8613...".
+  private neutralizeFormulas(worksheet: XLSX.WorkSheet): void {
+    for (const address of Object.keys(worksheet)) {
+      if (address.charAt(0) === '!') { continue; } // skip !ref, !cols, ... metadata keys
+      const cell = worksheet[address] as XLSX.CellObject;
+      if (cell && typeof cell.v === 'string') {
+        cell.t = 's';
+        if ('f' in cell) { delete (cell as any).f; }
+      }
+    }
+  }
 
-  - 加载中(groupFound=null)→ *ngIf 为 false → 包括加载动画在内全部不显示 → 空白页
-  - 未找到分组(groupFound=false)→ 同样全部不显示 → 空白页
-
-  因为语法上仍然能编译通过,所以不容易发现;但在数据加载完成之前或加载失败时,页面什么都不显示。
-
-  修改内容(仅 group-view.component.html,.ts 未改动)
-
-  1. 第 2 行:<div *ngIf=…> → 还原为 @if(…) {
-  2. 第 240 行:@if(!groupFound && groupFound !== null){ → } @else if(groupFound === false){(先关闭数据分支再进入 not-found)
-  3. 第 243 行:@if(groupFound==undefined){ → } @else {(loading 分支)
-  4. 第 250 行:删掉多出来的、原本用于闭合 *ngIf 的 </div>
-
-  这样三个分支重新变回互斥的兄弟节点,也和文件里其他地方使用的 @if 写法保持一致。构建已通过,无报错。
-
-  想实际打开分组页面确认显示效果的话,可以执行 ! npm run start:with-mock。
-
-
-
-
-. 静态确认：没有代码依赖 datejs
-当前检索结果显示：
-datejs 只出现在 package.json、package-lock.json 和 angular.json。
-项目日期格式化使用 date-fns。
-没发现 Date.today()、Date.addDays()、Date.parseExact() 等 datejs 特有 API。
-删除并执行 npm install 后，运行：
-rg -n -i "datejs|Date\.today|Date\.parseExact|addDays|addWeeks|next\(\)" package.json package-lock.json angular.json src
-npm ls datejs
-验收标准：
-rg 没有发现 datejs 配置或特有 API。
-npm ls datejs 不再显示已安装的 datejs。
-同时确认三处都已删除：
-// package.json
-- "datejs": "^0.0.2",
-
-// angular.json
-"scripts": [
-  "node_modules/jquery/dist/jquery.min.js",
-  "node_modules/bootstrap/dist/js/bootstrap.bundle.min.js",
-  "node_modules/print-js/dist/print.js"
-- "node_modules/datejs/lib/date.js"
-]
-并确认 package-lock.json 中不再有：
-node_modules/datejs
-2. 补充真正的日期单元测试
-当前 [date-formatter.pipe.spec.ts](C:/Users/lxzxc/workspace/ui/src/app/pipes/date-formatter.pipe.spec.ts) 只测试了能否创建实例：
-expect(pipe).toBeTruthy();
-它无法检测日期回归。建议至少增加：
-import { DateFormatterPipe } from './date-formatter.pipe';
-
-describe('DateFormatterPipe', () => {
-  let pipe: DateFormatterPipe;
-
-  beforeEach(() => {
-    pipe = new DateFormatterPipe();
-  });
-
-  it('formats the default yyyyMMdd input', () => {
-    expect(pipe.transform('20260729'))
-      .toBe('29 Jul 2026');
-  });
-
-  it('ignores time data following the date portion', () => {
-    expect(pipe.transform('20260729153045'))
-      .toBe('29 Jul 2026');
-  });
-
-  it('supports explicit input and output formats', () => {
-    expect(pipe.transform('29/07/2026', 'dd/MM/yyyy', 'yyyy-MM-dd'))
-      .toBe('2026-07-29');
-  });
-
-  it('returns an empty string for values shorter than eight characters', () => {
-    expect(pipe.transform('202607'))
-      .toBe('');
-  });
-});
-然后运行：
-npm test -- --watch=false --browsers=ChromeHeadless
-这些测试直接覆盖 [date-formatter.pipe.ts (line 16)](C:/Users/lxzxc/workspace/ui/src/app/pipes/date-formatter.pipe.ts:16) 的 date-fns 解析，不依赖 datejs。
-3. 构建并检查浏览器产物
-至少构建实际部署的配置：
-npm run build -- --configuration production
-npm run build -- --configuration qa
-如果 UAT 环境文件补齐后，再运行：
-npm run build -- --configuration uat
-构建后检查：
-rg -n -i "datejs|Date\.today|Date\.parseExact" dist
-Get-ChildItem -Recurse dist -Filter "scripts-*.js"
-验收标准：
-所有构建成功。
-产物中没有 datejs。
-scripts-*.js 仍包含 jQuery、Bootstrap 和 print-js，但不再包含 datejs。
-scripts bundle 大小应有所下降。
-为了排除旧产物影响，应确保检查的是这次构建产生的目录。
-4. 页面冒烟测试
-重点测试真正涉及日期和时间的功能。
-邮件组日期显示
-打开包含以下字段的 group 页面：
-UpdateTimeStamp
-CreateTimeStamp
-确认页面显示类似：
-Last Update 29 Jul 2026
-Created on 28 Jul 2026
-测试以下情况：
-只有 CreateTimeStamp；
-只有 UpdateTimeStamp；
-两者都有；
-字符串包含时间部分，例如 20260729153045；
-时间戳缺失时页面不报错。
-对应模板是 [group-view.component.html (line 19)](C:/Users/lxzxc/workspace/ui/src/app/components/group-view/group-view.component.html:19)。
-Cookie 到期时间
-[cookie.service.ts](C:/Users/lxzxc/workspace/ui/src/app/service/cookie.service.ts) 使用 date-fns/addMonths 设置三个月后的过期时间。
-在浏览器开发者工具的 Application → Cookies 中确认：
-Cookie 能正常创建；
-Expires 大约为当前日期后三个月；
-刷新页面后 Cookie 仍正常；
-没有 Invalid Date。
-Excel 文件名
-下载一次 Excel，确认文件名仍包含当天日期：
-<filename>_20260729.xlsx
-对应逻辑在 [download-excel.service.ts (line 26)](C:/Users/lxzxc/workspace/ui/src/app/service/download-excel.service.ts:26)。
-登录和 token 刷新
-虽然应用代码没有直接依赖 datejs，但 datejs 原来修改的是浏览器全局 Date，理论上也可能影响 OIDC 库。因此还应检查：
-正常登录；
-页面刷新后会话恢复；
-silent renew/token refresh；
-token 过期后的处理；
-注销。
-这是容易被忽略但很重要的运行时验证。
-浏览器控制台辅助检查
-移除前，datejs 可能给 Date 增加额外方法。移除后可以在控制台检查：
-typeof Date.today
-typeof Date.parseExact
-预期结果：
-"undefined"
-"undefined"
-同时验证标准 ISO 日期仍能解析：
-const timestamp = Date.parse('2026-07-29T10:30:00Z');
-Number.isNaN(timestamp);
-预期为：
-false
-不要用 07/29/2026、29-Jul-2026 等非标准格式证明兼容性，因为不同浏览器对非 ISO 字符串的原生解析可能不同；项目代码应继续使用 date-fns 明确指定格式。
-最终验收标准
-满足以下条件即可较有把握地认为没有回归：
-datejs 已从依赖、锁文件和 Angular scripts 中删除。
-源码和构建产物中不存在 datejs。
-日期 pipe 的实际输入输出测试通过。
-Production 和 QA 构建通过。
-Group 创建/更新时间显示正确。
-Cookie 到期时间正确。
-Excel 文件日期正确。
-OIDC 登录、刷新和退出正常。
-浏览器中 Date.today、Date.parseExact 不再存在。
-浏览器控制台没有 Invalid Date 或日期相关异常。
-其中最关键的是补充日期 pipe 测试和执行登录/token refresh 冒烟测试；只运行 npm run build 不足以证明移除全局 Date 补丁没有行为回归。
-
-
-12:31 PM
+  saveAsExcelFile(buffer:any, fileName:string): void{
+    const data: Blob = new Blob([buffer], {type: EXCEL_TYPE});
+    let now = new Date();
+    FileSaver.saveAs(data, fileName + '_' + this.datePipe.transform(new Date(), 'yyyyMMdd') + EXCEL_EXTENSION);
+  }
+}
