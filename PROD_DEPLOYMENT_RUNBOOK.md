@@ -60,10 +60,12 @@ flowchart TD
   S(["计划任务触发 exe"]):::exit --> LK{"获取 lock 文件成功?<br/>(防与上一轮重叠)"}
   LK -- 否 --> XL(["退出 0 · 上一轮仍在跑,跳过"]):::exit
   LK -- 是 --> C["加载配置<br/>PhotoFolder · PhotoType<br/>nasPhotoZip · usersZip<br/>UpdateWindow · SkipValidation<br/>dryRun · quarantineDir · minActiveThreshold"]:::new
-  C --> G1{"IsReadyToLoad(photoZip) 或 IsReadyToLoad(usersZip)?<br/>任一有更新 且 在时间窗内"}:::reuse
+  C --> G1{"try: IsReadyToLoad(photoZip, photoWatermark)<br/>或 IsReadyToLoad(usersZip, usersWatermark)?<br/>任一有更新(各自 watermark)"}:::reuse
   G1 -- 否 --> RL1["释放 lock"]:::new
   RL1 --> X1(["退出 0 · 两 zip 均无更新 · 记 skip"]):::exit
-  G1 -- 是 --> CP["(可选)先把 NAS zip 顺序大读拷到本地 scratch"]:::new
+  G1 -- 抛异常:zip 路径失效 --> RLE["释放 lock"]:::new
+  RLE --> X2(["退出 ≠0 · 报错"]):::bad
+  G1 -- 是 --> CP["(可选)仅当 photo zip 变更时,把它顺序大读拷到本地 scratch<br/>(users.dsml zip 小,无需拷)"]:::new
   CP --> AC{"users.dsml zip 可访问?"}:::new
   AC -- 否 --> RL2["释放 lock"]:::new
   RL2 --> X2(["退出 ≠0 · 报错"]):::bad
@@ -79,7 +81,7 @@ flowchart TD
   MO -- 是 --> LP
   MO -- 否 --> RC[["对账删除 → 图 D"]]:::new
   RC --> RP["汇总 added / updated / skipped / deleted / errors"]:::new
-  RP --> PS["更新 LastLoadTime"]:::new
+  RP --> PS["分别更新 photoWatermark / usersWatermark<br/>(哪个 zip 触发就更新哪个)"]:::new
   PS --> RL3["释放 lock"]:::new
   RL3 --> X3(["退出 0"]):::good
 
@@ -94,6 +96,10 @@ flowchart TD
 > **优雅停机**:主循环携带取消标记;计划任务/关机中断时,因幂等可下次从头扫、跳过未变化文件,等价断点续传。
 >
 > **G2 · 为何门闸对两个 zip 取「或」**:清理非活跃照片依赖 `users.dsml`。若只门控 photo zip,则「仅 users 更新(有人离职)、photo zip 未变」时整轮 skip,非活跃照片永远清不掉——这正是需求 4/5 的核心场景。故任一 zip 更新即进入本轮;一旦进入,对账删除阶段总会用最新活跃集执行。photo zip 未变时 Upsert 各条命中「未变化 skip」,开销很小。
+>
+> **C2 · watermark 必须按 zip 分别跟踪**:`IsReadyToLoad` 内含"每天只加载一次"(`Utility.cs:87`:`Now.Date != _LastLoadTime.Date`)。若两个 zip **共用一个** `LastLoadTime`:上午 photo zip 更新触发一轮 → watermark 置为今天 → 下午 users zip 再更新时,门闸因"今天已跑过"而 skip,**当天离职用户照片清不掉**。故必须为两个 zip 各自维护 `photoWatermark` / `usersWatermark`,分别调 `IsReadyToLoad`、分别更新。
+>
+> **C4a · 门闸异常处理**:`IsReadyToLoad` 对不存在/失效的 zip 会直接抛异常(`Utility.cs:97-100`),而 G1 先于可访问性检查。故 G1 需包 **try-catch**,zip 路径失效时路由到 X2 优雅退出(并释放 lock),而非未捕获抛出。此异常检查已覆盖原 `AC` 可访问性判断。
 
 ---
 
@@ -128,6 +134,8 @@ flowchart TD
 > **G1 · 必须显式建目录**:`GetUserPhotoFullPath` 只**拼路径不建目录**(注释即写 "The folder will be created in advance"),且当**根 `PhotoFolder` 不存在时会直接抛异常**(`Utility.cs:334`)。因此 exe 需:① 启动时确保根 `PhotoFolder` 存在;② 每次写盘前 `Directory.CreateDirectory(dest 父目录)` 建出 `5\8\` 两级子目录。否则 Upsert 落盘必失败。
 >
 > **N1 · 文件名→MSID**:zip entry 可能带目录前缀、大小写扩展名、混入非图片文件。取 `Path.GetFileNameWithoutExtension` 拿到裸 msid,再过 `IsValidMSIDForPhoto` + 长度≥2;非图片扩展名直接 skip。
+>
+> **C4c · 可选优化**:当活跃集已通过 `minActiveThreshold` 校验时,Upsert 阶段对**不在活跃集**的 msid 可直接 skip 写盘(反正对账阶段会删),省一轮"写+删"。注意:仅在**阈值通过、对账会执行**时才可这样短路;阈值未通过(对账被跳过)时**不可** skip,否则既不写也不删会残留。
 
 ---
 
@@ -228,7 +236,7 @@ flowchart TD
 | `usersZip` / `usersDsmlName` | users.dsml 所在 zip 及内部文件名 | 供 `ParseXml` |
 | `UpdateWindow` / `SkipValidation` | 时间窗 / 跳过变更校验 | 供 `IsReadyToLoad` |
 | `dryRun` | 只报告不落盘/不删除 | 上线前演练 |
-| `quarantineDir` | 删除照片的隔离目录 | 非硬删,可恢复 |
+| `quarantineDir` | 删除照片的隔离目录 | 非硬删,可恢复;**必须位于 `PhotoFolder` 之外**(否则下一轮对账会把隔离照片再当非活跃候选重复搬运)。若无法置于外部,对账遍历时须**显式排除**该目录 |
 | `minActiveThreshold` | 活跃集下限,低于则跳过删除 | 防 DSML 残缺误删 |
 
 ---
@@ -255,6 +263,11 @@ flowchart TD
 | **N3** | 每轮全量算哈希成本高 | ✅ 合理 | **已采纳** → §3/§6 改「大小+修改时间」优先,存疑再哈希 |
 | **N4** | "Values 去重"可简化 | ⚠️ 半对:字典是 **mail+msid 双键**,`.Values` 会重复;但 `HashSet<MSID>` 本就去重 | **已采纳(措辞简化、理由更正)** → §2 BS 节点 |
 | **Q1** | 建议关闭:`T = GlobalUserAccount` | ✅ 结论正确(引用行号 230/277 有误)。**旧版**源码 `:219` 曾是 `T==GlobalUser`、`:259` 是 `GlobalUserAccount`,两者互斥;用户**同步最新文件**后,`:218` propertyMapper 与 `:261` item 均判 `GlobalUserAccount`,已自洽 | **已关闭** → `T = GlobalUserAccount`(见 §10) |
+| **C2** | G2 修复引入:两 zip 共用 `LastLoadTime` 会因"每天只跑一次"漏清理 | ✅ 属实(`Utility.cs:87/93`) | **已采纳** → §2 拆 `photoWatermark`/`usersWatermark` 分别跟踪 |
+| **C3** | quarantine 在 `PhotoFolder` 内会被对账重复搬运 | ✅ 属实 | **已采纳** → §9 要求 quarantine 置于 `PhotoFolder` 外(或对账排除) |
+| **C4a** | `IsReadyToLoad` 对不存在 zip 抛异常、绕过优雅退出 | ✅ 属实(`Utility.cs:97-100`,review 引 109-112 略偏) | **已采纳** → §2 G1 包 try-catch 路由 X2 |
+| **C4b** | CP 步骤未说明拷哪个 zip | ✅ 合理 | **已采纳** → §2 CP 仅在 photo zip 变更时拷该大文件 |
+| **C4c** | 阈值通过时 Upsert 可 skip 非活跃 msid | ✅ 合理(可选) | **已采纳为可选** → §3 note(附阈值未通过时的约束) |
 
 > Q1 处置说明:首轮基于旧版本源码驳回是正确的(那版确有 `GlobalUser` vs `GlobalUserAccount` 互斥,两种 `T` 都跑不通);用户同步最新 `XmlHelper.cs` 后不一致已消除,故正式关闭,`T = GlobalUserAccount`。
 
