@@ -1,637 +1,237 @@
-# WeCom Audit Log Pipeline — PROD Deployment Runbook
+# 照片导入实现方案(方案 A) — Console EXE + Windows 计划任务
 
-**Applies to:** current zero-parameter scheduler/state-machine implementation  
-**Environment:** PROD  
-**PowerShell:** Windows PowerShell 5.1  
-**Last updated:** 2026-07-19
-
----
-
-## 1. Scope and production workflow
-
-The production entry point is `Invoke-WeComAuditScheduler.ps1`. It does not accept
-date, phase, or environment parameters. Dates are derived from `ScheduleAnchor`,
-the environment comes from the configuration file, and the next action is derived
-from persisted run state:
-
-```text
-Analysis incomplete                 -> run Analysis
-Analysis complete, Validate pending -> run Validate and archive
-Cycle complete                      -> no-op, exit 0
-```
-
-Do not call the scheduler with legacy parameters such as `-env` or `-Phase`.
-
-Production uses three scheduled tasks, registered only by
-`Register-WeComAuditTasks.ps1`:
-
-| Task | Trigger | Action |
-|---|---|---|
-| `WeComAudit-AutoCycle` | On demand only | Runs the state machine |
-| `WeComAudit-SourceWatcher` | Every second Thursday at 10:00 | Watches source activity and starts AutoCycle after files stabilize; exits at 18:00 |
-| `WeComAudit-FinalCheck` | Every second Thursday at 18:00 | Runs the same state machine with `-Escalate` |
-
-`run-now.cmd` is an optional operator recovery button. It starts
-`WeComAudit-AutoCycle`; it is not a routine deployment or cycle step.
+> 目标:把 global 下发的照片 zip(位于 NAS 共享)解压、按 MSID 两级分桶落盘,并按 `users.dsml` 清理非活跃用户照片。
+> 现状约束:后端为**单工程 monolith**;Hangfire 只搭了架子但**未通电**(依赖的 PostgreSQL 不存在);照片 zip 在 **NAS 共享**,内含**较大的 .jpg**。
+> 结论:**独立 console exe + Windows 计划任务**,代码复用走 **方案 A(抽最小 `FirmwideDirectory.Core` 共享库)**。不为此功能引入 PostgreSQL。
 
 ---
 
-## 2. Go/no-go rules
+## 0 · 为什么是这个方案
 
-Deployment is **NO-GO** if any of the following is unresolved:
-
-- `Environment` is not exactly `PROD`.
-- Any PROD recipient, SMTP identity, certificate name, server, share, or path is
-  still a QA/test/placeholder value.
-- The complete `modules\internal` tree or `modules\ImportExcel` is missing.
-- `SourceFolder`, `InputRoot`, and enabled task `InputDirectory` values do not
-  match the agreed file-delivery design.
-- The service account cannot read inputs, write state/backup, read certificate
-  private keys, or reach required endpoints.
-- `ScheduleAnchor` does not produce the intended biweekly Thursdays and 2/4-week
-  parity.
-- PROD recipient lists have not been reviewed and approved.
-- The release has not passed QA/off-day validation with isolated paths, state,
-  backup, and recipients.
-
----
-
-## 3. Deployment package
-
-Preserve the following layout under one release directory, for example
-`D:\Apps\wecom_audit\current`:
-
-```text
-Invoke-WeComAuditScheduler.ps1
-Invoke-AuditLog.ps1
-Invoke-AuditValidate.ps1
-Watch-WeComAuditSource.ps1
-Register-WeComAuditTasks.ps1
-run-now.cmd
-wecom_mail_analysis.ps1
-wecom_devicelog_analysis.ps1
-wecom_analysis_comm.psm1
-analysis_task.config.psd1
-modules\
-  ImportExcel\
-  internal\
-    Core.ps1
-    Config.ps1
-    State.ps1
-    Notification.ps1
-    Analysis.ps1
-    Archive.ps1
-    SourceCleanup.ps1
-```
-
-The root scripts must remain siblings, and both module subdirectories must retain
-their hierarchy.
-
-### 3.1 Configuration filename requirement
-
-The default runtime filename is:
-
-```text
-analysis_task.config.psd1
-```
-
-The repository source may be named `analysis_task_config.psd1`. Copy it into the
-release directory using the default dotted name.
-
-`Register-WeComAuditTasks.ps1` resolves `-ConfigPath` to an absolute path and
-pins that path into all three scheduled-task actions. The default dotted filename
-beside the scripts remains the recommended package convention, but runtime task
-selection no longer depends on the working directory or a machine-level
-`WECOM_AUDIT_CONFIG_PATH`. After registration, verify that every task action
-contains the same approved absolute `-ConfigPath` value.
-
-### 3.2 Package completeness check
-
-Run from the staged release directory:
-
-```powershell
-$required = @(
-    'Invoke-WeComAuditScheduler.ps1',
-    'Invoke-AuditLog.ps1',
-    'Invoke-AuditValidate.ps1',
-    'Watch-WeComAuditSource.ps1',
-    'Register-WeComAuditTasks.ps1',
-    'run-now.cmd',
-    'wecom_mail_analysis.ps1',
-    'wecom_devicelog_analysis.ps1',
-    'wecom_analysis_comm.psm1',
-    'analysis_task.config.psd1',
-    'modules\ImportExcel',
-    'modules\internal\Core.ps1',
-    'modules\internal\Config.ps1',
-    'modules\internal\State.ps1',
-    'modules\internal\Notification.ps1',
-    'modules\internal\Analysis.ps1',
-    'modules\internal\Archive.ps1',
-    'modules\internal\SourceCleanup.ps1'
-)
-
-$missing = @($required | Where-Object { -not (Test-Path -LiteralPath $_) })
-if ($missing.Count -gt 0) {
-    throw "Deployment package is incomplete:`n$($missing -join [Environment]::NewLine)"
-}
-```
-
-Record the release identifier and SHA256 hashes of the deployed files in the
-change record.
-
----
-
-## 4. PROD prerequisites
-
-### 4.1 Platform and service account
-
-- Windows Server with Windows PowerShell 5.1.
-- A dedicated PROD service account with "Log on as a batch job" rights.
-- Administrator access is available for task registration.
-- The service account password is available during registration.
-
-### 4.2 Certificates
-
-Install the approved PROD certificates in `Cert:\LocalMachine\My`. The service
-account must be able to read their private keys.
-
-Verify the actual configured certificate names, for example:
-
-```powershell
-Get-ChildItem Cert:\LocalMachine\My |
-    Where-Object {
-        $_.Subject -match 'wecom-audit-prod-cert|cod_wecom_ntfy_prod'
-    } |
-    Select-Object Subject, Thumbprint, NotBefore, NotAfter, HasPrivateKey
-```
-
-Confirm:
-
-- `HasPrivateKey` is `True`;
-- the certificate is currently valid and covers upcoming cycles;
-- the service account has private-key read permission;
-- duplicate CN certificates do not cause an unintended certificate to be chosen.
-
-### 4.3 Network access
-
-Confirm the approved PROD values rather than copying example hostnames blindly.
-Typical dependencies include:
-
-| Dependency | Protocol/port | Purpose |
-|---|---|---|
-| Notification SMTP | TCP 2587 | Ops and escalation email |
-| BU-report SMTP | TCP 2587 | Analysis email |
-| Vault | HTTPS 443 | Device-analysis credentials |
-| LDAP | Configured LDAP port | Device user lookup |
-| Source and backup shares | SMB 445 | Input monitoring and archive |
-
-Example connectivity checks:
-
-```powershell
-Test-NetConnection '<smtp-host>' -Port 2587
-Test-NetConnection '<vault-host>' -Port 443
-Test-NetConnection '<ldap-host>' -Port <ldap-port>
-Test-Path -LiteralPath '<SourceFolder>'
-Test-Path -LiteralPath '<BackupRoot>'
-```
-
-### 4.4 File permissions
-
-Test permissions while running as the scheduled-task service account:
-
-| Location | Required access |
+| 选项 | 现状下的判断 |
 |---|---|
-| `InputRoot` and enabled task input directories | Read |
-| `SourceFolder` | Read; Delete only when cleanup is approved and enabled |
-| `LogRoot` | Read, create, write, modify |
-| `BackupRoot` | Read, create, write, modify |
+| 用 Hangfire recurring job | ❌ Hangfire 未通电(无 PostgreSQL);为一天一次的作业搭 Postgres 严重不成比例 |
+| API 内 `BackgroundService` 定时器 | ❌ 重 NAS I/O 跑进 API 进程,抢资源;多实例会重复跑 |
+| **Console exe + 计划任务** | ✅ 零基础设施依赖、天然进程隔离、可部署到能访问 NAS 的主机、与幂等设计契合 |
 
-Do not validate permissions only from an administrator's interactive session.
-
----
-
-## 5. Configuration review
-
-Review `analysis_task.config.psd1` and attach the approved copy to the change
-record.
-
-### 5.1 Mandatory identity and recipient checks
-
-- [ ] `Environment = 'PROD'`.
-- [ ] `Notification.PROD.SmtpServer`, `Port`, `From`, and `CertName` are approved
-      PROD values.
-- [ ] `Notification.PROD.OpsTeam` contains only approved PROD operations
-      recipients.
-- [ ] Top-level `EscalationCc` contains the approved escalation recipients.
-- [ ] Hard-coded PROD recipient mappings in `wecom_mail_analysis.ps1` and
-      `wecom_devicelog_analysis.ps1` have been peer-reviewed.
-- [ ] No QA/test/placeholder address remains in any effective PROD recipient list.
-
-### 5.2 Schedule checks
-
-- [ ] `ScheduleAnchor` is a valid Thursday in `yyyyMMdd` format.
-- [ ] The next task StartBoundary lands on the intended cycle Thursday.
-- [ ] The derived 2-week/4-week alternation matches the business calendar.
-- [ ] `BackupValidationRules` contain the correct deliverables for both cycle
-      lengths.
-- [ ] All `TODO` file rules have been resolved or formally excluded.
-
-Preview the effective cycle without starting the scheduler:
-
-```powershell
-Import-Module .\wecom_analysis_comm.psm1 -Force
-$config = Import-PowerShellDataFile .\analysis_task.config.psd1
-$cycle = Resolve-ScheduleCycle -Config $config
-$cycle | Format-List Anchor, CycleIndex, StartDate, EndDate, CurrentRunWeeks, OffsetDays, Warnings
-```
-
-### 5.3 Path and input-design checks
-
-- [ ] `InputRoot`, `SourceFolder`, `LogRoot`, and `BackupRoot` are real PROD paths.
-- [ ] No effective PROD path contains test share names such as `test` or
-      `apptest`, unless specifically approved as a production dependency.
-- [ ] Every enabled task has a unique `Name`.
-- [ ] Every enabled task's resolved `InputDirectory` exists.
-- [ ] The watcher observes the location into which upstream actually delivers
-      Analysis files.
-- [ ] If enabled tasks read `{InputRoot}` while the watcher observes
-      `{SourceFolder}`, the transfer between those locations is documented and
-      tested. Otherwise align the paths before deployment.
-- [ ] Filename templates, including non-ASCII names and date tokens, resolve to
-      the exact upstream filenames on Windows PowerShell 5.1.
-
-Display the effective Analysis inputs:
-
-```powershell
-$tokens = New-AuditTokenMap `
-    -Config $config `
-    -StartDate $cycle.StartDate `
-    -EndDate $cycle.EndDate
-
-$bvc = Get-BackupValidationConfig -Config $config
-Get-PreflightFiles `
-    -BackupValidationConfig $bvc `
-    -Phase Analysis `
-    -CurrentRunWeeks $cycle.CurrentRunWeeks `
-    -DateTokens $tokens |
-    Format-Table Name, ResolvedPath, Source, ReadyBy -AutoSize
-```
-
-### 5.4 Source cleanup
-
-Source cleanup is enabled from the first supervised PROD cycle:
-
-```powershell
-SourceCleanup = @{
-    Enabled      = $true
-    AllowedRoots = @('<exact SourceFolder>')
-}
-```
-
-Before deployment, the same cleanup behavior must have been proven with an
-isolated QA source and backup location. When cleanup is enabled:
-
-- use the narrowest whitelist, normally the exact `SourceFolder`;
-- keep `BackupRoot` and `LogRoot` outside every allowed root;
-- confirm the service account can delete a controlled test file;
-- never whitelist a drive root, share root, or broad business-data parent;
-- confirm source deletion occurs only after backup verification.
-- confirm every source path selected for deletion is represented by a verified
-  backup copy with matching content hash.
-
-### 5.5 Environment-variable overrides
-
-Check for stale machine-level overrides:
-
-```powershell
-$names = @(
-    'WECOM_AUDIT_CONFIG_PATH',
-    'WECOM_AUDIT_LOG_ROOT',
-    'WECOM_AUDIT_INPUT_ROOT',
-    'WECOM_AUDIT_SOURCE_FOLDER',
-    'WECOM_AUDIT_BACKUP_ROOT'
-)
-
-$names | ForEach-Object {
-    [pscustomobject]@{
-        Name  = $_
-        Value = [Environment]::GetEnvironmentVariable($_, 'Machine')
-    }
-} | Format-Table -AutoSize
-```
-
-Every non-empty override must be intentional, documented, and visible to the
-service account. Remove obsolete overrides through the approved server-change
-process.
+**可逆性**:业务逻辑全部写在一个类里,`Main` 只做薄壳调用。将来若 Postgres/Hangfire 落地,把该类改挂成 Hangfire job 即可,不锁死当前选择。
 
 ---
 
-## 6. Pre-deployment validation
+## 1 · 组件与依赖(方案 A:抽最小 Core 库)
 
-### 6.1 Preserve the current deployment
+把 `Models + Faults + Common` 抽成一个 class library `FirmwideDirectory.Core`,由 **API** 与新的 **PhotoImportTool.exe** 同时引用。核心目的:**`GetUserPhotoFullPath` 的两级分桶规则与 API 字节级一致,杜绝漂移。**
 
-Before changing files:
+```mermaid
+flowchart LR
+  Task["Windows 计划任务<br/>每天 02:00"]:::exit --> EXE
+  subgraph EXEbox["PhotoImportTool.exe · 独立 console 进程"]
+    Main["Main(薄壳)"]:::new --> Job["PhotoImportJob(业务逻辑类)"]:::new
+  end
+  subgraph Core["FirmwideDirectory.Core · 新增共享类库"]
+    P["XmlHelper&lt;T&gt;.ParseXml"]:::reuse
+    G["Utility.GetUserPhotoFullPath"]:::reuse
+    V["Utility.IsValidMSIDForPhoto"]:::reuse
+    R["Utility.IsReadyToLoad"]:::reuse
+    M["Models / Faults"]:::reuse
+  end
+  Job --> P
+  Job --> G
+  Job --> V
+  Job --> R
+  API["FirmwideDirectory.API<br/>(读照片 / 用户导入)"]:::api --> Core
 
-- disable the three existing WeCom Audit scheduled tasks;
-- confirm no scheduler or watcher process is running;
-- export the existing scheduled tasks to XML;
-- copy the existing release directory to a versioned rollback directory;
-- copy the current effective config separately;
-- record the current release hashes;
-- do not delete or modify `runs`, ledger, retry-state, or validation state.
-
-### 6.2 Stage and unblock the release
-
-Copy the new release into a versioned directory, preserving module subfolders.
-If Windows marked the files as downloaded:
-
-```powershell
-Get-ChildItem -LiteralPath 'D:\Apps\wecom_audit\<release>' -Recurse -File |
-    Unblock-File
+  classDef reuse fill:#d9eef1,stroke:#0f7d8c,color:#0b3a41;
+  classDef new fill:#ffffff,stroke:#5b6b73,color:#16222b;
+  classDef exit fill:#e7ebee,stroke:#5b6b73,color:#16222b;
+  classDef api fill:#f2ede1,stroke:#9c8a5f,color:#4a4028;
 ```
 
-Do not overwrite the rollback copy.
-
-### 6.3 Parse all PowerShell files
-
-Run in Windows PowerShell 5.1 from the staged release directory:
-
-```powershell
-$errors = @()
-
-Get-ChildItem -Recurse -File |
-    Where-Object { $_.Extension -in '.ps1', '.psm1', '.psd1' } |
-    ForEach-Object {
-        $tokens = $null
-        $parseErrors = $null
-        [void][System.Management.Automation.Language.Parser]::ParseFile(
-            $_.FullName,
-            [ref]$tokens,
-            [ref]$parseErrors
-        )
-        if ($parseErrors) { $errors += $parseErrors }
-    }
-
-if ($errors.Count -gt 0) {
-    $errors | Format-List
-    throw "PowerShell parse validation failed."
-}
-```
-
-### 6.4 Load configuration and modules
-
-```powershell
-$config = Import-PowerShellDataFile .\analysis_task.config.psd1
-if ([string]$config.Environment -ne 'PROD') {
-    throw "Deployment config is not PROD."
-}
-
-Import-Module .\wecom_analysis_comm.psm1 -Force -ErrorAction Stop
-Import-Module .\modules\ImportExcel -Force -ErrorAction Stop
-```
-
-If the module was produced by `Split-WeComModule.ps1`, retain the associated
-`Verify-ModuleSplit.ps1` result from the build/change process. Do not invent an
-`-OriginalPath` comparison during deployment unless the approved pre-split module
-is available.
-
-### 6.5 QA evidence
-
-Before PROD activation, confirm the isolated QA/off-day evidence covers:
-
-- package/module completeness;
-- fast and slow watcher paths;
-- Analysis and Validate state transitions;
-- duplicate trigger/idempotency behavior;
-- backup verification followed by successful source cleanup in an isolated QA
-  directory;
-- off-day `-Escalate` date gate;
-- escalation email rendering/sending only to controlled QA recipients;
-- failure and recovery behavior.
+**图例**:🟦 复用(移入 Core 的现有代码) · ⬜ 新写 · 🟨 现有 API
 
 ---
 
-## 7. Install and register
+## 2 · 端到端主流程
 
-1. Point the approved production release path to the staged version, or deploy it
-   to the fixed production directory used by the tasks.
-2. Confirm `analysis_task.config.psd1` exists beside the scripts.
-3. Open an elevated Windows PowerShell 5.1 session in the release directory.
-4. Register all three tasks:
+调度由**计划任务**驱动;防重叠靠 **lock 文件**(取代 Hangfire 的隐身超时机制);变更判断靠 `IsReadyToLoad`。
 
-```powershell
-.\Register-WeComAuditTasks.ps1 `
-    -ServiceAccount 'DOMAIN\svc-wecom-audit-prod' `
-    -ConfigPath .\analysis_task.config.psd1
+```mermaid
+flowchart TD
+  S(["计划任务触发 exe"]):::exit --> LK{"获取 lock 文件成功?<br/>(防与上一轮重叠)"}
+  LK -- 否 --> XL(["退出 0 · 上一轮仍在跑,跳过"]):::exit
+  LK -- 是 --> C["加载配置<br/>PhotoFolder · PhotoType<br/>nasPhotoZip · usersZip<br/>UpdateWindow · SkipValidation<br/>dryRun · quarantineDir · minActiveThreshold"]:::new
+  C --> G1{"IsReadyToLoad(nasPhotoZip)?<br/>zip 有更新 且 在时间窗内"}:::reuse
+  G1 -- 否 --> RL1["释放 lock"]:::new
+  RL1 --> X1(["退出 0 · 记 skip"]):::exit
+  G1 -- 是 --> CP["(可选)先把 NAS zip 顺序大读拷到本地 scratch"]:::new
+  CP --> AC{"users.dsml zip 可访问?"}:::new
+  AC -- 否 --> RL2["释放 lock"]:::new
+  RL2 --> X2(["退出 ≠0 · 报错"]):::bad
+  AC -- 是 --> PR["XmlHelper&lt;?&gt;.ParseXml(usersZip, 'users.dsml')"]:::reuse
+  PR --> BS["构造活跃集<br/>Values 去重 · EmployeeStatus==Active<br/>HashSet(OrdinalIgnoreCase)"]:::new
+  BS --> TH{"活跃集 ≥ minActiveThreshold?"}:::new
+  TH -- 否 --> AB["跳过删除阶段<br/>仅 Upsert + 告警<br/>(防 DSML 残缺误删)"]:::warn
+  TH -- 是 --> UP["Upsert 阶段"]:::new
+  AB --> UP
+  UP --> LP["SharpZipLib 逐条流式读 photoZip entry"]:::new
+  LP --> PE[["单条照片处理 → 图 C"]]:::new
+  PE --> MO{"还有 entry?"}:::new
+  MO -- 是 --> LP
+  MO -- 否 --> RC[["对账删除 → 图 D"]]:::new
+  RC --> RP["汇总 added / updated / skipped / deleted / errors"]:::new
+  RP --> PS["更新 LastLoadTime"]:::new
+  PS --> RL3["释放 lock"]:::new
+  RL3 --> X3(["退出 0"]):::good
+
+  classDef reuse fill:#d9eef1,stroke:#0f7d8c,color:#0b3a41;
+  classDef new fill:#ffffff,stroke:#5b6b73,color:#16222b;
+  classDef exit fill:#e7ebee,stroke:#5b6b73,color:#16222b;
+  classDef warn fill:#fbefd6,stroke:#b7791f,color:#6b4a12;
+  classDef bad fill:#f6dcd8,stroke:#b4433a,color:#6b241d;
+  classDef good fill:#dcefe2,stroke:#2f8f5b,color:#1c4a30;
 ```
 
-Registration replaces tasks with the same names. Ensure the prior release has
-already been preserved.
+> **优雅停机**:主循环携带取消标记;计划任务/关机中断时,因幂等可下次从头扫、跳过未变化文件,等价断点续传。
 
-### 7.1 Verify task definitions
+---
 
-```powershell
-$taskNames = @(
-    'WeComAudit-AutoCycle',
-    'WeComAudit-SourceWatcher',
-    'WeComAudit-FinalCheck'
-)
+## 3 · 单条照片处理(Upsert)
 
-Get-ScheduledTask -TaskName $taskNames |
-    Select-Object TaskName, State,
-        @{n='User';e={$_.Principal.UserId}},
-        @{n='Arguments';e={$_.Actions.Arguments}},
-        @{n='WorkingDirectory';e={$_.Actions.WorkingDirectory}} |
-    Format-List
+```mermaid
+flowchart TD
+  E(["一条 zip entry"]):::new --> F{"是文件 且 图片扩展名?"}:::new
+  F -- 否 --> S1["skip++ · 跳过"]:::warn
+  F -- 是 --> M["从文件名解析 msid"]:::new
+  M --> L{"msid.Length ≥ 2<br/>且 IsValidMSIDForPhoto?"}:::reuse
+  L -- 否 --> S2["skip++ · 记非法 msid"]:::warn
+  L -- 是 --> D["dest = GetUserPhotoFullPath(msid)"]:::reuse
+  D --> XT["按 PhotoType 规范扩展名"]:::new
+  XT --> SM{"目标已存在 且<br/>大小 / 哈希相同?"}:::new
+  SM -- 是 --> S3["skip++ · 未变化(增量)"]:::warn
+  SM -- 否 --> DR{"dryRun?"}:::new
+  DR -- 是 --> LO["记录 '将写入' · 不落盘"]:::warn
+  DR -- 否 --> W["流式写临时文件(目标同目录)"]:::new
+  W --> MV["File.Move 原子替换"]:::good
+  MV --> CN["added / updated ++"]:::good
 
-$taskNames | ForEach-Object {
-    Get-ScheduledTaskInfo -TaskName $_
-}
+  classDef reuse fill:#d9eef1,stroke:#0f7d8c,color:#0b3a41;
+  classDef new fill:#ffffff,stroke:#5b6b73,color:#16222b;
+  classDef warn fill:#fbefd6,stroke:#b7791f,color:#6b4a12;
+  classDef good fill:#dcefe2,stroke:#2f8f5b,color:#1c4a30;
 ```
 
-Confirm:
-
-- [ ] all tasks use the approved PROD service account;
-- [ ] all actions and working directories point to the approved release;
-- [ ] all three actions contain the same approved absolute `-ConfigPath`;
-- [ ] AutoCycle has no scheduled trigger;
-- [ ] SourceWatcher is biweekly Thursday 10:00;
-- [ ] FinalCheck is biweekly Thursday 18:00 and its action contains `-Escalate`;
-- [ ] StartBoundary is the intended next cycle Thursday;
-- [ ] multiple instances are configured as `IgnoreNew`;
-- [ ] tasks are enabled and ready.
+> **为何临时文件 + `File.Move`**:目标目录正被 API 读取。就地覆盖会出现"读到半截"窗口;先写同目录临时文件再原子 `Move`,API 要么读到旧的、要么读到新的。
 
 ---
 
-## 8. Production smoke test
+## 4 · 对账删除(非活跃)
 
-There is no dry-run mode. Starting `Invoke-WeComAuditScheduler.ps1` or
-`WeComAudit-AutoCycle` can perform real Analysis, send BU email, write the mail
-ledger, validate/archive files, and—if enabled—delete source files.
+```mermaid
+flowchart TD
+  R0(["遍历 PhotoFolder 所有照片"]):::new --> EA["取每个文件的 msid"]:::new
+  EA --> IN{"msid ∈ 活跃集?"}:::new
+  IN -- 是 --> KP["保留"]:::good
+  IN -- 否 --> PO{"dryRun?"}:::new
+  PO -- 是 --> LD["记录 '将删除' · 不动"]:::warn
+  PO -- 否 --> QU["移入 quarantine 目录<br/>非硬删 · 可恢复"]:::bad
+  QU --> DC["deleted ++"]:::bad
+  KP --> NF{"还有文件?"}:::new
+  LD --> NF
+  DC --> NF
+  NF -- 是 --> EA
+  NF -- 否 --> DN(["对账结束"]):::exit
 
-Perform a production smoke test only in the approved change window after:
-
-- confirming PROD recipients;
-- confirming the effective current cycle;
-- confirming exactly which input files are present;
-- confirming `SourceCleanup.Enabled = $true`, with `AllowedRoots` equal to the
-  exact approved PROD `SourceFolder`;
-- confirming isolated QA evidence proves backup/hash verification occurs before
-  deletion;
-- obtaining approval for any real emails that may be sent.
-
-Preferred task-identity test:
-
-```powershell
-Start-ScheduledTask -TaskName 'WeComAudit-AutoCycle'
-Start-Sleep -Seconds 5
-Get-ScheduledTaskInfo -TaskName 'WeComAudit-AutoCycle' |
-    Format-List LastRunTime, LastTaskResult, NextRunTime
+  classDef new fill:#ffffff,stroke:#5b6b73,color:#16222b;
+  classDef good fill:#dcefe2,stroke:#2f8f5b,color:#1c4a30;
+  classDef warn fill:#fbefd6,stroke:#b7791f,color:#6b4a12;
+  classDef bad fill:#f6dcd8,stroke:#b4433a,color:#6b241d;
+  classDef exit fill:#e7ebee,stroke:#5b6b73,color:#16222b;
 ```
 
-Then inspect the current cycle's logs and artifacts. Do not assume that a process
-start proves a successful pipeline run.
+---
 
-Expected common results:
+## 5 · 删除语义(关键)
 
-| Result | Meaning |
-|---|---|
-| Exit/task result `0` | Work completed successfully or the cycle was already complete |
-| Exit/task result `3` | Required preflight files were missing/invalid; ops notification is throttled |
-| Exit/task result `1` or other nonzero | Real failure; inspect workflow/task logs |
-| Warning that mutex `Global\WeComAudit` is held | Another state-machine invocation is running; do not start another |
+源自 `XmlHelper.ParseXml → PostProcess`:解析结果**只含 Active + Inactive**,`Terminated` / `Pending` 被直接丢弃。活跃集 = **仅 Active**。
 
-The current scheduler does not use exit code 2 for an already-complete cycle; it
-returns 0.
+| EmployeeStatus | 在 ParseXml 结果中? | 在活跃集? | 照片处理 |
+|---|---|---|---|
+| `A` Active | 是 | 是 | **保留 / 更新** |
+| `I` Inactive | 是 | 否 | **删除 → 隔离** |
+| `T` Terminated | 否(丢弃) | 否 | **删除 → 隔离** |
+| `P` Pending | 否(丢弃) | 否 | **删除 → 隔离** |
+| 其它 / 缺 MSID | 否 | 否 | 删除候选 · 靠阈值兜底 |
+
+> **阈值保护**:若某天 `users.dsml` 残缺导致活跃集异常偏小,严格对账会误删大批在职照片。`minActiveThreshold` 不满足时**只做 Upsert、跳过删除并告警**。
 
 ---
 
-## 9. First-cycle supervised verification
+## 6 · 大文件 + NAS 必须处理的 5 个坑
 
-Monitor the first production cycle from before the watcher starts until FinalCheck
-has completed.
-
-### 9.1 Watcher
-
-- [ ] `WeComAudit-SourceWatcher` starts at 10:00 under the service account.
-- [ ] `<resolved output root>\watcher\watcher-<yyyyMMdd>.log` is created.
-- [ ] File activity and stabilization are logged.
-- [ ] AutoCycle is kicked only after the expected Analysis set is stable, or after
-      the slow-path quiet interval.
-- [ ] File deletions alone do not retrigger the pipeline.
-
-### 9.2 Analysis
-
-- [ ] The scheduler banner reports `Environment: PROD` and the intended cycle.
-- [ ] A timestamped run folder is created under
-      `<LogRoot>\wecom_audit_log\runs`.
-- [ ] `run-summary.json` shows every enabled task successful.
-- [ ] BU email recipients match the approved lists.
-- [ ] `sent-emails.json` and `ledger\mail-ledger.jsonl` contain the expected audit
-      evidence.
-- [ ] A duplicate trigger is a safe no-op and does not resend identical mail.
-
-### 9.3 Validate and archive
-
-- [ ] Validate uses the successful Analysis `RunId` for the current cycle.
-- [ ] `validation\backup-validation-summary.json` reports the expected result.
-- [ ] `<BackupRoot>\<endDate>` contains all required files.
-- [ ] Backup copies pass the built-in hash verification.
-- [ ] Every source file selected for cleanup has a corresponding verified backup
-      copy.
-- [ ] Only the expected files beneath the exact allowed source root are deleted.
-- [ ] No unrelated source file or directory is removed.
-- [ ] No unexpected `notification-failure.json` sidecar is present.
-
-### 9.4 FinalCheck and escalation
-
-- [ ] `WeComAudit-FinalCheck` starts at 18:00 with `-Escalate`.
-- [ ] If the cycle completed, no deadline escalation is sent.
-- [ ] If the cycle is genuinely incomplete on its end date, exactly one approved
-      deadline-escalation path is exercised.
-- [ ] Off-day invocations do not page escalation recipients.
+| # | 坑 | 对策 |
+|---|---|---|
+| 1 | **作业重叠** | 计划任务可能与上一轮长作业重叠 → 启动即取 **lock 文件 / mutex**,未取到直接退出 |
+| 2 | **内存** | 大 jpg **逐 entry 带 buffer 流式写盘**;禁止整包 `ExtractToDirectory` 或整图 load 内存 |
+| 3 | **NAS 健壮性** | 瞬时 IO 错误**有限重试**;可选:先把 NAS zip **顺序大读**拷到本地 scratch 再解压,减少长时间 SMB 句柄占用 |
+| 4 | **目标写入原子性** | 临时文件同目录 + `File.Move`,API 不会读到半截 |
+| 5 | **长作业遇重启** | 携带 `CancellationToken` 优雅停机;幂等设计使重跑跳过未变化文件(断点续传效果) |
 
 ---
 
-## 10. Operations and recovery
+## 7 · 复用清单(方案 A)
 
-Normal cycles require no manual scheduler run. After an escalation or recoverable
-failure:
-
-1. Diagnose and fix the named dependency, missing file, permission, or network
-   problem.
-2. Confirm no AutoCycle instance is still running.
-3. Start `run-now.cmd` or the `WeComAudit-AutoCycle` task.
-4. Inspect logs and artifacts; do not treat the command's “triggered” message as
-   proof of completion.
-
-Repeated state-machine invocations are designed to be safe. Completed cycles exit
-0 as no-ops. Changed mail content for an already-ledgered cycle is rejected rather
-than automatically resent.
-
-There is no operator BU-resend script in this release. Corrections or exceptional
-resends require the approved manual audit process. Do not edit or delete the mail
-ledger to force a resend.
-
-`-ForceRerunArchive` is an engineering-only archive recovery switch. It does not
-authorize rerunning or resending a completed Analysis cycle.
+| 流水线步骤 | 来源(移入 `FirmwideDirectory.Core`) | 状态 |
+|---|---|---|
+| 变更判断(zip 是否更新 / 时间窗) | `Utility.IsReadyToLoad` | 复用 |
+| 解析 users.dsml → 用户 + 状态 | `XmlHelper<T>.ParseXml` | 复用 |
+| 照片落盘路径 `5\8\58NVV.jpg` | `Utility.GetUserPhotoFullPath` | 复用 |
+| MSID 校验 | `Utility.IsValidMSIDForPhoto` | 复用 |
+| 解压照片 zip 并分发到子目录 | SharpZipLib(参照 ParseXml 读法) | 新写 |
+| 活跃集构造(去重 + 仅 Active) | — | 新写 |
+| 增量判断 / 临时文件 + 原子 Move | — | 新写 |
+| 对账删除 → quarantine | — | 新写 |
+| lock 防重叠 / 汇总报告 / 退出码 / dry-run | — | 新写 |
 
 ---
 
-## 11. Rollback
+## 8 · Core 库抽取要点(方案 A 的一次性成本)
 
-1. Disable these three tasks:
+**移入 Core**:`Models` + `Faults` + `Common`(`Utility`、`XmlHelper`)。
+**不移入**:`Controllers / Middlewares / Hangfire / Services / DataAccess / Repository / StateMachine / DataTransfer / Extensions`。
 
-   ```text
-   WeComAudit-AutoCycle
-   WeComAudit-SourceWatcher
-   WeComAudit-FinalCheck
-   ```
+抽取时的注意事项(避免把框架依赖带进库):
 
-2. Confirm that no scheduler or watcher PowerShell process from the release is
-   running.
-3. Preserve the failed release, effective config, task history, and logs for
-   investigation.
-4. Restore the previous approved release directory and configuration.
-5. Confirm the previous release can read the existing run-state and ledger schema.
-6. Re-register the three tasks from the restored release using
-   `Register-WeComAuditTasks.ps1`.
-7. Recheck each action, working directory, service account, trigger, and
-   StartBoundary.
-8. Review current-cycle guards and artifacts before manually starting AutoCycle.
-9. Re-enable the scheduled tasks only after rollback validation succeeds.
-
-Never delete or edit the following during rollback:
-
-- `runs` and run summaries;
-- `ledger\mail-ledger.jsonl`;
-- retry-state files;
-- validation summaries;
-- notification sidecars.
-
-Those artifacts provide duplicate-send protection and audit evidence.
+1. **清理框架耦合**:`XmlHelper.cs` 顶部有 `using Microsoft.AspNetCore.Http.Features;`,`Utility` 用了 `ILogger` / `WebProxy`。库里只允许依赖 `Microsoft.Extensions.Logging.Abstractions`,**不得依赖 ASP.NET**。先删无用 using、日志换 Abstractions。
+2. **传递依赖**:`Models` 可能反向引用 `DataTransfer / Extensions`,"编译-看报错"逐个收敛,必要时把真正共享的类型一起下沉。
+3. **这是生产单体上的重构**,须配回归测试(用户导入路径尤其要验证:API 仍能正常 `ParseXml` 加载用户/组)。
+4. **SharpZipLib** 依赖随 `Common` 进入 Core;API 与 exe 版本保持一致。
 
 ---
 
-## 12. Change record evidence
+## 9 · 配置项(建议与 API 共享同一 `PhotoOptions`)
 
-Attach the following to the production change ticket:
+| 配置 | 含义 | 备注 |
+|---|---|---|
+| `PhotoFolder` | 照片根目录(API 读、exe 写) | **exe 与 API 必须同值** |
+| `PhotoType` | 扩展名(如 `.jpg`) | **exe 落盘扩展名必须等于此值** |
+| `nasPhotoZip` | NAS 上照片 zip 路径 | exe 输入 |
+| `usersZip` / `usersDsmlName` | users.dsml 所在 zip 及内部文件名 | 供 `ParseXml` |
+| `UpdateWindow` / `SkipValidation` | 时间窗 / 跳过变更校验 | 供 `IsReadyToLoad` |
+| `dryRun` | 只报告不落盘/不删除 | 上线前演练 |
+| `quarantineDir` | 删除照片的隔离目录 | 非硬删,可恢复 |
+| `minActiveThreshold` | 活跃集下限,低于则跳过删除 | 防 DSML 残缺误删 |
 
-- approved release identifier and file hashes;
-- reviewed PROD configuration with secrets redacted;
-- complete package check result;
-- PowerShell parse and module-load results;
-- QA/off-day validation evidence;
-- service-account permission and connectivity results;
-- certificate thumbprints and validity dates;
-- pre-change task XML and rollback release location;
-- post-registration task definitions and StartBoundary values;
-- production smoke-test result;
-- first-cycle watcher, Analysis, Validate/archive, ledger, backup, and FinalCheck
-  evidence;
-- final go/no-go and operator sign-off.
+---
 
-Any subsequent change to schedule calculation, task names, filename templates,
-recipient mapping, mail Subject/Body generation, ledger behavior, source cleanup,
-or backup validation requires renewed QA evidence and change approval.
+## 10 · 动手前仍需拍板的问题
+
+| # | 问题 | 说明 |
+|---|---|---|
+| **Q1** | `ParseXml` 的泛型 `T` 用哪个? | 源码里 `propertyMapper` 按 `GlobalUser` 解析,建对象却判 `GlobalUserAccount`,两处不一致。**需以 `GlobalUserLoadService` 里能跑通的真实调用为准**(该文件在远端,需提供)。 |
+| **Q2** | 扩展名:zip 内是 `.png` 还是 `.jpg`? | 路径靠 `{msid}{PhotoType}` 拼,exe 落盘扩展名必须等于后端 `PhotoType`,否则 API 永远读不到。 |
+| **Q3** | 删除范围:只删 Inactive,还是删"非 Active"全部? | 推荐"非 Active 即删除候选 + 阈值兜底 + quarantine";需业务确认是否接受连 Terminated/Pending 一并清理。 |
+| **Q4** | 部署主机 | exe 需部署在**能同时访问 NAS 照片 zip 与目标 `PhotoFolder`** 的主机上;计划任务在该主机注册。 |
+
+---
+
+*本文档为评审用设计,未改动任何源码。确认 Q1–Q4 后再落 `FirmwideDirectory.Core` 抽取与 exe 骨架。*
