@@ -61,3 +61,30 @@
 
   要不要我把这套骨架直接写进 C:\Users\lxzxc\workspace\api 那边(作为真实项目文件),还是你自己拷过去?另外如果你把 Core 抽取后真实的 PhotoOptions/GlobalFileLoadOption/XmlParseResult 定义贴给我,我可以把那 4 个 TODO
   一次性对死、去掉占位。
+
+
+─ FirmwideDirectory.API\                                    (现有 API 项目)
+  └── MorganStanley.COD.FirmwideDirectory.PhotoImportTool\      ← 新建,7 个文件
+      ├── MorganStanley.COD.FirmwideDirectory.PhotoImportTool.csproj
+      ├── appsettings.json
+      ├── Program.cs
+      ├── PhotoImportOptions.cs
+      ├── PhotoImportJob.cs
+      ├── WatermarkStore.cs
+      ├── SingleInstanceLock.cs
+      └── RunSummary.cs
+
+  放成了 API 项目的同级兄弟、在解决方案文件夹内,符合 .NET 多项目约定。
+
+  你在真实解决方案里要做的收尾
+
+  1. 命名对齐:本地这层叫 FirmwideDirectory.API,你真实仓库是 MorganStanley.COD.FirmwideDirectory.API。csproj 里的 ProjectReference 现在指向 ..\MorganStanley.COD.FirmwideDirectory.Core\...——确认 Core
+  抽取后的真实项目名/相对路径一致(前面清理重建那步用的就是这个名)。
+  2. 加进解决方案 + 引用 Core(在解决方案文件夹下):
+  dotnet sln add ".\MorganStanley.COD.FirmwideDirectory.PhotoImportTool\MorganStanley.COD.FirmwideDirectory.PhotoImportTool.csproj"
+  dotnet build
+  3. 对死 4 个 TODO:PhotoOptions / GlobalFileLoadOption / XmlParseResult.UsersDict 的真实属性名,以及 PhotoImportJob.cs 顶部三个 using 的真实命名空间(抽取后统一即可直接用)。
+  4. 干跑验证:appsettings.json 默认 DryRun=true,先 dotnet run --project ...,只打印 added/updated/deleted/purged 计数、不写盘不删;核对无误后再 --PhotoImport:DryRun=false。
+
+  一句话:骨架已落到 api 里的 MorganStanley.COD.FirmwideDirectory.PhotoImportTool 项目;接下来 dotnet sln add + 对齐 Core 引用/4 个 TODO + 干跑,就能跑起来。把 Core 抽取后真实的
+  PhotoOptions/GlobalFileLoadOption/XmlParseResult 贴给我,我可以把 TODO 一次性去掉。
