@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>   <!-- 与 API / Core 一致 -->
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>MorganStanley.COD.FirmwideDirectory.PhotoImportTool</RootNamespace>
+    <AssemblyName>MorganStanley.COD.FirmwideDirectory.PhotoImportTool</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 复用 Core 的 Utility / XmlHelper / Models / Faults(单一数据源) -->
+    <ProjectReference Include="..\MorganStanley.COD.FirmwideDirectory.Core\MorganStanley.COD.FirmwideDirectory.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 解压照片 zip;版本与 Core/API 保持一致 -->
+    <PackageReference Include="SharpZipLib" Version="1.4.2" />
+    <PackageReference Include="Microsoft.Extensions.Configuration" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="appsettings.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
