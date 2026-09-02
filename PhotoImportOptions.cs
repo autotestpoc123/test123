@@ -1,4 +1,4 @@
-namespace MorganStanley.COD.FirmwideDirectory.PhotoImportTool;
+namespace COD.FirmwideDirectory.PhotoImportTool;
 
 /// <summary>
 /// 从 appsettings.json 的 "PhotoImport" 节绑定。对应设计文档 §9 配置项。
