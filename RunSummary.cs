@@ -1,4 +1,4 @@
-namespace MorganStanley.COD.FirmwideDirectory.PhotoImportTool;
+namespace COD.FirmwideDirectory.PhotoImportTool;
 
 /// <summary>对应设计文档 §2 汇总节点。</summary>
 public sealed class RunSummary
