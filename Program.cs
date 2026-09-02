@@ -1,7 +1,7 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
-namespace MorganStanley.COD.FirmwideDirectory.PhotoImportTool;
+namespace COD.FirmwideDirectory.PhotoImportTool;
 
 /// <summary>
 /// 薄壳 Main:装配配置/日志/取消 → 取单实例锁 → 跑 PhotoImportJob → 映射退出码。
