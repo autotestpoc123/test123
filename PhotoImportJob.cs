@@ -1,12 +1,16 @@
 using ICSharpCode.SharpZipLib.Zip;
 using Microsoft.Extensions.Logging;
 
-// —— 来自 Core(抽取后统一命名空间;若真实命名空间不同请按实调整)——
-using MorganStanley.COD.FirmwideDirectory.Common;          // Utility, XmlHelper<T>
-using MorganStanley.COD.FirmwideDirectory.Models;          // GlobalUserAccount, EmployeeStatus, XmlParseResult
-using MorganStanley.COD.FirmwideDirectory.Models.Options;  // PhotoOptions, GlobalFileLoadOption
+// —— 来自 Core / API ——
+// ⚠️ 当前源码命名空间不统一(见本轮 review R1),下面按各文件"实际"命名空间接线;
+//    统一后应收敛成一个根再简化。
+using MorganStanley.COD.FirmwideDirectory.API.Common;   // Utility       (Utility.cs)
+using FirmwideDirectory.API.Common;                     // XmlHelper<T>  (XmlHelper.cs)
+using COD.FirwideDirectory.API.Models.Options;          // PhotoOptions, GlobalFileLoadOption(注意:命名空间含拼写 "Firwide")
+using COD.FirwideDirectory.API.Models.Primitive;        // XmlParseResult
+using FirmwideDirectory.API.Models;                     // GlobalUserAccount, EmployeeStatus(TODO: 核对真实命名空间)
 
-namespace MorganStanley.COD.FirmwideDirectory.PhotoImportTool;
+namespace COD.FirmwideDirectory.PhotoImportTool;
 
 /// <summary>
 /// 业务编排,对应设计文档 §2 主流程 + §3 Upsert + §4 对账/清理。
@@ -14,11 +18,9 @@ namespace MorganStanley.COD.FirmwideDirectory.PhotoImportTool;
 /// </summary>
 public sealed class PhotoImportJob
 {
-    private static readonly HashSet<string> ImageExts =
-        new(new[] { ".jpg", ".jpeg", ".png" }, StringComparer.OrdinalIgnoreCase);
-
     private const string PhotoKey = "photoZip";
     private const string UsersKey = "usersZip";
+    private const string TempSuffix = ".photoimport-tmp";   // 临时文件后缀(便于 R11 清理)
 
     private readonly PhotoImportOptions _opt;
     private readonly ILogger _log;
@@ -28,7 +30,7 @@ public sealed class PhotoImportJob
     {
         _opt = opt;
         _log = log;
-        // TODO: 核对 Core.PhotoOptions 的真实属性名(应含 PhotoFolder / PhotoType)
+        // 已核对:PhotoOptions { PhotoFolder, PhotoType }(均为 string?)
         _photoOptions = new PhotoOptions { PhotoFolder = opt.PhotoFolder, PhotoType = opt.PhotoType };
     }
 
@@ -52,8 +54,11 @@ public sealed class PhotoImportJob
         }
         _log.LogInformation("门闸通过:photoReady={P} usersReady={U}", photoReady, usersReady);
 
-        // 确保根目录存在(G1:GetUserPhotoFullPath 根目录不存在会抛)
-        Directory.CreateDirectory(_opt.PhotoFolder);
+        // 根目录:R13 dry-run 零副作用,仅非 dry-run 才建;GetUserPhotoFullPath 需要它存在
+        if (!_opt.DryRun)
+            Directory.CreateDirectory(_opt.PhotoFolder);
+        else if (!Directory.Exists(_opt.PhotoFolder))
+            _log.LogWarning("dry-run:PhotoFolder 不存在,写入路径预览会报错(不影响 users 解析/对账预览)");
 
         // —— 活跃集(§2 BS + N4)——
         var activeMsids = BuildActiveMsids(_opt.UsersZipPath, _opt.UsersDsmlName);
@@ -66,9 +71,17 @@ public sealed class PhotoImportJob
             _log.LogWarning("活跃集 {N} < 阈值 {T},本轮跳过删除阶段(防 DSML 残缺误删)",
                 activeMsids.Count, _opt.MinActiveThreshold);
 
-        // —— Upsert(§3);仅当 photo zip 有更新才有新内容,否则各条命中"未变化 skip" ——
-        var photoZip = MaybeCopyToScratch(_opt.PhotoZipPath, ct);
-        UpsertPhotos(photoZip, activeMsids, deleteEnabled, summary, ct);
+        // —— Upsert(§3):R5 仅当 photo zip 有更新才做,避免为"全部 skip"而白读整个大 NAS zip ——
+        if (photoReady)
+        {
+            CleanupOrphanTempFiles(ct);                               // R11:清理崩溃残留的 tmp
+            var photoZip = MaybeCopyToScratch(_opt.PhotoZipPath, ct); // R6/R13:非 dry-run 且 photo 变更时才拷
+            UpsertPhotos(photoZip, activeMsids, deleteEnabled, summary, ct);
+        }
+        else
+        {
+            _log.LogInformation("photo zip 未变,跳过 Upsert(仅 users 更新触发本轮)");
+        }
 
         // —— 对账删除(§4)——
         if (deleteEnabled)
@@ -77,23 +90,36 @@ public sealed class PhotoImportJob
         // —— quarantine 永久删除(§4.1 PG)——
         PurgeQuarantine(summary, ct);
 
-        // —— 更新对应水位(C2)——
-        var now = DateTime.Now;
-        if (photoReady) watermarks.Set(PhotoKey, now);
-        if (usersReady) watermarks.Set(UsersKey, now);
-        if (!_opt.DryRun) watermarks.Save();
+        // —— 更新水位(C2 + R8:仅在无错误时推进,否则下轮重试)——
+        // 用处理时刻 now 而非 zip mtime:IsReadyToLoad 用严格 '<' 比较,水位须 > zip mtime
+        // 才能让"未变 zip"下轮被 skip。(彻底修复需把 Core 的比较改成 '<=' 并存 zip mtime。)
+        if (summary.Errors == 0)
+        {
+            var now = DateTime.Now;
+            if (photoReady) watermarks.Set(PhotoKey, now);
+            if (usersReady) watermarks.Set(UsersKey, now);
+            if (!_opt.DryRun) watermarks.Save();
+        }
+        else
+        {
+            _log.LogWarning("本轮有 {E} 个错误,不推进水位,下轮将重试", summary.Errors);
+        }
 
         await Task.CompletedTask;
         return summary;
     }
 
-    // GlobalFileLoadOption:供 IsReadyToLoad(ZipFilePath / UpdateWindow / SkipValidation)
-    private GlobalFileLoadOption MakeLoadOption(string zipPath) => new()
+    // GlobalFileLoadOption 是 abstract → 用具体子类实例化(见文件末 PhotoImportLoadOption)。
+    // 已核对属性:ZipFilePath / UpdateTimeWindow / SkipValidation / EnableLoad / FileName。
+    // ⚠️ 注意 R3:类的属性是 UpdateTimeWindow,但 Utility.IsReadyToLoad 读的是 UpdateWindow(不存在),
+    //    两者需先在 Core 里对齐,否则 IsReadyToLoad 本身无法编译。
+    private GlobalFileLoadOption MakeLoadOption(string zipPath) => new PhotoImportLoadOption
     {
-        // TODO: 核对 Core.GlobalFileLoadOption 的真实属性名
         ZipFilePath = zipPath,
-        UpdateWindow = _opt.UpdateWindow,
+        UpdateTimeWindow = _opt.UpdateWindow,
         SkipValidation = _opt.SkipValidation,
+        EnableLoad = true,
+        FileName = Path.GetFileName(zipPath),
     };
 
     /// <summary>§2 BS:解析 users.dsml,取仅 Active 的 MSID,HashSet 天然去重(N4)。</summary>
@@ -103,7 +129,7 @@ public sealed class PhotoImportJob
         XmlParseResult result = XmlHelper<GlobalUserAccount>.ParseXml(usersZip, dsmlName);
 
         var active = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        // TODO: 核对 XmlParseResult 暴露用户集合的属性名(设计里为 UsersDict)
+        // 已核对:XmlParseResult.UsersDict = ConcurrentDictionary<string, GlobalUserAccount>(mail 或 msid 双键)
         foreach (var u in result.UsersDict.Values)
         {
             if (u.EmployeeStatus == EmployeeStatus.Active && !string.IsNullOrWhiteSpace(u.MSID))
@@ -126,7 +152,9 @@ public sealed class PhotoImportJob
             if (!entry.IsFile) continue;
 
             var fileName = Path.GetFileName(entry.Name);
-            if (!ImageExts.Contains(Path.GetExtension(fileName))) { s.Skipped++; continue; }
+            // R7:只接受与 PhotoType 一致的扩展名,避免把 .png 写成内容错配的 .jpg
+            if (!string.Equals(Path.GetExtension(fileName), _opt.PhotoType, StringComparison.OrdinalIgnoreCase))
+            { s.Skipped++; continue; }
 
             // N1:文件名 → msid
             var msid = Path.GetFileNameWithoutExtension(fileName);
@@ -149,7 +177,7 @@ public sealed class PhotoImportJob
             Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
 
             // §3:临时文件 + 原子 Move,避免 API 读到半截
-            var tmp = dest + ".tmp-" + Guid.NewGuid().ToString("N");
+            var tmp = dest + TempSuffix + Guid.NewGuid().ToString("N");
             try
             {
                 using (var fs = File.Create(tmp)) zip.CopyTo(fs);
@@ -220,15 +248,38 @@ public sealed class PhotoImportJob
     private string MaybeCopyToScratch(string zipPath, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(_opt.LocalScratchDir)) return zipPath;
+        if (_opt.DryRun) return zipPath;   // R13:dry-run 直接读原文件,不写 scratch
         Directory.CreateDirectory(_opt.LocalScratchDir);
         var local = Path.Combine(_opt.LocalScratchDir, Path.GetFileName(zipPath));
-        // TODO(可选):加瞬时 IO 重试;仅在 zip 变化时才拷
+        // 仅在 photo zip 变更时才会走到这里(调用方已 R6 gate);TODO(可选):瞬时 IO 重试
         File.Copy(zipPath, local, overwrite: true);
         return local;
+    }
+
+    /// <summary>R11:清理上次崩溃残留的临时文件(不会被对账的 *.jpg 命中,否则会累积)。</summary>
+    private void CleanupOrphanTempFiles(CancellationToken ct)
+    {
+        if (!Directory.Exists(_opt.PhotoFolder)) return;
+        int n = 0;
+        foreach (var f in Directory.EnumerateFiles(_opt.PhotoFolder, "*" + TempSuffix + "*", SearchOption.AllDirectories))
+        {
+            ct.ThrowIfCancellationRequested();
+            if (_opt.DryRun) { n++; continue; }
+            try { File.Delete(f); n++; } catch { /* ignore */ }
+        }
+        if (n > 0) _log.LogInformation("清理孤儿临时文件 {N} 个", n);
     }
 
     private static void TryDelete(string path)
     {
         try { if (File.Exists(path)) File.Delete(path); } catch { /* ignore */ }
     }
+}
+
+/// <summary>
+/// GlobalFileLoadOption 是 abstract,无法直接实例化,这里提供一个可用的具体子类。
+/// (它不含抽象成员,空实现即可。)
+/// </summary>
+internal sealed class PhotoImportLoadOption : GlobalFileLoadOption
+{
 }
