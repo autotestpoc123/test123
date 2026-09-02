@@ -1,4 +1,4 @@
-namespace MorganStanley.COD.FirmwideDirectory.PhotoImportTool;
+namespace COD.FirmwideDirectory.PhotoImportTool;
 
 /// <summary>
 /// 防与上一轮重叠(设计文档 §2 LK / §6 坑1)。用独占创建的 lock 文件实现:
