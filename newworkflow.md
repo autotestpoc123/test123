@@ -79,13 +79,50 @@
 | quarantine 今天 | 保留 | 不动 |
 | 全程 | 计数与上表一致、errors=0 | 落盘/隔离/清理与上表一致 |
 
-**运行**:
+### L2 已生成:`dotnet test` 一条命令自动断言
+
+桩项目 + fixtures + xUnit 断言**已生成**,位置(api 解决方案文件夹下):
+
 ```
-dotnet build
-dotnet run --project COD.FirmwideDirectory.PhotoImportTool           # DryRun=true,核对计数
-dotnet run --project ... -- --PhotoImport:DryRun=false               # 真跑,核对文件系统
+COD.FirmwideDirectory.PhotoImportTool.Verify\
+├── COD.FirmwideDirectory.PhotoImportTool.Verify.csproj   # xUnit;链接 exe 逻辑源 + Fake.Core
+├── FakeCore.cs             # Utility(3 方法)/XmlHelper/PhotoOptions/GlobalFileLoadOption/XmlParseResult/GlobalUserAccount/EmployeeStatus 的假实现
+└── PhotoImportJobTests.cs  # 3 个测试 + 合成 fixtures + 断言(与上面断言表一致)
 ```
-断言方式:比对日志里的 `RunSummary` 计数;真跑后 `ls` 目标目录/quarantine 与期望表逐项对。可进一步写成一个 xUnit 测试项目自动断言。
+
+**运行方式**(在有 .NET SDK 的机器,例如平时 build API 那台):
+
+```powershell
+# 进解决方案文件夹
+cd src\...\FirmwideDirectory.API
+
+# ★ 只针对测试项目跑,别对 .sln 跑(否则会 build exe 里指向未完成 Core 的引用而失败)
+dotnet test .\COD.FirmwideDirectory.PhotoImportTool.Verify\COD.FirmwideDirectory.PhotoImportTool.Verify.csproj
+
+# 只跑单个用例(可选)
+dotnet test .\COD.FirmwideDirectory.PhotoImportTool.Verify\COD.FirmwideDirectory.PhotoImportTool.Verify.csproj `
+  --filter "FullyQualifiedName~RealRun_writes_quarantines_and_purges"
+```
+
+**首次会自动从 nuget.org 还原**:`Microsoft.NET.Test.Sdk` / `xunit` / `xunit.runner.visualstudio` / `SharpZipLib` / `Microsoft.Extensions.Logging.Abstractions`。离线环境需先配好内网 NuGet 源。
+
+**3 个测试**:
+
+| 测试 | 断言要点 |
+|---|---|
+| `DryRun_counts_correct_and_no_side_effects` | ActiveCount=2、DeleteEnabled=true、Updated=1、Skipped=7、Deleted=1、Purged=1;且零副作用(active1 未写、orphanX 仍在、超期批次仍在) |
+| `RealRun_writes_quarantines_and_purges` | Added=1、Skipped=7、Deleted=1、Purged=1;落盘 `A\C\active1.jpg`、active2 未动、orphanX 移入当日隔离、超期批次删除、当天保留、无孤儿 tmp |
+| `Validate_rejects_quarantine_inside_photofolder` | C3:quarantine 在 PhotoFolder 内 → `Validate()` 抛异常 |
+
+**为什么不用等 R1–R4**:`FakeCore.cs` 用与真源码**完全相同的命名空间/签名**提供 Core 表面,并把 `IsReadyToLoad` 实现成意图正确的语义(绕开真源码的 `UpdateWindow`/`_lastLoadTime` bug);csproj **只链接 exe 的逻辑 `.cs`**、不引用真 Core/exe 的 csproj,从而完全隔离未完成的后端,测的仍是 exe 的真实代码。
+
+**期望值来源**:按代码逐路径静态推算(非实跑)。若某条断言失败,多半是环境细节(`entry.Size`、路径大小写),把失败输出发来即可定位。
+
+**手动 DryRun(可跑真 exe 时的备选)**:R1–R4 修好后也可直接跑真 exe——
+```powershell
+dotnet run --project COD.FirmwideDirectory.PhotoImportTool                 # DryRun=true(默认),核对 RunSummary 计数
+dotnet run --project COD.FirmwideDirectory.PhotoImportTool -- --PhotoImport:DryRun=false   # 真跑,核对文件系统
+```
 
 ---
 
