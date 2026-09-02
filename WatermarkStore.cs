@@ -1,6 +1,6 @@
 using System.Text.Json;
 
-namespace MorganStanley.COD.FirmwideDirectory.PhotoImportTool;
+namespace COD.FirmwideDirectory.PhotoImportTool;
 
 /// <summary>
 /// 按 zip 分别持久化 last-load 水位(设计文档 C2)。
