@@ -1,92 +1,66 @@
-# Watch-WeComAuditSource.ps1 现状分析
+:没有 over-architected(架构是干净的),但在若干局部 over-hardened / over-optimized;而且最大的一块复杂度来自一个结构性选择——复用
+  IsReadyToLoad,它本是给轮询服务设计的,套到批处理 exe 上带来了不成比例的复杂度。 需求本身很简单:解压照片到 MSID 分桶 +
+  删非活跃。核心其实不复杂,复杂度基本是迭代 review 一条条累加出来的边界处理。
 
-基于当前代码(`Watch-WeComAuditSource.ps1`)整理,未包含尚未落地的简化方案。
+  先说不算 over-design 的地方(架构层面是克制的)
 
-## 流程图
+  没有 DI 容器、没有插件体系、没有抽象层、没有过早泛化——就是一个类 + 若干方法。复杂度在"边界/优化",不在"架构astronautics"。这点是好的。
 
-```mermaid
-flowchart TD
-    Start([脚本启动]) --> GateThu{是 cycle Thursday?}
-    GateThu -- 否, 未加 -AllowOffDayQaTest --> ExitA[exit 0]
-    GateThu -- 否, 但 AllowOffDayQaTest<br/>+QA环境+指定TaskName --> GateDone
-    GateThu -- 是 --> GateDone{Analysis 和 Validate<br/>都已完成?}
-    GateDone -- 是 --> ExitB[exit 0]
-    GateDone -- 否 --> ResolveExpected[解析 Analysis 期望文件集 ExpectedNames<br/>解析失败则置空, 仅保留慢速路径]
-    ResolveExpected --> GateStopAt{当前时间已过 StopAt?}
-    GateStopAt -- 是 --> ExitC[exit 0]
-    GateStopAt -- 否 --> InitSnap[取初始快照 InitialSnapshot<br/>计算 InitialExtraNames<br/>= 快照中不属于 ExpectedNames 的文件]
-    InitSnap --> Loop{{进入 Poll Loop<br/>每 PollSeconds 一轮, 直到 Now ≥ StopAt}}
+  确实必要、该留的(约占一半)
 
-    Loop --> Retry[重试通道: 读 analysis-retry-state.json<br/>到期且 NextRetryAt 变化 → KickAutoCycle]
-    Retry --> ResolveValidate{ValidateManifestResolved?}
-    ResolveValidate -- 否 --> TryResolve[尝试: Analysis 是否已完成?<br/>是则解析 Validate 期望集合 ValidateExpectedNames<br/>ValidateManifestResolved = true]
-    ResolveValidate -- 是 --> Snap
-    TryResolve --> Snap[取当前快照 Snapshot]
-    Snap -- NAS 不可达 --> Loop
-    Snap -- 成功 --> UpdateState[Update-WatcherState 一轮]
+  ┌───────────────────────────────────────┬────────────────────────────────────────────────┐
+  │                 特性                  │             为什么不是 over-design             │
+  ├───────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ MSID 分桶路径、解压落盘、对账删非活跃 │ 需求本身,且路径必须与 API 读取一致             │
+  ├───────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ 解析 users.dsml 取活跃集              │ 判断"谁非活跃"的唯一依据                       │
+  ├───────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ 临时文件 + 原子 Move                  │ PhotoFolder 被 API 在线读取,防读到半截是真需求 │
+  ├───────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ dry-run                               │ 在生产删照片,预览是廉价且明智的                │
+  ├───────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ 单实例锁                              │ 防重叠跑,廉价                                  │
+  ├───────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ minActiveThreshold 阈值保护           │ DSML 残缺可能误删全量照片,这是真实灾难性风险   │
+  └───────────────────────────────────────┴────────────────────────────────────────────────┘
 
-    UpdateState --> Stability[计算逐文件稳定轮数 Stability]
-    Stability --> Grown{Test-SnapshotGrewOrChanged?<br/>新增/变化=true, 纯删除=false}
-    Grown -- 是 --> Arm[Armed=true, LastChangeAt=Now<br/>action += Activity]
-    Grown -- 否 --> FastCheck
-    Arm --> FastCheck{FastKicked=false<br/>且 ExpectedNames 非空<br/>且 Test-AnalysisSetReady?}
-    FastCheck -- 是 --> DoFast[FastKicked=true<br/>disarm 慢速路径<br/>action=FastKick<br/>本轮提前 return]
-    FastCheck -- 否 --> StartupCheck{StartupExtrasKicked=false<br/>且 ValidateManifestResolved=false<br/>且 InitialExtraNames 非空<br/>且全部仍存在+稳定2轮?}
-    StartupCheck -- 是 --> DoStartup[StartupExtrasKicked=true<br/>action += StartupKick]
-    StartupCheck -- 否 --> ValidateCheck
-    DoStartup --> ValidateCheck{ValidateFastKicked=false<br/>且 ValidateManifestResolved=true<br/>且 ValidateExpectedNames 非空<br/>且 Test-AnalysisSetReady?}
-    ValidateCheck -- 是 --> DoValidate[ValidateFastKicked=true<br/>disarm 慢速路径<br/>action += ValidateFastKick]
-    ValidateCheck -- 否 --> SlowCheck
-    DoValidate --> SlowCheck{Armed 且<br/>Now-LastChangeAt ≥ 静默期?}
-    SlowCheck -- 是 --> DoSlow[Armed=false<br/>action += SlowKick]
-    SlowCheck -- 否 --> Dispatch
-    DoSlow --> Dispatch[按 action 列表逐个<br/>Invoke-KickAutoCycle + 写日志]
-    DoFast --> Dispatch
-    Dispatch --> Loop
+  这些放在"生产目录被在线服务 + 几十万文件 + NAS + 会删数据"的语境下,都是该有的硬化,不是镀金。
 
-    Loop -- Now ≥ StopAt --> ExitD[窗口结束, exit 0<br/>交给 18:00 FinalCheck 兜底]
-```
+  确实 over-design 的地方(按影响排序)
 
-**静默期(SlowCheck 的判断阈值)计算规则**:
-- 默认 = `DebounceSeconds`(300s)。
-- 若 `Armed` 为真,且存在"已知但未到齐的集合"(Analysis 集合在 FastKick 前 / 已解析的 Validate 集合在 ValidateFastKick 前),且当前快照里**没有任何不属于已知集合的文件**,则静默期改为 `DebounceSeconds x PendingManifestWatchdogMultiplier`(6 倍,默认 1800s/30 分钟)。
-- 只要出现任何"意外/命名错误"文件,或没有已知集合处于 pending 状态,立刻退回短静默期(300s)。
+  ① 复用 IsReadyToLoad 做门闸 —— 最大的一块,得不偿失
+  它带来了:双 watermark、UpdateWindow 时间窗、每天一次、< vs <=、以及一大串 review 边界(C2、D2、comment 5、comment
+  7)。这些复杂度几乎全是为了迁就一个不匹配的函数。 一个计划任务驱动的 exe,变更检测本可以是 5 行:"存上次处理的 zip mtime,zip.mtime <= 上次 就跳过"。复用
+  GetUserPhotoFullPath/ParseXml 是对的(单一数据源);复用 IsReadyToLoad 是误用。
 
-## Watcher 覆盖的所有 user case
+  ② quarantine 的"日期分批 + 保留期 + 自动 purge" —— 投机式复杂
+  需求只说"remove if needed"。而照片本就可从 zip 重新生成(误删的活跃用户下轮自动写回),所以这个"可恢复安全网"的价值被高估了。quarantineRetentionDays +
+  分批目录 + purge 步骤,是为边际收益加的配置和代码。硬删、或"移到单个 quarantine 目录 + 人工清理"就够。
 
-### 前置门禁(Gate)
-1. **非 cycle Thursday 启动** → 默认直接 `exit 0`,不产生任何 kick;仅当显式传 `-AllowOffDayQaTest` 且配置 `Environment=QA`、`-TaskName` 为指定的 OffDayQA 名字时才放行,防止 PROD 上误跑。
-2. **当天 Analysis + Validate 已全部完成**(例如周期已被手工跑完,或 watcher 被重复拉起)→ 直接 `exit 0`,不重复 kick、不重复通知。
-3. **启动时窗口已过 `StopAt`**(例如程序启动晚了)→ 不进入 poll loop,直接 `exit 0`,把工作完全交给 18:00 的 FinalCheck。
+  ③ C4c 优化 —— 边际收益,该砍
+  已标"可选/虚线",但它把 deleteEnabled 耦合进了 Upsert。省的只是"给非活跃写盘又删"的一来一回,收益小、增加跨阶段耦合。删掉最干净。
 
-### FAST PATH(Analysis 原始文件)
-4. **窗口开启时 3 个 Analysis 原始文件(csv/两个 xlsx)已经存在**,或期间陆续被运维拷贝齐 → 一旦全部存在且连续 2 轮字节稳定,`FastKick` 立即触发 AutoCycle,不等 debounce。
-5. **上游把 xlsx 错误导出成 `.xls` 扩展名** → `Test-AnalysisSetReady` 同时接受配置名和其 `.xls` 双胞胎作为"该文件已到"的证据,不因扩展名问题误判为"缺文件"(真正的改名由 scheduler 侧 `Rename-MislabeledXlsInputs` 完成)。
+  ④ mtime 增量(size+mtime + 盖时间戳)—— 为极小概率加复杂度
+  真实照片改内容几乎必改字节大小,size-only 漏检概率≈0。mtime 版加了:存 mtime、写后盖时间戳、容差、首轮全量重写、DST 边角。(这条是你在 review 里选的 Option
+  B;技术上正确,但属于"为 0.1% 情况付 100% 复杂度"。)
 
-### SLOW PATH + PENDING MANIFEST WATCHDOG
-6. **运维把 Analysis 3 个文件分批、间隔拷贝**(不是一次性到齐)→ 只要文件夹里没有"意外文件",静默期从 300s 拉长到 1800s,避免每次拷贝间隔都触发一次过早的"缺文件"预警邮件;一旦真正齐全稳定,`FastKick` 会立即触发,不需要等满 30 分钟。
-7. **4 周周期(FourWeekFixedFiles)的 Validate 阶段证据文件到齐更慢** → 同样受益于第 6 点的 30 分钟静默期放宽,运维分批上传 `.msg`/`.png` 证据不会被过早打断。
-8. **文件夹中出现不属于任何已知规则的陌生/命名错误文件** → 视为"意外文件",不适用 30 分钟放宽,走正常 300s 短静默期尽快 `SlowKick`,让 scheduler 的 preflight 校验尽早把问题暴露给运维。
-9. **Validate 阶段的 `.msg`/`.png` 证据被运维手动拷贝进来,但尚未解析出精确期望集合**(或 Validate Fast Path 从未解析成功)→ 慢速路径始终作为兜底,文件夹稳定 debounce 期后触发 `SlowKick`。
-10. **Archive 步骤删除源文件(纯删除)** → `Test-SnapshotGrewOrChanged` 只对新增/内容变化返回 true,单纯的 key 消失不算活动,不会被 Archive 自己的清理动作重新 kick 一遍。
+  ⑤ 变更检测本身的价值存疑
+  如果 global zip 每天都重新生成,那它每天都"变了"→ 每轮都全量处理 → 变更检测基本白费,只是徒增 watermark 机制。它的价值取决于 zip
+  实际更新频率——这个你需要确认。
 
-### STARTUP SAFETY NET
-11. **watcher 启动时(取第一张快照前),文件夹里已经躺着不属于 Analysis 期望集合的文件**(例如凌晨被误放的 `.msg`,或上次运行残留的证据文件)→ 这些文件相对自身 baseline 永远不算"新增",Activity 驱动的慢速路径无法为它们单独 arm;`StartupKick` 单独记录这批文件,只要它们持续存在且稳定 2 轮就单独触发一次,且仅在 Validate manifest 尚未解析时生效,解析后由更精确的 ValidateFastKick/慢速路径接管。
+  一个"最小可行版"长什么样
 
-### VALIDATE FAST PATH
-12. **Analysis 已完成,Validate 阶段动态 `.msg` 规则的确切文件名依赖 Analysis 的 task summary 才能算出**(如 `device-msms`/`mail-msms` 对应的按 BU 命名的报告确认信)→ 每轮尝试解析一次(`Resolve-ValidateFastPathExpectedNames`),解析成功后用与 Analysis 相同的"齐全 + 连续2轮稳定"标准,`ValidateFastKick` 立即触发,不必等满 debounce。
+  配置(folder/photoZip/usersZip/dryRun/threshold) → 取锁
+  → ParseXml 取活跃集 → 阈值守卫
+  → 流式解压:校验 msid → GetUserPhotoFullPath → size 不同则 temp+Move 写
+  → 遍历 PhotoFolder:msid 不在活跃集 → 删除(或移单一 quarantine)
+  → 退出码
+  这大约是当前代码的一半,且满足全部需求。砍掉的是:双 watermark + IsReadyToLoad 门闸、quarantine 分批/保留/purge、C4c、mtime+盖戳、scratch 拷贝、孤儿 tmp
+  清理。
 
-### RETRY CHANNEL
-13. **Analysis 阶段出现瞬时性失败**(scheduler 写入 `analysis-retry-state.json` 及 `NextRetryAt`)→ 每轮检查一次,到点且是尚未处理过的新计划时重新 kick AutoCycle 触发重试,不需要人工介入,也不用等到 18:00 FinalCheck。
+  我的建议
 
-### 健壮性 / 兜底
-14. **NAS/网络抖动导致某一轮 `Get-ChildItem` 失败**(文件夹瞬时不可达)→ `Get-FolderSnapshot` 捕获异常返回 `$null`,当轮直接跳过比较,不会误判为"文件全部被删除",下一轮重试。
-15. **窗口跑到 `StopAt`(默认 18:00)自然结束**,无论文件是否到齐 → 干净退出,交由独立触发的 FinalCheck task 做最后一次状态机执行,未完成则发出一次性升级通知。
-
-## State 字段一览
-
-`LastSnapshot, Stability, LastChangeAt, Armed, FastKicked, ExpectedNames, DebounceSeconds, InitialExtraNames, StartupExtrasKicked, ValidateExpectedNames, ValidateManifestResolved, ValidateFastKicked`
-
-## Action 类型一览
-
-`Activity`(仅记录日志)、`FastKick`、`SlowKick`、`StartupKick`、`ValidateFastKick`,均通过 `Invoke-KickAutoCycle` 调用 `Start-ScheduledTask -TaskName $TaskName` 触发同一个 AutoCycle 任务;重复 kick 无害(cycle guards + 单一 mutex + IgnoreNew)。
+  1. 不必推翻:当前实现是正确且安全的,能上线。over-design 的部分是"多余的稳,不是错"。
+  2. 若在意可维护性,按上面①→⑤的顺序精简。收益最大的是①:把 IsReadyToLoad 门闸换成一行 mtime 比较,能连带消掉 C2/D2/comment 5/7 这一整类复杂度和 bug 面。
+  3. 一个 meta 观察:这轮 11+ 条 review 每条"单独看都合理",但累加起来超过了任务真正需要的——这是典型的 review
+  驱动的镀金(gold-plating)。以后可以设个基线:"这条边界在真实运行环境的发生概率 × 后果,值不值这段代码/配置?"
