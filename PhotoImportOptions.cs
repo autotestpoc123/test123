@@ -16,9 +16,9 @@ public sealed class PhotoImportOptions
     public string UsersZipPath { get; set; } = "";
     public string UsersDsmlName { get; set; } = "users.dsml";
 
-    // —— 调度门闸(交给 Core.Utility.IsReadyToLoad)——
-    public string UpdateWindow { get; set; } = "";      // 例 "01:00-05:00";空=不做时间窗限制
-    public bool SkipValidation { get; set; }
+    // —— 变更门闸 ——
+    // 计划任务管"何时跑";门闸只比较 zip mtime 与上次处理的 mtime。Force=强制处理(手动调试用)。
+    public bool Force { get; set; }
 
     // —— 删除保护 / 演练 ——
     public bool DryRun { get; set; } = true;
