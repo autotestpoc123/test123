@@ -6,7 +6,7 @@ using Microsoft.Extensions.Logging;
 //    统一后应收敛成一个根再简化。
 using MorganStanley.COD.FirmwideDirectory.API.Common;   // Utility       (Utility.cs)
 using FirmwideDirectory.API.Common;                     // XmlHelper<T>  (XmlHelper.cs)
-using COD.FirwideDirectory.API.Models.Options;          // PhotoOptions, GlobalFileLoadOption(注意:命名空间含拼写 "Firwide")
+using COD.FirwideDirectory.API.Models.Options;          // PhotoOptions(注意:命名空间含拼写 "Firwide")
 using COD.FirwideDirectory.API.Models.Primitive;        // XmlParseResult
 using FirmwideDirectory.API.Models;                     // GlobalUserAccount, EmployeeStatus(TODO: 核对真实命名空间)
 
@@ -14,7 +14,7 @@ namespace COD.FirmwideDirectory.PhotoImportTool;
 
 /// <summary>
 /// 业务编排,对应设计文档 §2 主流程 + §3 Upsert + §4 对账/清理。
-/// 复用 Core:Utility.IsReadyToLoad / GetUserPhotoFullPath / IsValidMSIDForPhoto、XmlHelper.ParseXml。
+/// 复用 Core:Utility.GetUserPhotoFullPath / IsValidMSIDForPhoto、XmlHelper.ParseXml(门闸已自带 zip-mtime 比较,不再用 IsReadyToLoad)。
 /// </summary>
 public sealed class PhotoImportJob
 {
@@ -39,21 +39,17 @@ public sealed class PhotoImportJob
         var summary = new RunSummary();
         var watermarks = WatermarkStore.Load(_opt.WatermarkFilePath);
 
-        // —— 门闸(§2 G1 + C2 双水位 + C4a 异常上抛)——
-        var photoOpt = MakeLoadOption(_opt.PhotoZipPath);
-        var usersOpt = MakeLoadOption(_opt.UsersZipPath);
+        // —— 门闸(§2 G1 + C2 分 zip + C4a):比较各 zip 的 mtime 与"上次处理的 zip mtime",'>' 即已变更。
+        //     计划任务管"何时跑",本门闸只管"变没变";Force 可手动强制。缺 zip → 记日志 + 抛(Program 退出≠0)。
+        var (photoChanged, photoMtime) = CheckZip(_opt.PhotoZipPath, PhotoKey, watermarks, "photo zip");
+        var (usersChanged, usersMtime) = CheckZip(_opt.UsersZipPath, UsersKey, watermarks, "users zip");
 
-        // C4a:IsReadyToLoad 对失效 zip 会抛异常 → 各自包 try-catch 记清是哪个 zip,再 rethrow;
-        //      退出码 1 + 释放 lock 由 Program.Main 的外层 catch + `using mutex` 统一处理。
-        bool photoReady = ReadyOrLog(watermarks.Get(PhotoKey), photoOpt, "photo zip");
-        bool usersReady = ReadyOrLog(watermarks.Get(UsersKey), usersOpt, "users zip");
-
-        if (!photoReady && !usersReady)
+        if (!photoChanged && !usersChanged)
         {
             _log.LogInformation("两 zip 均无更新,skip");
             return summary;
         }
-        _log.LogInformation("门闸通过:photoReady={P} usersReady={U}", photoReady, usersReady);
+        _log.LogInformation("门闸通过:photoChanged={P} usersChanged={U}", photoChanged, usersChanged);
 
         // 根目录:R13 dry-run 零副作用,仅非 dry-run 才建;GetUserPhotoFullPath 需要它存在
         if (!_opt.DryRun)
@@ -74,10 +70,10 @@ public sealed class PhotoImportJob
 
         // 一次性枚举 PhotoFolder,供 Upsert 增量 + 对账删除**共用**(避免两次树枚举)。
         // 仅在真会用到时才枚举;对账用"启动前快照"是正确的——本轮 Upsert 新写的都是活跃、无需再删。
-        var snapshot = (photoReady || deleteEnabled) ? SnapshotPhotoFolder(ct) : new List<PhotoFile>();
+        var snapshot = (photoChanged || deleteEnabled) ? SnapshotPhotoFolder(ct) : new List<PhotoFile>();
 
         // —— Upsert(§3):R5 仅当 photo zip 有更新才做,避免为"全部 skip"而白读整个大 NAS zip ——
-        if (photoReady)
+        if (photoChanged)
         {
             CleanupOrphanTempFiles(ct);                               // R11:清理崩溃残留的 tmp
             var photoZip = MaybeCopyToScratch(_opt.PhotoZipPath, ct); // R6/R13:非 dry-run 且 photo 变更时才拷
@@ -95,14 +91,15 @@ public sealed class PhotoImportJob
         // —— quarantine 永久删除(§4.1 PG)——
         PurgeQuarantine(summary, ct);
 
-        // —— 更新水位(C2 + R8:仅在无错误时推进,否则下轮重试)——
-        // 用处理时刻 now 而非 zip mtime:IsReadyToLoad 用严格 '<' 比较,水位须 > zip mtime
-        // 才能让"未变 zip"下轮被 skip。(彻底修复需把 Core 的比较改成 '<=' 并存 zip mtime。)
+        // —— 更新水位(R8:仅在无错误时推进,否则下轮重试)——
+        // 存"本轮处理的那个 zip 的 mtime"(非 now):门闸用 '>' 比较,故未变 zip 下轮 mtime==已存 → skip;
+        // 若 zip 在本轮读完后又被更新,其更大的 mtime 下轮仍 > 已存 → 会处理(无并发漏更新,消解旧 comment 5)。
         if (summary.Errors == 0)
         {
-            var now = DateTime.Now;
-            if (photoReady) watermarks.Set(PhotoKey, now);
-            if (usersReady) watermarks.Set(UsersKey, now);
+            if (photoChanged) watermarks.Set(PhotoKey, photoMtime);
+            // D2:usersMtime 仅在对账真的执行了(deleteEnabled)时才推进;阈值未通过(跳过删除)时不推进,
+            // 留待下轮重试对账,避免"users 版本没被完整处理却把水位推过去"导致漏清理。
+            if (usersChanged && deleteEnabled) watermarks.Set(UsersKey, usersMtime);
             if (!_opt.DryRun) watermarks.Save();
         }
         else
@@ -114,29 +111,19 @@ public sealed class PhotoImportJob
         return summary;
     }
 
-    // GlobalFileLoadOption 是 abstract → 用具体子类实例化(见文件末 PhotoImportLoadOption)。
-    // 已核对属性:ZipFilePath / UpdateWindow / SkipValidation / EnableLoad / FileName。
-    private GlobalFileLoadOption MakeLoadOption(string zipPath) => new PhotoImportLoadOption
+    // 门闸:比较 zip 当前 mtime 与"上次处理的 zip mtime"('>' 即已变更);Force 强制处理。
+    // C4a:缺 zip/不可达 → 记清是哪个 + 抛(退出≠0 + 释放锁交给 Program.Main)。
+    // 注意:File.GetLastWriteTime 对不存在文件不抛、返回 1601 哨兵,故必须显式 File.Exists。
+    private (bool changed, DateTime mtime) CheckZip(string zipPath, string key, WatermarkStore store, string label)
     {
-        ZipFilePath = zipPath,
-        UpdateWindow = _opt.UpdateWindow,
-        SkipValidation = _opt.SkipValidation,
-        EnableLoad = true,
-        FileName = Path.GetFileName(zipPath),
-    };
-
-    // C4a:包一层 try-catch,zip 路径失效时记清是哪个再 rethrow(退出/释放锁交给 Program.Main)。
-    private bool ReadyOrLog(DateTime lastLoad, GlobalFileLoadOption opt, string label)
-    {
-        try
+        if (!File.Exists(zipPath))
         {
-            return Utility.IsReadyToLoad(lastLoad, opt, _log);
+            _log.LogError("门闸失败:{Label} 不可访问 {Zip}", label, zipPath);
+            throw new FileNotFoundException($"{label} not found: {zipPath}", zipPath);
         }
-        catch (Exception ex)
-        {
-            _log.LogError(ex, "门闸失败:{Label} 不可访问 {Zip}", label, opt.ZipFilePath);
-            throw;
-        }
+        var mtime = File.GetLastWriteTime(zipPath);
+        bool changed = _opt.Force || mtime > store.Get(key);
+        return (changed, mtime);
     }
 
     /// <summary>§2 BS:解析 users.dsml,取仅 Active 的 MSID,HashSet 天然去重(N4)。</summary>
@@ -160,9 +147,9 @@ public sealed class PhotoImportJob
     private void UpsertPhotos(string photoZipPath, HashSet<string> activeMsids,
         bool deleteEnabled, IReadOnlyList<PhotoFile> existingSnapshot, RunSummary s, CancellationToken ct)
     {
-        // 从共享快照建 msid→size 内存索引(无额外枚举 / 无每文件 SMB 往返)
-        var existing = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
-        foreach (var pf in existingSnapshot) existing[pf.Msid] = pf.Size;
+        // 从共享快照建 msid→(size,mtime) 内存索引(无额外枚举 / 无每文件 SMB 往返)
+        var existing = new Dictionary<string, (long Size, DateTime Mtime)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var pf in existingSnapshot) existing[pf.Msid] = (pf.Size, pf.Mtime);
 
         using var zip = new ZipInputStream(File.OpenRead(photoZipPath));
         ZipEntry entry;
@@ -188,9 +175,12 @@ public sealed class PhotoImportJob
             try { dest = Utility.GetUserPhotoFullPath(msid, _photoOptions); } // 已按 PhotoType 拼扩展名
             catch (Exception ex) { _log.LogWarning(ex, "算路径失败 msid={Msid}", msid); s.Errors++; continue; }
 
-            // N3:增量——查内存索引(避免每文件 SMB 往返);大小相同则跳过(存疑再比哈希)
-            bool existed = existing.TryGetValue(msid, out var existingSize);
-            if (existed && entry.Size >= 0 && existingSize == entry.Size) { s.Skipped++; continue; }
+            // N3:增量——查内存索引(避免每文件 SMB 往返);大小 + mtime 都一致才 skip。
+            // mtime 依赖写盘后 File.SetLastWriteTime 把 zip 条目时间盖到文件上(见下);容差 2s(DOS 时间粒度)。
+            bool existed = existing.TryGetValue(msid, out var meta);
+            if (existed && entry.Size >= 0 && meta.Size == entry.Size
+                && Math.Abs((meta.Mtime - entry.DateTime).TotalSeconds) <= 2)
+            { s.Skipped++; continue; }
 
             if (_opt.DryRun) { _log.LogDebug("将写入 {Dest}", dest); s.Updated++; continue; }
 
@@ -203,7 +193,10 @@ public sealed class PhotoImportJob
             {
                 using (var fs = File.Create(tmp)) zip.CopyTo(fs);
                 File.Move(tmp, dest, overwrite: true);
+                if (entry.DateTime.Year >= 1980)
+                    File.SetLastWriteTime(dest, entry.DateTime);       // 盖源时间戳,使下轮 size+mtime 比对成立
                 if (existed) s.Updated++; else s.Added++;
+                existing[msid] = (entry.Size, entry.DateTime);         // 更新内存索引:同 zip 重复 msid 第二次即 skip(幂等)
             }
             catch (Exception ex)
             {
@@ -240,7 +233,11 @@ public sealed class PhotoImportJob
         }
     }
 
-    /// <summary>一次性枚举 PhotoFolder(元数据随目录枚举返回,无每文件 SMB 往返),供 Upsert 增量与对账共用。</summary>
+    /// <summary>
+    /// 一次性枚举 PhotoFolder(元数据随目录枚举返回,无每文件 SMB 往返),供 Upsert 增量与对账共用。
+    /// comment 11:此枚举只覆盖 PhotoFolder;依赖 quarantine 在 PhotoFolder **之外**(由 PhotoImportOptions.Validate 前置强校验),
+    /// 否则隔离照片会被再次当成非活跃候选。
+    /// </summary>
     private List<PhotoFile> SnapshotPhotoFolder(CancellationToken ct)
     {
         var list = new List<PhotoFile>();
@@ -249,13 +246,13 @@ public sealed class PhotoImportJob
                      .EnumerateFiles("*" + _opt.PhotoType, SearchOption.AllDirectories))
         {
             ct.ThrowIfCancellationRequested();
-            list.Add(new PhotoFile(fi.FullName, Path.GetFileNameWithoutExtension(fi.Name), fi.Length));
+            list.Add(new PhotoFile(fi.FullName, Path.GetFileNameWithoutExtension(fi.Name), fi.Length, fi.LastWriteTime));
         }
         return list;
     }
 
-    /// <summary>PhotoFolder 里一张已存在照片的快照:路径 + msid + 大小(元数据来自单次枚举)。</summary>
-    private readonly record struct PhotoFile(string Path, string Msid, long Size);
+    /// <summary>PhotoFolder 里一张已存在照片的快照:路径 + msid + 大小 + mtime(元数据来自单次枚举)。</summary>
+    private readonly record struct PhotoFile(string Path, string Msid, long Size, DateTime Mtime);
 
     /// <summary>§4.1 PG:删除 age &gt; retention 的批次目录(真正的永久删除)。</summary>
     private void PurgeQuarantine(RunSummary s, CancellationToken ct)
@@ -288,9 +285,22 @@ public sealed class PhotoImportJob
         if (_opt.DryRun) return zipPath;   // R13:dry-run 直接读原文件,不写 scratch
         Directory.CreateDirectory(_opt.LocalScratchDir);
         var local = Path.Combine(_opt.LocalScratchDir, Path.GetFileName(zipPath));
-        // 仅在 photo zip 变更时才会走到这里(调用方已 R6 gate);TODO(可选):瞬时 IO 重试
-        File.Copy(zipPath, local, overwrite: true);
+        var tmp = local + ".copytmp";
+        // 仅在 photo zip 变更时才会走到这里(调用方已 R6 gate)。§6 坑3:NAS 瞬时 IO 抖动做有限重试;
+        // 先拷到 .copytmp 再原子 rename,避免上次崩溃残留的半截 zip 被本轮读到(comment 9)。
+        RetryIo(() => File.Copy(zipPath, tmp, overwrite: true));
+        RetryIo(() => File.Move(tmp, local, overwrite: true));
         return local;
+    }
+
+    /// <summary>§6 坑3:对 NAS 瞬时 IO 抖动做有限重试(默认 3 次,指数退避 1s/2s)。</summary>
+    private static void RetryIo(Action action, int attempts = 3)
+    {
+        for (int i = 0; ; i++)
+        {
+            try { action(); return; }
+            catch (IOException) when (i < attempts - 1) { Thread.Sleep(1000 << i); }
+        }
     }
 
     /// <summary>R11:清理上次崩溃残留的临时文件(不会被对账的 *.jpg 命中,否则会累积)。</summary>
@@ -311,12 +321,4 @@ public sealed class PhotoImportJob
     {
         try { if (File.Exists(path)) File.Delete(path); } catch { /* ignore */ }
     }
-}
-
-/// <summary>
-/// GlobalFileLoadOption 是 abstract,无法直接实例化,这里提供一个可用的具体子类。
-/// (它不含抽象成员,空实现即可。)
-/// </summary>
-internal sealed class PhotoImportLoadOption : GlobalFileLoadOption
-{
 }
