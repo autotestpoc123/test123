@@ -43,31 +43,45 @@ public static class Program
             return 2;
         }
 
-        // 单实例锁:拿不到说明上一轮仍在跑 → 正常跳过(§2 LK)
-        using var mutex = SingleInstanceLock.TryAcquire(options.LockFilePath);
+        // 单实例锁:拿不到(IOException→null)说明上一轮仍在跑 → 正常跳过(§2 LK)。
+        // 但创建/访问锁文件本身失败(如权限不足)不是"被占用",应作为"无法启动" → 退出 2,而非误当跳过。
+        SingleInstanceLock? mutex;
+        try
+        {
+            mutex = SingleInstanceLock.TryAcquire(options.LockFilePath);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "无法创建/访问锁文件 {Lock}(权限?),无法启动", options.LockFilePath);
+            return 2;
+        }
+
         if (mutex is null)
         {
             logger.LogWarning("上一轮仍在运行(锁被占用),本次跳过。lock={Lock}", options.LockFilePath);
             return 0;
         }
 
-        try
+        using (mutex)
         {
-            var job = new PhotoImportJob(options, logger);
-            var summary = await job.RunAsync(cts.Token);
-            logger.LogInformation("完成:{Summary}", summary);
-            return summary.Errors > 0 ? 1 : 0;
-        }
-        catch (OperationCanceledException)
-        {
-            logger.LogWarning("被取消(停机/超时),本轮未完成;因幂等下次可续跑");
-            return 1;
-        }
-        catch (Exception ex)
-        {
-            // 含 C4a:IsReadyToLoad 对失效 zip 抛异常 → 走这里 → 退出 1,锁在 finally/using 释放
-            logger.LogError(ex, "运行失败");
-            return 1;
+            try
+            {
+                var job = new PhotoImportJob(options, logger);
+                var summary = await job.RunAsync(cts.Token);
+                logger.LogInformation("完成:{Summary}", summary);
+                return summary.Errors > 0 ? 1 : 0;
+            }
+            catch (OperationCanceledException)
+            {
+                logger.LogWarning("被取消(停机/超时),本轮未完成;因幂等下次可续跑");
+                return 1;
+            }
+            catch (Exception ex)
+            {
+                // 含 C4a:IsReadyToLoad 对失效 zip 抛异常 → 走这里 → 退出 1,锁在 using 释放
+                logger.LogError(ex, "运行失败");
+                return 1;
+            }
         }
     }
 }
