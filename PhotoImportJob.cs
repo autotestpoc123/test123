@@ -43,9 +43,10 @@ public sealed class PhotoImportJob
         var photoOpt = MakeLoadOption(_opt.PhotoZipPath);
         var usersOpt = MakeLoadOption(_opt.UsersZipPath);
 
-        // IsReadyToLoad 对失效 zip 会抛异常 → 由 Main 捕获退出 1(C4a)
-        bool photoReady = Utility.IsReadyToLoad(watermarks.Get(PhotoKey), photoOpt, _log);
-        bool usersReady = Utility.IsReadyToLoad(watermarks.Get(UsersKey), usersOpt, _log);
+        // C4a:IsReadyToLoad 对失效 zip 会抛异常 → 各自包 try-catch 记清是哪个 zip,再 rethrow;
+        //      退出码 1 + 释放 lock 由 Program.Main 的外层 catch + `using mutex` 统一处理。
+        bool photoReady = ReadyOrLog(watermarks.Get(PhotoKey), photoOpt, "photo zip");
+        bool usersReady = ReadyOrLog(watermarks.Get(UsersKey), usersOpt, "users zip");
 
         if (!photoReady && !usersReady)
         {
@@ -71,12 +72,16 @@ public sealed class PhotoImportJob
             _log.LogWarning("活跃集 {N} < 阈值 {T},本轮跳过删除阶段(防 DSML 残缺误删)",
                 activeMsids.Count, _opt.MinActiveThreshold);
 
+        // 一次性枚举 PhotoFolder,供 Upsert 增量 + 对账删除**共用**(避免两次树枚举)。
+        // 仅在真会用到时才枚举;对账用"启动前快照"是正确的——本轮 Upsert 新写的都是活跃、无需再删。
+        var snapshot = (photoReady || deleteEnabled) ? SnapshotPhotoFolder(ct) : new List<PhotoFile>();
+
         // —— Upsert(§3):R5 仅当 photo zip 有更新才做,避免为"全部 skip"而白读整个大 NAS zip ——
         if (photoReady)
         {
             CleanupOrphanTempFiles(ct);                               // R11:清理崩溃残留的 tmp
             var photoZip = MaybeCopyToScratch(_opt.PhotoZipPath, ct); // R6/R13:非 dry-run 且 photo 变更时才拷
-            UpsertPhotos(photoZip, activeMsids, deleteEnabled, summary, ct);
+            UpsertPhotos(photoZip, activeMsids, deleteEnabled, snapshot, summary, ct);
         }
         else
         {
@@ -85,7 +90,7 @@ public sealed class PhotoImportJob
 
         // —— 对账删除(§4)——
         if (deleteEnabled)
-            ReconcileDeletes(activeMsids, summary, ct);
+            ReconcileDeletes(activeMsids, snapshot, summary, ct);
 
         // —— quarantine 永久删除(§4.1 PG)——
         PurgeQuarantine(summary, ct);
@@ -110,17 +115,29 @@ public sealed class PhotoImportJob
     }
 
     // GlobalFileLoadOption 是 abstract → 用具体子类实例化(见文件末 PhotoImportLoadOption)。
-    // 已核对属性:ZipFilePath / UpdateTimeWindow / SkipValidation / EnableLoad / FileName。
-    // ⚠️ 注意 R3:类的属性是 UpdateTimeWindow,但 Utility.IsReadyToLoad 读的是 UpdateWindow(不存在),
-    //    两者需先在 Core 里对齐,否则 IsReadyToLoad 本身无法编译。
+    // 已核对属性:ZipFilePath / UpdateWindow / SkipValidation / EnableLoad / FileName。
     private GlobalFileLoadOption MakeLoadOption(string zipPath) => new PhotoImportLoadOption
     {
         ZipFilePath = zipPath,
-        UpdateTimeWindow = _opt.UpdateWindow,
+        UpdateWindow = _opt.UpdateWindow,
         SkipValidation = _opt.SkipValidation,
         EnableLoad = true,
         FileName = Path.GetFileName(zipPath),
     };
+
+    // C4a:包一层 try-catch,zip 路径失效时记清是哪个再 rethrow(退出/释放锁交给 Program.Main)。
+    private bool ReadyOrLog(DateTime lastLoad, GlobalFileLoadOption opt, string label)
+    {
+        try
+        {
+            return Utility.IsReadyToLoad(lastLoad, opt, _log);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "门闸失败:{Label} 不可访问 {Zip}", label, opt.ZipFilePath);
+            throw;
+        }
+    }
 
     /// <summary>§2 BS:解析 users.dsml,取仅 Active 的 MSID,HashSet 天然去重(N4)。</summary>
     private HashSet<string> BuildActiveMsids(string usersZip, string dsmlName)
@@ -139,10 +156,14 @@ public sealed class PhotoImportJob
         return active;
     }
 
-    /// <summary>§3:逐 entry 流式 Upsert。</summary>
+    /// <summary>§3:逐 entry 流式 Upsert。existingSnapshot=启动前 PhotoFolder 快照(共享,避免重复枚举)。</summary>
     private void UpsertPhotos(string photoZipPath, HashSet<string> activeMsids,
-        bool deleteEnabled, RunSummary s, CancellationToken ct)
+        bool deleteEnabled, IReadOnlyList<PhotoFile> existingSnapshot, RunSummary s, CancellationToken ct)
     {
+        // 从共享快照建 msid→size 内存索引(无额外枚举 / 无每文件 SMB 往返)
+        var existing = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        foreach (var pf in existingSnapshot) existing[pf.Msid] = pf.Size;
+
         using var zip = new ZipInputStream(File.OpenRead(photoZipPath));
         ZipEntry entry;
         while ((entry = zip.GetNextEntry()) != null)
@@ -167,9 +188,9 @@ public sealed class PhotoImportJob
             try { dest = Utility.GetUserPhotoFullPath(msid, _photoOptions); } // 已按 PhotoType 拼扩展名
             catch (Exception ex) { _log.LogWarning(ex, "算路径失败 msid={Msid}", msid); s.Errors++; continue; }
 
-            // N3:增量——大小相同则跳过(存疑再比哈希)
-            var fi = new FileInfo(dest);
-            if (fi.Exists && entry.Size >= 0 && fi.Length == entry.Size) { s.Skipped++; continue; }
+            // N3:增量——查内存索引(避免每文件 SMB 往返);大小相同则跳过(存疑再比哈希)
+            bool existed = existing.TryGetValue(msid, out var existingSize);
+            if (existed && entry.Size >= 0 && existingSize == entry.Size) { s.Skipped++; continue; }
 
             if (_opt.DryRun) { _log.LogDebug("将写入 {Dest}", dest); s.Updated++; continue; }
 
@@ -182,7 +203,7 @@ public sealed class PhotoImportJob
             {
                 using (var fs = File.Create(tmp)) zip.CopyTo(fs);
                 File.Move(tmp, dest, overwrite: true);
-                if (fi.Exists) s.Updated++; else s.Added++;
+                if (existed) s.Updated++; else s.Added++;
             }
             catch (Exception ex)
             {
@@ -193,32 +214,48 @@ public sealed class PhotoImportJob
         }
     }
 
-    /// <summary>§4:遍历 PhotoFolder,非活跃 → 移入 quarantine 当日批次目录。</summary>
-    private void ReconcileDeletes(HashSet<string> activeMsids, RunSummary s, CancellationToken ct)
+    /// <summary>§4:遍历共享快照,非活跃 → 移入 quarantine 当日批次目录。</summary>
+    private void ReconcileDeletes(HashSet<string> activeMsids, IReadOnlyList<PhotoFile> snapshot, RunSummary s, CancellationToken ct)
     {
         var batchDir = Path.Combine(_opt.QuarantineDir, DateTime.Now.ToString("yyyy-MM-dd"));
 
-        foreach (var file in Directory.EnumerateFiles(_opt.PhotoFolder, "*" + _opt.PhotoType, SearchOption.AllDirectories))
+        foreach (var pf in snapshot)
         {
             ct.ThrowIfCancellationRequested();
 
-            // N2:用文件名(非文件夹字符)还原 msid
-            var msid = Path.GetFileNameWithoutExtension(file);
-            if (activeMsids.Contains(msid)) continue;
+            // N2:msid 来自文件名(非文件夹字符);活跃则保留
+            if (activeMsids.Contains(pf.Msid)) continue;
 
-            if (_opt.DryRun) { _log.LogDebug("将删除 {File}", file); s.Deleted++; continue; }
+            if (_opt.DryRun) { _log.LogDebug("将删除 {File}", pf.Path); s.Deleted++; continue; }
 
             try
             {
-                var rel = Path.GetRelativePath(_opt.PhotoFolder, file);
+                var rel = Path.GetRelativePath(_opt.PhotoFolder, pf.Path);
                 var target = Path.Combine(batchDir, rel);
                 Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-                File.Move(file, target, overwrite: true);
+                File.Move(pf.Path, target, overwrite: true);
                 s.Deleted++;
             }
-            catch (Exception ex) { _log.LogWarning(ex, "移入 quarantine 失败 {File}", file); s.Errors++; }
+            catch (Exception ex) { _log.LogWarning(ex, "移入 quarantine 失败 {File}", pf.Path); s.Errors++; }
         }
     }
+
+    /// <summary>一次性枚举 PhotoFolder(元数据随目录枚举返回,无每文件 SMB 往返),供 Upsert 增量与对账共用。</summary>
+    private List<PhotoFile> SnapshotPhotoFolder(CancellationToken ct)
+    {
+        var list = new List<PhotoFile>();
+        if (!Directory.Exists(_opt.PhotoFolder)) return list;
+        foreach (var fi in new DirectoryInfo(_opt.PhotoFolder)
+                     .EnumerateFiles("*" + _opt.PhotoType, SearchOption.AllDirectories))
+        {
+            ct.ThrowIfCancellationRequested();
+            list.Add(new PhotoFile(fi.FullName, Path.GetFileNameWithoutExtension(fi.Name), fi.Length));
+        }
+        return list;
+    }
+
+    /// <summary>PhotoFolder 里一张已存在照片的快照:路径 + msid + 大小(元数据来自单次枚举)。</summary>
+    private readonly record struct PhotoFile(string Path, string Msid, long Size);
 
     /// <summary>§4.1 PG:删除 age &gt; retention 的批次目录(真正的永久删除)。</summary>
     private void PurgeQuarantine(RunSummary s, CancellationToken ct)
