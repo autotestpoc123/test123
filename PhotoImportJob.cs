@@ -39,6 +39,10 @@ public sealed class PhotoImportJob
         var summary = new RunSummary();
         var watermarks = WatermarkStore.Load(_opt.WatermarkFilePath);
 
+        // —— quarantine 到期清理(§4.1 PG):独立于变更门闸,**每次调度都执行**。
+        //     否则 zip 长期不变时门闸会 skip 掉整轮 → 到期照片清不掉,违反 SRE"隔离满 1 个月自动删除"。
+        PurgeQuarantine(summary, ct);
+
         // —— 门闸(§2 G1 + C2 分 zip + C4a):比较各 zip 的 mtime 与"上次处理的 zip mtime",'>' 即已变更。
         //     计划任务管"何时跑",本门闸只管"变没变";Force 可手动强制。缺 zip → 记日志 + 抛(Program 退出≠0)。
         var (photoChanged, photoMtime) = CheckZip(_opt.PhotoZipPath, PhotoKey, watermarks, "photo zip");
@@ -64,6 +68,8 @@ public sealed class PhotoImportJob
         // —— 阈值 → deleteEnabled(§2 TH + D1)——
         bool deleteEnabled = activeMsids.Count >= _opt.MinActiveThreshold;
         summary.DeleteEnabled = deleteEnabled;
+        // 注:阈值持续不达标时,usersChanged 恒为 true(D2 不推进 usersMtime)→ 每轮都重解析 DSML + 建快照。
+        //     这是**预期的重试**(直到活跃集恢复健康),不是性能 bug;每轮告警也便于发现 DSML/阈值配置问题。
         if (!deleteEnabled)
             _log.LogWarning("活跃集 {N} < 阈值 {T},本轮跳过删除阶段(防 DSML 残缺误删)",
                 activeMsids.Count, _opt.MinActiveThreshold);
@@ -88,12 +94,11 @@ public sealed class PhotoImportJob
         if (deleteEnabled)
             ReconcileDeletes(activeMsids, snapshot, summary, ct);
 
-        // —— quarantine 永久删除(§4.1 PG)——
-        PurgeQuarantine(summary, ct);
-
         // —— 更新水位(R8:仅在无错误时推进,否则下轮重试)——
         // 存"本轮处理的那个 zip 的 mtime"(非 now):门闸用 '>' 比较,故未变 zip 下轮 mtime==已存 → skip;
         // 若 zip 在本轮读完后又被更新,其更大的 mtime 下轮仍 > 已存 → 会处理(无并发漏更新,消解旧 comment 5)。
+        // 已知且可接受的 TOCTOU:photoMtime 在门闸时刻捕获,若 NAS zip 在"门闸→读取/拷贝"的数秒窗内被更新,
+        // 我们处理的是新版但记的是旧 mtime → 下轮判"已变更"再多跑一次(方向安全:宁可多跑不漏跑,增量会跳过未变照片)。
         if (summary.Errors == 0)
         {
             if (photoChanged) watermarks.Set(PhotoKey, photoMtime);
@@ -147,9 +152,9 @@ public sealed class PhotoImportJob
     private void UpsertPhotos(string photoZipPath, HashSet<string> activeMsids,
         bool deleteEnabled, IReadOnlyList<PhotoFile> existingSnapshot, RunSummary s, CancellationToken ct)
     {
-        // 从共享快照建 msid→(size,mtime) 内存索引(无额外枚举 / 无每文件 SMB 往返)
-        var existing = new Dictionary<string, (long Size, DateTime Mtime)>(StringComparer.OrdinalIgnoreCase);
-        foreach (var pf in existingSnapshot) existing[pf.Msid] = (pf.Size, pf.Mtime);
+        // 从共享快照建 msid→size 内存索引(无额外枚举 / 无每文件 SMB 往返)
+        var existing = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        foreach (var pf in existingSnapshot) existing[pf.Msid] = pf.Size;
 
         using var zip = new ZipInputStream(File.OpenRead(photoZipPath));
         ZipEntry entry;
@@ -168,19 +173,18 @@ public sealed class PhotoImportJob
             var msid = Path.GetFileNameWithoutExtension(fileName);
             if (msid.Length < 2 || !Utility.IsValidMSIDForPhoto(msid)) { s.Skipped++; continue; }
 
-            // C4c(可选):阈值通过且非活跃 → 不写(对账会删已存在的)
+            // C4c(载荷性,勿删):阈值通过且非活跃 → 不写。对账遍历"启动前快照",若此处写了非活跃文件,
+            //   本轮对账看不到它 → 漏删一轮;不写才使"单快照对账"正确(兼省"写了又删")。
             if (deleteEnabled && !activeMsids.Contains(msid)) { s.Skipped++; continue; }
 
             string dest;
             try { dest = Utility.GetUserPhotoFullPath(msid, _photoOptions); } // 已按 PhotoType 拼扩展名
             catch (Exception ex) { _log.LogWarning(ex, "算路径失败 msid={Msid}", msid); s.Errors++; continue; }
 
-            // N3:增量——查内存索引(避免每文件 SMB 往返);大小 + mtime 都一致才 skip。
-            // mtime 依赖写盘后 File.SetLastWriteTime 把 zip 条目时间盖到文件上(见下);容差 2s(DOS 时间粒度)。
-            bool existed = existing.TryGetValue(msid, out var meta);
-            if (existed && entry.Size >= 0 && meta.Size == entry.Size
-                && Math.Abs((meta.Mtime - entry.DateTime).TotalSeconds) <= 2)
-            { s.Skipped++; continue; }
+            // N3:增量——查内存索引(避免每文件 SMB 往返);size-only 快检(同 rsync --size-only)。
+            // 刻意取舍:真实照片改内容几乎必改字节数,"同 size 换内容"概率≈0;引入 mtime 打戳/容差/DST 边角不划算(over-design ④)。
+            bool existed = existing.TryGetValue(msid, out var existingSize);
+            if (existed && entry.Size >= 0 && existingSize == entry.Size) { s.Skipped++; continue; }
 
             if (_opt.DryRun) { _log.LogDebug("将写入 {Dest}", dest); s.Updated++; continue; }
 
@@ -193,10 +197,8 @@ public sealed class PhotoImportJob
             {
                 using (var fs = File.Create(tmp)) zip.CopyTo(fs);
                 File.Move(tmp, dest, overwrite: true);
-                if (entry.DateTime.Year >= 1980)
-                    File.SetLastWriteTime(dest, entry.DateTime);       // 盖源时间戳,使下轮 size+mtime 比对成立
                 if (existed) s.Updated++; else s.Added++;
-                existing[msid] = (entry.Size, entry.DateTime);         // 更新内存索引:同 zip 重复 msid 第二次即 skip(幂等)
+                existing[msid] = entry.Size;   // 更新内存索引:同 zip 重复 msid 第二次同尺寸即 skip(幂等)
             }
             catch (Exception ex)
             {
@@ -246,13 +248,13 @@ public sealed class PhotoImportJob
                      .EnumerateFiles("*" + _opt.PhotoType, SearchOption.AllDirectories))
         {
             ct.ThrowIfCancellationRequested();
-            list.Add(new PhotoFile(fi.FullName, Path.GetFileNameWithoutExtension(fi.Name), fi.Length, fi.LastWriteTime));
+            list.Add(new PhotoFile(fi.FullName, Path.GetFileNameWithoutExtension(fi.Name), fi.Length));
         }
         return list;
     }
 
-    /// <summary>PhotoFolder 里一张已存在照片的快照:路径 + msid + 大小 + mtime(元数据来自单次枚举)。</summary>
-    private readonly record struct PhotoFile(string Path, string Msid, long Size, DateTime Mtime);
+    /// <summary>PhotoFolder 里一张已存在照片的快照:路径 + msid + 大小(元数据来自单次枚举)。</summary>
+    private readonly record struct PhotoFile(string Path, string Msid, long Size);
 
     /// <summary>§4.1 PG:删除 age &gt; retention 的批次目录(真正的永久删除)。</summary>
     private void PurgeQuarantine(RunSummary s, CancellationToken ct)
