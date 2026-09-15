@@ -77,4 +77,17 @@ public static class XmlPhotoReader
     /// <summary>按固定格式解析 LastModifiedTime;失败抛 <see cref="FormatException"/>,由调用方计数 + 跳过。</summary>
     public static DateTimeOffset ParseLastModified(string raw)
         => DateTimeOffset.ParseExact(raw, LastModifiedFormat, CultureInfo.InvariantCulture, DateTimeStyles.None);
+
+    /// <summary>
+    /// 解码 Image Base64 → 字节。容错:部分导出把 Base64 按 76 列折行,
+    /// 而 <see cref="Convert.FromBase64String"/> 对内嵌空白严格(抛 <see cref="FormatException"/>)→ 先剥空白再解码。
+    /// 空白从不是 Base64 有效数据,剥除安全。无空白的常见情形零额外分配。
+    /// </summary>
+    public static byte[] DecodeImage(string base64)
+    {
+        var cleaned = base64.Any(char.IsWhiteSpace)
+            ? string.Concat(base64.Where(c => !char.IsWhiteSpace(c)))
+            : base64;
+        return Convert.FromBase64String(cleaned);
+    }
 }
