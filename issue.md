@@ -92,3 +92,34 @@
   2. QuarantineDir 落在卷子目录、非卷根(避开 ~snapshot);这条其实是配置纪律,不用改代码。
 
   要不要我把第 1 点(删前清 ReadOnly + 更清楚地把"卡住原因"打进日志,便于区分是占用/只读/超长/快照)加进 PurgeQuarantine?小改动,能让到期清理在遇到 ReadOnly 时自愈,而不是每轮报错重试。
+
+   样本额外暴露的三件事(直接影响实现,必须写进文档):
+
+  1. 元素名是完整点分名:SoftwareHouse.NextGen.Common.SecurityObjects.Personnel / …Images(无 xmlns 前缀,整串就是 LocalName)。reader 必须按这个长字符串匹配,不能找 <Personnel>/<Images>。
+  2. <Image> 出现在 <LastModifiedTime> 之前(样本第 17 行 vs 第 20 行)——这正好坐实了三.2"必须缓存 Base64 字符串":前向 reader 读到大 Image 时还不知道 LMT,只能先把 Image 当字符串拿着,读到 LMT
+  与 manifest 比完再决定要不要 Convert.FromBase64String。
+  3. 有两个时间戳:ImageCaptureDate(3:26:18)和 LastModifiedTime(3:26:20)。增量版本必须取 LastModifiedTime,别拿错成 ImageCaptureDate。
+
+  顺带确认无害的两点:Image 以 /9j/ 开头 = JPEG 魔数(FFD8),与 .jpg 一致;根节点 culture-info="en-US",月/日/AM-PM 按 en-US。
+
+  三.1 的解析配方现在可以钉死(样本已确认格式):
+  DateTimeOffset.ParseExact(v, "M/d/yyyy h:mm:ss tt 'GMT'zzz",
+      CultureInfo.InvariantCulture, DateTimeStyles.None)   // 单数字用 M/d/h,'GMT' 当字面量,zzz 吃 +08:00
+  // 落 manifest 用 .ToUniversalTime() 的 "o" round-trip 串
+
+  ---
+  下一轮开工,还需要你确认这几样
+
+  样本到位后,外部材料只剩两类:一个老阻塞 + 几个业务确认。
+
+  A. 老阻塞(与 XML 无关,但不解决则整个 exe 编不过,XML 是搭在它上面的):
+  1. Utility.EnsurePhotoFolderGrid / Utility.RetryIo 的着落——Core 里现在有没有现成的 IO 重试工具?
+    - 有 → 给我它的类型名 + 文件位置,我对齐复用;
+    - 没有 → 给我一句 greenlight,我在 Core.Utility 里按 SMB 抖动风格写一个 RetryIo,并实现 EnsurePhotoFolderGrid(预建 36×36 网格 + 哨兵 fast-path)。
+    - 另外确认:真 Core 项目(MorganStanley.COD.FirmwideDirectory.Core)本轮会在分支里吗? 不在的话,我就先在 Verify(FakeCore) 项目里落实现 + 跑测试(XML reader 不依赖
+  GlobalUserAccount,CrossFire≠DSML,能自足)。
+
+  B. 业务确认(几分钟就能定,决定 reader 边角):
+  2. XmlPhotoPath 是单个文件还是一个目录?(样本是单文件多 Personnel;门闸按文件 mtime。若是目录/多文件,门闸和读取循环要改。)
+  3. XML 的 <Image> 是否恒为 JPEG? 我们把它按 PhotoType(.jpg)落盘、没有原始扩展名可校验。恒 JPEG → 直接写;可能混 PNG → 落盘前加魔数判别。
+  4. LastModifiedTime 的偏移是否恒为 GMT+HH:mm?(会不会出现裸 +08:00、Z、或负偏移?)——恒定则上面那条 ParseExact 就够;有变体我加一条兜底解析。
