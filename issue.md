@@ -30,3 +30,65 @@
 
   -  1. 补 xmlMsids 每轮构建(第二节)——这是唯一的正确性硬伤。
 
+
+
+ 分两块答:先说 Thumbs.db 在本工具的删除路径里到底有没有影响,再说手动删不掉文件夹的排查处理。
+
+  一、Thumbs.db 这类隐藏文件在删除时有没有影响?
+
+  先分清工具里两条不同的"删除":
+
+  1. ReconcileDeletes(非活跃照片 → quarantine):基本无影响。
+  它做的是 File.Move(pf.Path, target),而 pf 只来自 list(已被 PhotoType 扩展名过滤)。Thumbs.db 根本不在被搬运列表里,既不会被移动、也不会被计数,更不会删文件夹(它搬的是单个
+  jpg,不是目录)。所以隐藏文件对这条路零影响。
+
+  2. PurgeQuarantine(到期批次目录 → Directory.Delete(dir, recursive:true)):这里才可能被"目录内的文件"卡住。 但要分清哪种属性会卡:
+
+  ┌──────────┬─────────────────────────────────────────┐
+  │   属性   │ 是否阻止 Directory.Delete / File.Delete │
+  ├──────────┼─────────────────────────────────────────┤
+  │ Hidden   │ 否                                      │
+  ├──────────┼─────────────────────────────────────────┤
+  │ System   │ 否                                      │
+  ├──────────┼─────────────────────────────────────────┤
+  │ ReadOnly │ 是 → 抛 UnauthorizedAccessException     │
+  └──────────┴─────────────────────────────────────────┘
+
+  Thumbs.db 是 Hidden+System、通常不带 ReadOnly → Directory.Delete(recursive:true) 会正常把它一起删掉,不阻塞。真正会卡住递归删除的是 ReadOnly 文件、被占用的文件句柄、超长路径、以及 NetApp
+  的 ~snapshot(见下)。
+
+  ▎ 现状:PurgeQuarantine 已经 try/catch——删不掉就 LogWarning + Errors++,水位不推进、下轮重试。所以偶发占用能自愈;但永久卡住(如 ReadOnly / 超长路径)会每轮都报错重试,需要人工介入。
+
+  二、手动删不掉文件夹,按这个顺序查
+
+  Windows / NAS(SMB)上"文件夹删不掉"绝大多数是下面四类,从最常见往下:
+
+  ① 文件被进程占用(最常见) — "操作无法完成,因为文件已在另一程序中打开"
+  - 找占用者:资源监视器 → CPU → "关联的句柄"里搜文件夹名;或 Sysinternals handle.exe:
+  handle.exe -nobanner "C:\path\to\folder"
+  - 典型元凶:资源管理器缩略图预览、杀毒扫描、Windows Search 索引、或这个照片工具自己正在跑(拿着句柄)。关掉对应进程再删。
+
+  ② ReadOnly 属性 — 递归清掉再删:
+  attrib -r -s -h /s /d "C:\path\to\folder\*"
+  rmdir /s /q "C:\path\to\folder"
+  PowerShell 版:Get-ChildItem -LiteralPath $p -Recurse -Force | ForEach-Object { $_.Attributes = 'Normal' }
+
+  ③ 路径超长(>260 字符) — NAS 上深层网格路径 \\host\photos\A\B\.... 容易触发。用 \\?\ 前缀或 robocopy 空目录镜像法:
+  robocopy "C:\empty_tmp" "C:\path\to\folder" /MIR
+  rmdir /s /q "C:\path\to\folder"
+  (先建个空目录 C:\empty_tmp,/MIR 把目标清空,再 rmdir。)
+
+  ④ 目录里含 ~snapshot(NetApp 特有,最容易被忽略) — 这是只读快照,客户端根本删不了,它会让父目录显示非空、删除失败。
+  - 处理:不能从客户端删。需要存储管理员在 filer 上过期/删除对应 snapshot,或在卷/qtree 层处理。你在 Windows 里对含 ~snapshot 的目录 rmdir 一定失败,别再试。
+  - 这也是本工具枚举时目录级剪枝 ~snapshot 的原因——工具不碰它;但如果你的 QuarantineDir 恰好设在某个卷根,批次目录可能"看见"卷级 ~snapshot,导致 PurgeQuarantine 删不掉。建议 QuarantineDir
+  不要放在卷根,放在卷下的子目录,就不会在批次目录里遇到 ~snapshot。
+
+  ⑤ 权限/ACL — 对 NAS 共享没有 delete 权限。用运行工具的服务账号验证 icacls "path",确认有删除权。
+
+  三、给工具的两点加固(可选)
+
+  如果你希望 PurgeQuarantine 更皮实,不用每次人工兜:
+  1. 删前清 ReadOnly:递归遍历把属性置 Normal 再 Directory.Delete(挡住 ReadOnly 这类硬阻塞)。
+  2. QuarantineDir 落在卷子目录、非卷根(避开 ~snapshot);这条其实是配置纪律,不用改代码。
+
+  要不要我把第 1 点(删前清 ReadOnly + 更清楚地把"卡住原因"打进日志,便于区分是占用/只读/超长/快照)加进 PurgeQuarantine?小改动,能让到期清理在遇到 ReadOnly 时自愈,而不是每轮报错重试。
