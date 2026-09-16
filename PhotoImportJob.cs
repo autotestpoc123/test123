@@ -41,7 +41,7 @@ public sealed class PhotoImportJob
         _manifestPath = opt.ResolveManifestPath();
     }
 
-    public async Task<RunSummary> Run(CancellationToken ct)
+    public RunSummary Run(CancellationToken ct)
     {
         var summary = new RunSummary();
         var watermarks = WatermarkStore.Load(_opt.WatermarkFilePath);
@@ -126,7 +126,8 @@ public sealed class PhotoImportJob
         {
             // 盘上已存在集(msid):用于把 XML 写盘精确分类为 XmlUpdated(覆盖)/ XmlAdded(新文件),使 NasPhotoCount 精确。
             var onDiskMsids = new HashSet<string>(snapshot.Select(p => p.Msid), StringComparer.OrdinalIgnoreCase);
-            Time("UpsertXmlPhotos", () => UpsertXmlPhotos(xmlMsids, onDiskMsids, summary, ct));
+            // applyWrites=xmlChanged:zip-only 轮(仅 photoChanged)只扫覆盖集不写盘;xml 变更(含 Force)才解码写盘(§5.3)。
+            Time("UpsertXmlPhotos", () => UpsertXmlPhotos(xmlMsids, onDiskMsids, activeMsids, deleteEnabled, xmlChanged, summary, ct));
         }
 
         // —— zip Upsert(§3):R5 仅当 photo zip 有更新才做,避免为"全部 skip"而白读整个大 NAS zip;排除 XML 覆盖 msid ——
@@ -253,6 +254,14 @@ public sealed class PhotoImportJob
             bool existed = existing.TryGetValue(msid, out var existingSize);
             if (existed && entry.Size >= 0 && existingSize == entry.Size) { s.Skipped++; continue; }
 
+            if (_opt.DryRun)
+            {
+                // R13:dry-run 零副作用——只计 would-write、不落盘(与 §4 对账/§5 XML upsert 的 dry-run 语义一致)。
+                _log.LogDebug("将写入 {Dest}", dest);
+                s.Updated++;
+                continue;
+            }
+
             //Grid is precreated; CreateDestFile only mkdirs on DirectoryNotFound(before zip copyto)
             var tmp = dest + TempSuffix + Guid.NewGuid().ToString("N");
             try
@@ -277,73 +286,94 @@ public sealed class PhotoImportJob
     /// 覆盖集与"是否重写"解耦:只要该 msid 在 XML 有有效 Image 就进覆盖集(供 zip 排除),
     /// 是否 Convert.FromBase64String + 写盘则看 LastModifiedTime 是否前进。落盘复用 zip 同款 tmp + 原子 File.Move。
     /// </summary>
-    private void UpsertXmlPhotos(HashSet<string> xmlMsids, IReadOnlySet<string> onDiskMsids, RunSummary s, CancellationToken ct)
+    private void UpsertXmlPhotos(HashSet<string> xmlMsids, IReadOnlySet<string> onDiskMsids,
+        HashSet<string> activeMsids, bool deleteEnabled, bool applyWrites, RunSummary s, CancellationToken ct)
     {
         var manifest = AppliedManifestStore.Load(_manifestPath);
         bool anyApplied = false;
 
-        foreach (var rec in XmlPhotoReader.Read(_opt.XmlPhotoPath!))
+        try
         {
-            ct.ThrowIfCancellationRequested();
-
-            var msid = rec.Msid;
-            // GetUserPhotoFullPath 需要 msid[0]/[1] → 至少 2 字符;规则同 zip 侧。
-            if (msid.Length < 2 || !Utility.IsValidMSIDForPhoto(msid)) { s.XmlSkipped++; continue; }
-
-            DateTimeOffset lmt;
-            try { lmt = XmlPhotoReader.ParseLastModified(rec.LastModifiedRaw); }
-            catch (FormatException ex)
+            foreach (var rec in XmlPhotoReader.Read(_opt.XmlPhotoPath!))
             {
-                _log.LogWarning(ex, "XML LastModifiedTime 解析失败 msid={Msid} raw={Raw},跳过", msid, rec.LastModifiedRaw);
-                s.XmlSkipped++; continue;
-            }
+                ct.ThrowIfCancellationRequested();
 
-            // 覆盖集:不论本轮是否重写,只要 XML 有该 msid 的有效照片,zip 都要排除它。
-            xmlMsids.Add(msid);
+                var msid = rec.Msid;
+                // GetUserPhotoFullPath 需要 msid[0]/[1] → 至少 2 字符;规则同 zip 侧。非法 msid 连覆盖都不算(zip 也会 skip)。
+                if (msid.Length < 2 || !Utility.IsValidMSIDForPhoto(msid)) { s.XmlSkipped++; continue; }
 
-            // 增量:manifest 未记录过,或 XML 版本前进 → 才解码重写;否则跳过(同尺寸换图靠版本捕获,不靠 size)。
-            var prev = manifest.Get(msid);
-            if (prev is not null && lmt <= prev.Version) { s.XmlSkipped++; continue; }
+                // review#1:覆盖集判据 = "XML 有该人有效 Image",先于 LMT 解析/写盘门控 Add,保证 zip 永不覆盖 XML。
+                xmlMsids.Add(msid);
 
-            string dest;
-            try { dest = Utility.GetUserPhotoFullPath(msid, _photoOptions); }
-            catch (Exception ex) { _log.LogWarning(ex, "算路径失败(xml) msid={Msid}", msid); s.Errors++; continue; }
+                // review#4:写盘门控——只有 xml 门闸通过(applyWrites,含 Force)才解码/写盘;
+                //   zip-only 轮到此为止,只贡献覆盖集,不解码不写(与"zip-only 只解析不解码"一致,兼修 manifest 损坏时的全量重写)。
+                if (!applyWrites) { s.XmlSkipped++; continue; }
 
-            byte[] bytes;
-            try { bytes = XmlPhotoReader.DecodeImage(rec.ImageBase64); }
-            catch (FormatException ex) { _log.LogWarning(ex, "XML Image Base64 解码失败 msid={Msid},跳过", msid); s.XmlSkipped++; continue; }
+                // review#2:与 zip 对称的 C4c——阈值通过且非活跃 → 不写(对账用启动前快照,此处写新文件本轮看不到 → 留孤儿)。
+                //   上面的 Add 仍保留:非活跃 msid 的 zip 侧 C4c 也会 skip,双重保险。
+                if (deleteEnabled && !activeMsids.Contains(msid)) { s.XmlSkipped++; continue; }
 
-            // 计数按"盘上是否已存在"分类(与 zip 的 Added/Updated 同义),使 NasPhotoCount 精确不重复计数。
-            bool onDisk = onDiskMsids.Contains(msid);
+                // review#1:LMT 缺失/畸形不阻止 overlay(已 Add),仅无法版本门控 → 跳过写盘并告警。
+                if (string.IsNullOrEmpty(rec.LastModifiedRaw))
+                { _log.LogWarning("XML 无 LastModifiedTime msid={Msid},跳过写盘(仍覆盖 zip)", msid); s.XmlSkipped++; continue; }
+                DateTimeOffset lmt;
+                try { lmt = XmlPhotoReader.ParseLastModified(rec.LastModifiedRaw); }
+                catch (FormatException ex)
+                {
+                    _log.LogWarning(ex, "XML LastModifiedTime 解析失败 msid={Msid} raw={Raw},跳过写盘(仍覆盖 zip)", msid, rec.LastModifiedRaw);
+                    s.XmlSkipped++; continue;
+                }
 
-            if (_opt.DryRun)
-            {
-                _log.LogDebug("将写入(xml) {Dest} ({N} bytes, v={V:o})", dest, bytes.Length, lmt);
-                if (onDisk) s.XmlUpdated++; else s.XmlAdded++;
-                continue;   // R13:dry-run 零副作用,不写盘、不动 manifest
-            }
+                // 增量:manifest 未记录过,或 XML 版本前进 → 才解码重写;否则跳过(同尺寸换图靠版本捕获,不靠 size)。
+                var prev = manifest.Get(msid);
+                if (prev is not null && lmt <= prev.Version) { s.XmlSkipped++; continue; }
 
-            var tmp = dest + TempSuffix + Guid.NewGuid().ToString("N");
-            try
-            {
-                // XML 是内存 Base64,直接写目标网格的 tmp 再同卷原子 Move(不经 staging NAS,§5)。
-                using (var fs = CreateDestFile(tmp, Path.GetDirectoryName(dest)!)) fs.Write(bytes, 0, bytes.Length);
-                Utility.RetryIo(() => File.Move(tmp, dest, overwrite: true));
-                if (onDisk) s.XmlUpdated++; else s.XmlAdded++;
-                manifest.Set(msid, new AppliedManifestStore.Entry { Source = "xml", Version = lmt, Size = bytes.Length });
-                anyApplied = true;
-            }
-            catch (Exception ex)
-            {
-                _log.LogWarning(ex, "写盘失败(xml) dest={Dest}", dest);
-                TryDelete(tmp);
-                s.Errors++;
+                string dest;
+                try { dest = Utility.GetUserPhotoFullPath(msid, _photoOptions); }
+                catch (Exception ex) { _log.LogWarning(ex, "算路径失败(xml) msid={Msid}", msid); s.Errors++; continue; }
+
+                byte[] bytes;
+                try { bytes = XmlPhotoReader.DecodeImage(rec.ImageBase64); }
+                catch (FormatException ex) { _log.LogWarning(ex, "XML Image Base64 解码失败 msid={Msid},跳过", msid); s.XmlSkipped++; continue; }
+
+                // 计数按"盘上是否已存在"分类(与 zip 的 Added/Updated 同义),使 NasPhotoCount 精确不重复计数。
+                bool onDisk = onDiskMsids.Contains(msid);
+
+                if (_opt.DryRun)
+                {
+                    _log.LogDebug("将写入(xml) {Dest} ({N} bytes, v={V:o})", dest, bytes.Length, lmt);
+                    if (onDisk) s.XmlUpdated++; else s.XmlAdded++;
+                    continue;   // R13:dry-run 零副作用,不写盘、不动 manifest
+                }
+
+                var tmp = dest + TempSuffix + Guid.NewGuid().ToString("N");
+                try
+                {
+                    // XML 是内存 Base64,直接写目标网格的 tmp 再同卷原子 Move(不经 staging NAS,§5)。
+                    using (var fs = CreateDestFile(tmp, Path.GetDirectoryName(dest)!)) fs.Write(bytes, 0, bytes.Length);
+                    Utility.RetryIo(() => File.Move(tmp, dest, overwrite: true));
+                    if (onDisk) s.XmlUpdated++; else s.XmlAdded++;
+                    manifest.Set(msid, new AppliedManifestStore.Entry { Source = "xml", Version = lmt, Size = bytes.Length });
+                    anyApplied = true;
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "写盘失败(xml) dest={Dest}", dest);
+                    TryDelete(tmp);
+                    s.Errors++;
+                }
             }
         }
+        catch (OperationCanceledException) { throw; }   // 取消照常向上传播(优雅停机)
+        catch (Exception ex) when (ex is System.Xml.XmlException || ex is IOException || ex is UnauthorizedAccessException)
+        {
+            // review#3 / §7:XML 解析中途出错(截断/坏节点/不可读)不掀翻整轮——已收集的覆盖集保留(zip 对已见 msid 仍 skip),
+            //   计 Errors(→ 三源水位都不推进,下轮重试),然后正常返回让 zip upsert 照走。
+            _log.LogWarning(ex, "XML 解析中断,已收集 {N} 个覆盖 msid;本轮不再处理 XML,zip 照常", xmlMsids.Count);
+            s.Errors++;
+        }
 
-        // 只在真有成功写入时保存(原子 tmp+Move)。manifest 仅在 Set 成功项后写,
-        // 故即便本轮有个别写盘失败,保存的也精确反映盘上已应用的项——失败项未 Set,下轮凭 xml 水位未推进而重试。
-        // 保存失败不掀翻整轮:计入 Errors(→ 不推进任何水位、下轮重试),让本轮 zip/对账结果仍能收尾。
+        // 成功写入的项即便本轮后续解析出错也要落 manifest(Save 内部已 原子 + 重试),精确反映盘上已应用。
         if (anyApplied && !_opt.DryRun)
         {
             try { manifest.Save(); }
