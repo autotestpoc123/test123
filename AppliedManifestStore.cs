@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using MorganStanley.COD.FirmwideDirectory.API.Common;   // Utility.RetryIo(SMB 抖动重试,与照片落盘同一套)
 
 namespace COD.FirmwideDirectory.PhotoImportTool;
 
@@ -7,11 +8,12 @@ namespace COD.FirmwideDirectory.PhotoImportTool;
 /// 人级"已应用"清单(§5):msid → {source, version, size}。与 <see cref="WatermarkStore"/> 是两种数据:
 /// 水位是**源文件级 mtime**(photoZip/usersZip/xmlPhoto),这份是**每个 msid 上次落盘的版本**,故独立一份文件、不混进水位。
 ///
-/// 语义(overlay 模式):这份文件的 key 集合 = 当前由 XML 覆盖的 msid 集(zip-only 不入清单,文件不膨胀到全员)。
-/// XML 侧增量以 <see cref="Entry.Version"/>(=LastModifiedTime)前进为准;size-only 不足以判"同尺寸换图"。
+/// 定位:这是 XML 侧的**增量/版本缓存**,不是覆盖集的真相来源——**每轮的 XML 覆盖集(xmlMsids)由 reader 重新扫出**,
+/// 不能拿本清单的 key 当"当前覆盖集"或 zip 的 skip 集(否则离开 XML 的人删不掉 key 会永远错误挡住 zip)。
+/// 增量判定:以 <see cref="Entry.Version"/>(=LastModifiedTime)前进为准;size-only 不足以判"同尺寸换图"。
 ///
-/// 落盘用 tmp + 原子 File.Move(区别于 WatermarkStore 的直接覆盖写):清单损坏 = 整个 XML 覆盖集丢失、
-/// 下轮全量重解码重写,代价远大于水位损坏,故值得原子写。
+/// 落盘用 tmp + 原子 File.Move + SMB 有限重试(区别于 WatermarkStore 的直接覆盖写):清单损坏 = 下轮 XML 全量重解码重写,
+/// 代价远大于水位损坏,故值得原子写 + 重试。
 /// </summary>
 public sealed class AppliedManifestStore
 {
@@ -63,13 +65,24 @@ public sealed class AppliedManifestStore
     /// <summary>当前清单里的 msid 数(= 当前由 XML 覆盖的照片数)。</summary>
     public int Count => _map.Count;
 
-    /// <summary>原子写:先落 tmp,再同目录 File.Move 覆盖,避免崩溃留半截 JSON。</summary>
+    /// <summary>
+    /// 原子写:先落 tmp,再同目录 File.Move 覆盖,避免崩溃留半截 JSON。
+    /// Move 对瞬时 SMB 抖动做有限重试(review#6,与照片落盘同一套);任何失败都清掉半截 tmp 再上抛,不留孤儿。
+    /// </summary>
     public void Save()
     {
         var dir = Path.GetDirectoryName(_path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
         var tmp = _path + TempSuffix + Guid.NewGuid().ToString("N");
-        File.WriteAllText(tmp, JsonSerializer.Serialize(_map, JsonOpts));
-        File.Move(tmp, _path, overwrite: true);
+        try
+        {
+            File.WriteAllText(tmp, JsonSerializer.Serialize(_map, JsonOpts));
+            Utility.RetryIo(() => File.Move(tmp, _path, overwrite: true));
+        }
+        catch
+        {
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* ignore */ }
+            throw;
+        }
     }
 }
