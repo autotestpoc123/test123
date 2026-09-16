@@ -31,8 +31,9 @@ public static class XmlPhotoReader
     // 单数字月/日/时 → M/d/h;'GMT' 当字面量;zzz 吃 "+08:00"。culture-info=en-US → InvariantCulture 足够。
     private const string LastModifiedFormat = "M/d/yyyy h:mm:ss tt 'GMT'zzz";
 
-    /// <summary>一条带照片的 Personnel 记录(原始字段,未解码/未校验,交调用方处理)。</summary>
-    public readonly record struct Record(string Msid, string LastModifiedRaw, string ImageBase64);
+    /// <summary>一条带照片的 Personnel 记录(原始字段,未解码/未校验,交调用方处理)。
+    /// LastModifiedRaw 可空:overlay 判据是"有 Image",LMT 缺失只影响能否版本门控写盘,不影响覆盖。</summary>
+    public readonly record struct Record(string Msid, string? LastModifiedRaw, string ImageBase64);
 
     /// <summary>流式读取;仅产出"有 msid 且有非空 Image + LastModifiedTime"的记录,无照片者(缺 Images 块)自然略过。</summary>
     public static IEnumerable<Record> Read(string xmlPath)
@@ -60,9 +61,9 @@ public static class XmlPhotoReader
                 var imageB64 = ((string?)images?.Element("Image"))?.Trim();
                 var lmtRaw = ((string?)images?.Element("LastModifiedTime"))?.Trim();
 
-                if (!string.IsNullOrEmpty(msid)
-                    && !string.IsNullOrEmpty(imageB64)
-                    && !string.IsNullOrEmpty(lmtRaw))
+                // 产出判据 = "有 msid 且有非空 Image"(overlay 覆盖判据,§4)。
+                // LastModifiedTime 缺失/畸形不在此拦截 → 交调用方:仍覆盖 zip、只跳过版本门控写盘(§3/review#1)。
+                if (!string.IsNullOrEmpty(msid) && !string.IsNullOrEmpty(imageB64))
                 {
                     yield return new Record(msid, lmtRaw, imageB64);
                 }
