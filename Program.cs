@@ -95,3 +95,7 @@ public static class Program
       if (r.LocalName=="Text2") Console.WriteLine(r.ReadElementContentAsString());
       else r.Skip();
   }
+
+Get-ChildItem $HOME -Recurse -Filter *.csproj -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match 'repro' -or $_.LastWriteTime -gt (Get-Date).AddHours(-6) } |
+    Select-Object FullName, LastWriteTime
