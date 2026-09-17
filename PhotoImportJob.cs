@@ -291,10 +291,18 @@ public sealed class PhotoImportJob
     {
         var manifest = AppliedManifestStore.Load(_manifestPath);
         bool anyApplied = false;
+        HashSet<string>? onDiskMsids = applyWrites
+             ? new HashSet<string>(snapshot.Select(p => p.Msid), StringComparer.OrdinalIgnoreCase)
+             : null;
 
         try
         {
-            foreach (var rec in XmlPhotoReader.Read(_opt.XmlPhotoPath!))
+            // includeImage=applyWrites:zip-only 轮(仅扫覆盖集)不物化 Image/Thumbnail Base64;xml 变更轮才取 Image。
+            // onExtraImages:同一人多条 Images 取第一条并告警(§7)。
+            foreach (var rec in XmlPhotoReader.Read(
+                         _opt.XmlPhotoPath!,
+                         includeImage: applyWrites,
+                         onExtraImages: msid => _log.LogWarning("XML 同一人多条 Images,取第一条 msid={Msid}", m)))
             {
                 ct.ThrowIfCancellationRequested();
 
@@ -365,7 +373,7 @@ public sealed class PhotoImportJob
             }
         }
         catch (OperationCanceledException) { throw; }   // 取消照常向上传播(优雅停机)
-        catch (Exception ex) when (ex is System.Xml.XmlException || ex is IOException || ex is UnauthorizedAccessException)
+        catch (Exception ex) when (ex is System.Xml.XmlException || ex is InvalidOperationException || ex is IOException || ex is UnauthorizedAccessException)
         {
             // review#3 / §7:XML 解析中途出错(截断/坏节点/不可读)不掀翻整轮——已收集的覆盖集保留(zip 对已见 msid 仍 skip),
             //   计 Errors(→ 三源水位都不推进,下轮重试),然后正常返回让 zip upsert 照走。
