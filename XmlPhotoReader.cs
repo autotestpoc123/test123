@@ -1,6 +1,5 @@
 using System.Globalization;
 using System.Xml;
-using System.Xml.Linq;
 
 namespace COD.FirmwideDirectory.PhotoImportTool;
 
@@ -18,9 +17,15 @@ namespace COD.FirmwideDirectory.PhotoImportTool;
 ///               └─ LastModifiedTime  = XML 侧增量版本
 ///
 /// 关键实现取舍:
-///  - 逐 Personnel 用 <see cref="XNode.ReadFrom"/> 物化(一次一人),不把整份文件/全部 Base64 一次性载入内存。
-///  - 样本里 &lt;Image&gt; 出现在 &lt;LastModifiedTime&gt; 之前,前向 reader 读到大 Image 时还不知版本;
-///    故本 reader 只负责把 Image 当**字符串**取出(便宜),是否 Convert.FromBase64String 由调用方按版本比较后决定(§3.2)。
+///  - 纯 <see cref="XmlReader"/> 逐 Personnel 子节点前进,不物化整棵(否则 Thumbnail/Image 两段 Base64 每人都进托管堆)。
+///    未知子节点一律 <see cref="XmlReader.Skip"/>。
+///  - 样本里 &lt;Image&gt; 在 &lt;LastModifiedTime&gt; 之前,前向 reader 读到大 Image 时还不知版本;
+///    includeImage=true 时把 Image 当字符串取出(相对解码方便),是否 FromBase64 由调用方按版本决定。
+///    includeImage=false(只收覆盖集,不写盘)时对 Image/Thumbnail/LMT 一律 Skip,连字符串都不持有,
+///    仅凭 Image 元素是否非空判定覆盖。
+///
+/// 推进契约:每个 handler(ReadElementContentAsString / Skip / ReadImages)返回时 reader 已越过其所处元素,
+/// 停在下一个兄弟节点或父级 EndElement;子循环仅在**非元素**节点上 Read(),避免二次前进漏节点。
 /// </summary>
 public static class XmlPhotoReader
 {
@@ -32,11 +37,16 @@ public static class XmlPhotoReader
     private const string LastModifiedFormat = "M/d/yyyy h:mm:ss tt 'GMT'zzz";
 
     /// <summary>一条带照片的 Personnel 记录(原始字段,未解码/未校验,交调用方处理)。
-    /// LastModifiedRaw 可空:overlay 判据是"有 Image",LMT 缺失只影响能否版本门控写盘,不影响覆盖。</summary>
+    /// LastModifiedRaw 可空:overlay 判据是"有 Image",LMT 缺失只影响能否版本门控写盘,不影响覆盖。
+    /// includeImage=false 时 ImageBase64 为空串(调用方不得解码)。</summary>
     public readonly record struct Record(string Msid, string? LastModifiedRaw, string ImageBase64);
 
-    /// <summary>流式读取;仅产出"有 msid 且有非空 Image + LastModifiedTime"的记录,无照片者(缺 Images 块)自然略过。</summary>
-    public static IEnumerable<Record> Read(string xmlPath)
+    /// <summary>
+    /// 流式读取;仅产出"有 msid 且有非空 Image"的记录,无照片者(缺 Images 块)自然略过。
+    /// <paramref name="includeImage"/>==false 时不持有 Image/Thumbnail/LMT 文本,只按 Image 元素是否非空判定覆盖。
+    /// 同一 Personnel 出现多条 Images 时取第一条,并通过 <paramref name="onExtraImages"/> 告知(msid;无 Text2 则空串)。
+    /// </summary>
+    public static IEnumerable<Record> Read(string xmlPath, bool includeImage = true, Action<string>? onExtraImages = null)
     {
         var settings = new XmlReaderSettings
         {
@@ -50,22 +60,20 @@ public static class XmlPhotoReader
         reader.MoveToContent();
         while (!reader.EOF)
         {
-            // 只在 Personnel 起始节点物化整棵子树;ReadFrom 会把 reader 推进到该元素之后的下一个节点,
-            // 故这里**不能**再无脑 reader.Read(),否则会跳过紧邻的下一条 Personnel。
-            if (reader.NodeType == XmlNodeType.Element && reader.LocalName == PersonnelElement)
+            if (reader.NodeType == XmlNodeType.Element)
             {
-                var personnel = (XElement)XNode.ReadFrom(reader);
-
-                var msid = ((string?)personnel.Element("Text2"))?.Trim();
-                var images = personnel.Element(ImagesElement);
-                var imageB64 = ((string?)images?.Element("Image"))?.Trim();
-                var lmtRaw = ((string?)images?.Element("LastModifiedTime"))?.Trim();
-
-                // 产出判据 = "有 msid 且有非空 Image"(overlay 覆盖判据,§4)。
-                // LastModifiedTime 缺失/畸形不在此拦截 → 交调用方:仍覆盖 zip、只跳过版本门控写盘(§3/review#1)。
-                if (!string.IsNullOrEmpty(msid) && !string.IsNullOrEmpty(imageB64))
+                if (reader.LocalName == PersonnelElement)
                 {
-                    yield return new Record(msid, lmtRaw, imageB64);
+                    var rec = ReadPersonnel(reader, includeImage, out var extraImages, out var msidForWarn);
+                    if (extraImages)
+                        onExtraImages?.Invoke(msidForWarn);
+                    if (rec is not null)
+                        yield return rec.Value;
+                    // ReadPersonnel 已把 reader 推进到 </Personnel> 之后 → 本分支不再 Read()。
+                }
+                else
+                {
+                    reader.Skip();   // 顶层未知元素:整棵跳过,不下钻(采纳 review#4,比 Read() 干净)
                 }
             }
             else
@@ -73,6 +81,120 @@ public static class XmlPhotoReader
                 reader.Read();
             }
         }
+    }
+
+    /// <summary>reader 位于 Personnel 起始节点;返回时位于该元素之后(与原 ReadFrom 推进规则相同)。</summary>
+    private static Record? ReadPersonnel(XmlReader reader, bool includeImage, out bool extraImages, out string msidForWarn)
+    {
+        extraImages = false;
+        msidForWarn = "";
+
+        string? msid = null;
+        string? imageBase64 = null;
+        string? lmtRaw = null;
+        bool hasImage = false;
+        int imagesBlocks = 0;
+
+        if (reader.IsEmptyElement)
+        {
+            reader.Read();          // 空 <Personnel/>:越过自身
+            return null;
+        }
+
+        int depth = reader.Depth;   // Personnel 起始节点深度,用于识别其 EndElement
+        reader.Read();              // 进入第一个子节点(无子节点则直接是 </Personnel>)
+        // !reader.EOF 是防御:良构 XML 必到 </Personnel>;截断文件会先抛 XmlException,此处兜住任何静默 EOF 不空转。
+        while (!reader.EOF && !(reader.NodeType == XmlNodeType.EndElement && reader.Depth == depth))
+        {
+            if (reader.NodeType != XmlNodeType.Element)
+            {
+                reader.Read();      // 非元素节点(文本等):前进
+                continue;
+            }
+
+            // 分派发生在起始元素上;各分支自行前进过该元素,故本轮结束不再 Read()。
+            switch (reader.LocalName)
+            {
+                case "Text2":
+                    msid = reader.ReadElementContentAsString().Trim();   // 读文本并前进过 </Text2>
+                    msidForWarn = msid;
+                    break;
+                case ImagesElement:
+                    if (++imagesBlocks == 1)
+                        ReadImages(reader, includeImage, ref hasImage, ref imageBase64, ref lmtRaw);  // 前进过 </Images>
+                    else
+                    {
+                        extraImages = true;
+                        reader.Skip();   // 多余 Images 块:整块跳过
+                    }
+                    break;
+                default:
+                    reader.Skip();       // 其他元素(Name/FirstName/…):整棵跳过
+                    break;
+            }
+        }
+        reader.Read();              // 越过 </Personnel>,停到其后(维持推进契约)
+
+        if (string.IsNullOrWhiteSpace(msid) || !hasImage)
+            return null;            // 无 msid 或无照片 → 不产出
+        return new Record(msid, lmtRaw, includeImage ? (imageBase64 ?? "") : "");
+    }
+
+    /// <summary>reader 位于 Images 起始节点;返回时位于该元素之后。Thumbnail/ImageCaptureDate/未知子节点一律 Skip。</summary>
+    private static void ReadImages(XmlReader reader, bool includeImage, ref bool hasImage, ref string? imageBase64, ref string? lmtRaw)
+    {
+        if (reader.IsEmptyElement)
+        {
+            reader.Read();          // 空 <Images/>:越过自身
+            return;
+        }
+
+        int depth = reader.Depth;   // Images 起始节点深度
+        reader.Read();              // 进入第一个子节点
+        while (!reader.EOF && !(reader.NodeType == XmlNodeType.EndElement && reader.Depth == depth))
+        {
+            if (reader.NodeType != XmlNodeType.Element)
+            {
+                reader.Read();
+                continue;
+            }
+
+            switch (reader.LocalName)
+            {
+                case "Image":
+                    if (hasImage)
+                    {
+                        reader.Skip();       // 已取第一条 Image,后续忽略
+                        break;
+                    }
+                    if (includeImage)
+                    {
+                        var s = reader.ReadElementContentAsString().Trim();   // 前进过 </Image>
+                        if (s.Length > 0)
+                        {
+                            hasImage = true;
+                            imageBase64 = s;
+                        }
+                    }
+                    else
+                    {
+                        // 只需知道"有无非空 Image",不持有内容:present 非自闭元素即算覆盖。
+                        hasImage = !reader.IsEmptyElement;
+                        reader.Skip();       // 前进过该 Image(不读 Base64)
+                    }
+                    break;
+                case "LastModifiedTime":
+                    if (includeImage)
+                        lmtRaw = reader.ReadElementContentAsString().Trim();  // 前进过 </LastModifiedTime>
+                    else
+                        reader.Skip();       // 覆盖集轮次不需要版本
+                    break;
+                default:
+                    reader.Skip();           // Thumbnail / ImageCaptureDate / 未知:整棵跳过,不进托管堆
+                    break;
+            }
+        }
+        reader.Read();              // 越过 </Images>,停到其后
     }
 
     /// <summary>按固定格式解析 LastModifiedTime;失败抛 <see cref="FormatException"/>,由调用方计数 + 跳过。</summary>
