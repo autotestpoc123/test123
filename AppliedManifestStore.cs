@@ -62,6 +62,22 @@ public sealed class AppliedManifestStore
 
     public void Set(string msid, Entry entry) => _map[msid] = entry;
 
+    /// <summary>删除已经不在当前 XML 覆盖集中的历史条目，返回删除数量。</summary>
+    public int RemoveMissing(IReadOnlySet<string> currentXmlMsids)
+    {
+        var removed = 0;
+        foreach (var msid in _map.Keys.Where(msid => !currentXmlMsids.Contains(msid)).ToArray())
+        {
+            if (_map.Remove(msid)) removed++;
+        }
+        return removed;
+    }
+
+    public void Clear() => _map.Clear();
+
+    /// <summary>当前已成功应用的 XML MSID 快照；解析失败时用于继续保护盘上 XML 照片不被 zip 覆盖。</summary>
+    public IReadOnlySet<string> Msids => new HashSet<string>(_map.Keys, StringComparer.OrdinalIgnoreCase);
+
     /// <summary>当前清单里的 msid 数(= 当前由 XML 覆盖的照片数)。</summary>
     public int Count => _map.Count;
 
