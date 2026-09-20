@@ -1,313 +1,119 @@
-using System.Globalization;
-using System.Xml;
+using System.Text;
+using Xunit;
 
-namespace COD.FirmwideDirectory.PhotoImportTool;
+namespace COD.FirmwideDirectory.PhotoImportTool.IntegrationTests;
 
 /// <summary>
-/// 流式解析 CrossFire 单文件 XML(多条 Personnel),产出带照片的记录。对应设计文档 §3。
-///
-/// 结构(已按 mock_photo.xml 核实):
-///   CrossFire
-///     └─ SoftwareHouse.NextGen.Common.SecurityObjects.Personnel   (点分名即 LocalName,无 xmlns)
-///          ├─ Text2                                                = msid
-///          └─ SoftwareHouse.NextGen.Common.SecurityObjects.Images  (有照片才出现;无照片者整块缺失)
-///               ├─ Image             = 权威 JPEG(Base64),落盘用这个
-///               ├─ Thumbnail         = 门户派生预览,忽略
-///               ├─ ImageCaptureDate  = 拍摄时间,忽略(勿当版本)
-///               └─ LastModifiedTime  = XML 侧增量版本
-///
-/// 关键实现取舍:
-///  - 纯 <see cref="XmlReader"/> 逐 Personnel 子节点前进,不物化整棵(否则 Thumbnail/Image 两段 Base64 每人都进托管堆)。
-///    未知子节点一律 <see cref="XmlReader.Skip"/>。
-///  - 样本里 &lt;Image&gt; 在 &lt;LastModifiedTime&gt; 之前,前向 reader 读到大 Image 时还不知版本;
-///    includeImage=true 时把 Image 当字符串取出(相对解码方便),是否 FromBase64 由调用方按版本决定。
-///    includeImage=false(只收覆盖集,不写盘)时对 Image/Thumbnail/LMT 一律 Skip,连字符串都不持有,
-///    仅凭 Image 元素是否非空判定覆盖。
-///
-/// 推进契约:每个 handler(ReadElementContentAsString / Skip / ReadImages)返回时 reader 已越过其所处元素,
-/// 停在下一个兄弟节点或父级 EndElement;子循环仅在**非元素**节点上 Read(),避免二次前进漏节点。
+/// XmlPhotoReader 属 PhotoImportTool 自身(不依赖 Core),此处用内联 XML 自包含验证。
+/// 与 Verify 同源;放在真 Core 工程里可确认 exe 引用链下也照样编得过、跑得通。无需外部样本。
 /// </summary>
-public static class XmlPhotoReader
+public class XmlPhotoReaderTests
 {
-    private const string PersonnelElement = "SoftwareHouse.NextGen.Common.SecurityObjects.Personnel";
-    private const string ImagesElement = "SoftwareHouse.NextGen.Common.SecurityObjects.Images";
+    private const string Personnel = "SoftwareHouse.NextGen.Common.SecurityObjects.Personnel";
+    private const string Images = "SoftwareHouse.NextGen.Common.SecurityObjects.Images";
 
-    // LastModifiedTime 固定格式(已确认):例 "8/4/2026 3:26:20 PM GMT+08:00"。
-    // 单数字月/日/时 → M/d/h;'GMT' 当字面量;zzz 吃 "+08:00"。culture-info=en-US → InvariantCulture 足够。
-    private const string LastModifiedFormat = "M/d/yyyy h:mm:ss tt 'GMT'zzz";
-
-    /// <summary>一条带照片的 Personnel 记录(原始字段,未解码/未校验,交调用方处理)。
-    /// LastModifiedRaw 可空:overlay 判据是"有 Image",LMT 缺失只影响能否版本门控写盘,不影响覆盖。
-    /// includeImage=false 时 ImageBase64 为空串(调用方不得解码)。</summary>
-    public readonly record struct Record(string Msid, string? LastModifiedRaw, string ImageBase64);
-    public readonly record struct Metadata(string Msid, string? LastModifiedRaw);
-
-    /// <summary>
-    /// 流式读取;仅产出"有 msid 且有非空 Image"的记录,无照片者(缺 Images 块)自然略过。
-    /// <paramref name="includeImage"/>==false 时不持有 Image/Thumbnail/LMT 文本,只按 Image 元素是否非空判定覆盖。
-    /// 同一 Personnel 出现多条 Images 时取第一条,并通过 <paramref name="onExtraImages"/> 告知(msid;无 Text2 则空串)。
-    /// </summary>
-    public static IEnumerable<Record> Read(string xmlPath, bool includeImage = true, Action<string>? onExtraImages = null)
+    private static string WriteXml(string content)
     {
-        using var stream = new FileStream(xmlPath, FileMode.Open, FileAccess.Read, FileShare.Read);
-        foreach (var record in ReadCore(
-                     stream, _ => includeImage, readLastModified: includeImage,
-                     onExtraImages, CancellationToken.None))
-            yield return record;
+        var dir = Path.Combine(Path.GetTempPath(), "pit-xr-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, "photos.xml");
+        File.WriteAllText(path, content);
+        return path;
     }
 
-    /// <summary>
-    /// 第一阶段：完整扫描并验证 XML，只保留 msid/版本元数据，不物化 Image Base64。
-    /// 方法返回前已经读到文档末尾，因此任何 malformed XML 都会在产生写盘副作用前抛出。
-    /// </summary>
-    public static IReadOnlyList<Metadata> Scan(
-        Stream xmlStream,
-        Action<string>? onExtraImages = null,
-        CancellationToken cancellationToken = default)
-        => ReadCore(xmlStream, _ => false, readLastModified: true, onExtraImages, cancellationToken)
-            .Select(record => new Metadata(record.Msid, record.LastModifiedRaw))
-            .ToList();
-
-    /// <summary>
-    /// 第二阶段：重新扫描同一稳定流，只物化写入计划选中的人员 Image；其他 Image 仅流式判空。
-    /// 调用方须在调用前把可 Seek 的流重置到起点。
-    /// </summary>
-    public static IEnumerable<Record> ReadSelected(
-        Stream xmlStream,
-        IReadOnlySet<string> selectedMsids,
-        Action<string>? onExtraImages = null,
-        CancellationToken cancellationToken = default)
-        => ReadCore(xmlStream, selectedMsids.Contains, readLastModified: false, onExtraImages, cancellationToken);
-
-    private static IEnumerable<Record> ReadCore(
-        Stream xmlStream,
-        Func<string, bool> includeImageForMsid,
-        bool readLastModified,
-        Action<string>? onExtraImages,
-        CancellationToken cancellationToken)
+    [Fact]
+    public void Reads_personnel_with_image_and_skips_those_without()
     {
-        var settings = new XmlReaderSettings
+        var b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes("IMG"));
+        var xml = WriteXml($"""
+            <CrossFire>
+              <{Personnel}><Text2>7G754</Text2></{Personnel}>
+              <{Personnel}>
+                <Text2>58MVN</Text2>
+                <{Images}>
+                  <Image>{b64}</Image>
+                  <LastModifiedTime>8/4/2026 3:26:20 PM GMT+08:00</LastModifiedTime>
+                </{Images}>
+              </{Personnel}>
+            </CrossFire>
+            """);
+        try
         {
-            IgnoreComments = true,
-            IgnoreProcessingInstructions = true,
-            IgnoreWhitespace = true,
-            DtdProcessing = DtdProcessing.Prohibit,
-            XmlResolver = null,
-            CloseInput = false,
-        };
-        using var reader = XmlReader.Create(xmlStream, settings);
-
-        reader.MoveToContent();
-        while (!reader.EOF)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (reader.NodeType == XmlNodeType.Element)
-            {
-                if (reader.LocalName == PersonnelElement)
-                {
-                    var rec = ReadPersonnel(
-                        reader, includeImageForMsid, readLastModified,
-                        out var extraImages, out var msidForWarn);
-                    if (extraImages)
-                        onExtraImages?.Invoke(msidForWarn);
-                    if (rec is not null)
-                        yield return rec.Value;
-                    // ReadPersonnel 已把 reader 推进到 </Personnel> 之后 → 本分支不再 Read()。
-                }
-                // CrossFire 是包含 Personnel 的容器。这里不能 Skip，否则在根节点就会把
-                // 整棵文档跳过；逐节点前进，直到遇到 Personnel 再由专用 reader 消费整段。
-                else if (!reader.Read()) break;
-            }
-            else if (!reader.Read()) break;
+            var rec = Assert.Single(XmlPhotoReader.Read(xml).ToList());
+            Assert.Equal("58MVN", rec.Msid);                                    // 7G754 无 Image → 不产出
+            Assert.Equal("IMG", Encoding.UTF8.GetString(XmlPhotoReader.DecodeImage(rec.ImageBase64)));
+            Assert.Equal("8/4/2026 3:26:20 PM GMT+08:00", rec.LastModifiedRaw);
         }
+        finally { TryDeleteParent(xml); }
     }
 
-    /// <summary>reader 位于 Personnel 起始节点;返回时位于该元素之后(与原 ReadFrom 推进规则相同)。</summary>
-    private static Record? ReadPersonnel(
-        XmlReader reader,
-        Func<string, bool> includeImageForMsid,
-        bool readLastModified,
-        out bool extraImages,
-        out string msidForWarn)
+    [Fact]
+    public void Uses_Image_not_Thumbnail_regardless_of_order()
     {
-        extraImages = false;
-        msidForWarn = "";
-        string? msid = null;
-        string? imageBase64 = null;
-        string? lmtRaw = null;
-        bool hasImage = false;
-        int imagesBlocks = 0;
-
-        if (reader.IsEmptyElement)
+        var img = Convert.ToBase64String(Encoding.UTF8.GetBytes("REAL"));
+        var thumb = Convert.ToBase64String(Encoding.UTF8.GetBytes("THUMB"));
+        var xml = WriteXml($"""
+            <CrossFire>
+              <{Personnel}>
+                <Text2>USER01</Text2>
+                <{Images}>
+                  <Thumbnail>{thumb}</Thumbnail>
+                  <Image>{img}</Image>
+                </{Images}>
+              </{Personnel}>
+            </CrossFire>
+            """);
+        try
         {
-            reader.Read();          // 空 <Personnel/>:越过自身
-            return null;
+            var rec = Assert.Single(XmlPhotoReader.Read(xml).ToList());
+            Assert.Equal("REAL", Encoding.UTF8.GetString(XmlPhotoReader.DecodeImage(rec.ImageBase64)));  // 取 Image 非 Thumbnail
         }
-
-        int depth = reader.Depth;   // Personnel 起始节点深度,用于识别其 EndElement
-        reader.Read();              // 进入第一个子节点(无子节点则直接是 </Personnel>)
-        // !reader.EOF 是防御:良构 XML 必到 </Personnel>;截断文件会先抛 XmlException,此处兜住任何静默 EOF 不空转。
-        while (!reader.EOF && !(reader.NodeType == XmlNodeType.EndElement && reader.Depth == depth))
-        {
-            if (reader.NodeType != XmlNodeType.Element)
-            {
-                if(!reader.Read()) break;      // 非元素节点(文本等):前进
-                continue;
-            }
-
-            // 分派发生在起始元素上;各分支自行前进过该元素,故本轮结束不再 Read()。
-            switch (reader.LocalName)
-            {
-                case "Text2":
-                    msid = reader.ReadElementContentAsString().Trim();   // 读文本并前进过 </Text2>
-                    msidForWarn = msid;
-                    break;
-                case ImagesElement:
-                    if (++imagesBlocks == 1)
-                    {
-                        // CrossFire 当前结构中 Text2 位于 Images 之前，故此处已能按 msid 判断是否物化 Image。
-                        bool includeImage = includeImageForMsid(msid ?? "");
-                        ReadImages(reader, includeImage, readLastModified,
-                            ref hasImage, ref imageBase64, ref lmtRaw);  // 前进过 </Images>
-                    }
-                    else
-                    {
-                        extraImages = true;
-                        reader.Skip();   // 多余 Images 块:整块跳过
-                    }
-                    break;
-                default:
-                    reader.Skip();       // 其他元素(Name/FirstName/…):整棵跳过
-                    break;
-            }
-        }
-        if (reader.NodeType == XmlNodeType.EndElement)
-            reader.Read();          // 越过 </Personnel>,停到其后
-
-        if (string.IsNullOrWhiteSpace(msid) || !hasImage)
-            return null;            // 无 msid 或无照片 → 不产出
-        return new Record(msid, lmtRaw, imageBase64 ?? "");
+        finally { TryDeleteParent(xml); }
     }
 
-    /// <summary>reader 位于 Images 起始节点;返回时位于该元素之后。Thumbnail/ImageCaptureDate/未知子节点一律 Skip。</summary>
-    private static void ReadImages(
-        XmlReader reader,
-        bool includeImage,
-        bool readLastModified,
-        ref bool hasImage,
-        ref string? imageBase64,
-        ref string? lmtRaw)
+    [Fact]
+    public void Overlay_scan_ignores_empty_and_whitespace_images()
     {
-        if (reader.IsEmptyElement)
+        var xml = WriteXml($"""
+            <CrossFire>
+              <{Personnel}><Text2>E0</Text2><{Images}><Image/></{Images}></{Personnel}>
+              <{Personnel}><Text2>E1</Text2><{Images}><Image></Image></{Images}></{Personnel}>
+              <{Personnel}><Text2>E2</Text2><{Images}><Image>   </Image></{Images}></{Personnel}>
+            </CrossFire>
+            """);
+        try
         {
-            reader.Read();          // 空 <Images/>:越过自身
-            return;
+            // 覆盖集扫描(includeImage=false):空 / 仅空白的 Image 都不算覆盖 → 无记录
+            Assert.Empty(XmlPhotoReader.Read(xml, includeImage: false));
         }
-
-        int depth = reader.Depth;   // Images 起始节点深度
-        reader.Read();              // 进入第一个子节点
-        while (!reader.EOF && !(reader.NodeType == XmlNodeType.EndElement && reader.Depth == depth))
-        {
-            if (reader.NodeType != XmlNodeType.Element)
-            {
-                if (!reader.Read()) break;
-                continue;
-            }
-
-            switch (reader.LocalName)
-            {
-                case "Image":
-                    if (hasImage)
-                    {
-                        reader.Skip();       // 已取第一条 Image,后续忽略
-                        break;
-                    }
-                    if (includeImage)
-                    {
-                        var s = reader.ReadElementContentAsString().Trim();   // 前进过 </Image>
-                        if (s.Length > 0)
-                        {
-                            hasImage = true;
-                            imageBase64 = s;
-                        }
-                    }
-                    else
-                    {
-                        // 只需知道"有无非空 Image"，按块读取文本但不构造完整 Base64 字符串。
-                        // 不能用 !IsEmptyElement：<Image></Image> 和仅含空白的 Image 同样不是有效照片。
-                        hasImage = ConsumeElementAndDetectNonWhitespace(reader);
-                    }
-                    break;
-                case "LastModifiedTime":
-                    if (readLastModified)
-                        lmtRaw = reader.ReadElementContentAsString().Trim();  // 前进过 </LastModifiedTime>
-                    else
-                        reader.Skip();       // 覆盖集轮次不需要版本
-                    break;
-                default:
-                    reader.Skip();           // Thumbnail / ImageCaptureDate / 未知:整棵跳过,不进托管堆
-                    break;
-            }
-        }
-       if(reader.NodeType == XmlNodeType.EndElement) reader.Read();              // 越过 </Images>,停到其后
+        finally { TryDeleteParent(xml); }
     }
 
-    /// <summary>
-    /// 消费当前元素并判断其文本是否含非空白字符。使用 ReadValueChunk 避免覆盖集扫描时
-    /// 把完整 Base64 字符串分配到托管堆；返回时 reader 已位于该元素之后。
-    /// </summary>
-    private static bool ConsumeElementAndDetectNonWhitespace(XmlReader reader)
+    [Fact]
+    public void Malformed_xml_throws()
     {
-        if (reader.IsEmptyElement)
-        {
-            reader.Read();
-            return false;
-        }
-
-        int depth = reader.Depth;
-        bool hasContent = false;
-        var buffer = new char[4096];
-        reader.Read();
-        while (!reader.EOF && !(reader.NodeType == XmlNodeType.EndElement && reader.Depth == depth))
-        {
-            if (reader.NodeType is XmlNodeType.Text or XmlNodeType.CDATA or
-                XmlNodeType.Whitespace or XmlNodeType.SignificantWhitespace)
-            {
-                int count;
-                while ((count = reader.ReadValueChunk(buffer, 0, buffer.Length)) > 0)
-                {
-                    for (int i = 0; i < count; i++)
-                        if (!char.IsWhiteSpace(buffer[i])) hasContent = true;
-                }
-                reader.Read();
-            }
-            else if (reader.NodeType == XmlNodeType.Element)
-            {
-                reader.Skip();
-            }
-            else
-            {
-                reader.Read();
-            }
-        }
-        if (reader.NodeType == XmlNodeType.EndElement) reader.Read();
-        return hasContent;
+        var xml = WriteXml($"<CrossFire><{Personnel}>");   // 未闭合
+        try { Assert.Throws<System.Xml.XmlException>(() => XmlPhotoReader.Read(xml).ToList()); }
+        finally { TryDeleteParent(xml); }
     }
 
-    /// <summary>按固定格式解析 LastModifiedTime;失败抛 <see cref="FormatException"/>,由调用方计数 + 跳过。</summary>
-    public static DateTimeOffset ParseLastModified(string raw)
-        => DateTimeOffset.ParseExact(raw, LastModifiedFormat, CultureInfo.InvariantCulture, DateTimeStyles.None);
-
-    /// <summary>
-    /// 解码 Image Base64 → 字节。容错:部分导出把 Base64 按 76 列折行,
-    /// 而 <see cref="Convert.FromBase64String"/> 对内嵌空白严格(抛 <see cref="FormatException"/>)→ 先剥空白再解码。
-    /// 空白从不是 Base64 有效数据,剥除安全。无空白的常见情形零额外分配。
-    /// </summary>
-    public static byte[] DecodeImage(string base64)
+    [Fact]
+    public void ParseLastModified_parses_gmt_offset_format()
     {
-        var cleaned = base64.Any(char.IsWhiteSpace)
-            ? string.Concat(base64.Where(c => !char.IsWhiteSpace(c)))
-            : base64;
-        return Convert.FromBase64String(cleaned);
+        var dto = XmlPhotoReader.ParseLastModified("8/4/2026 3:26:20 PM GMT+08:00");
+        Assert.Equal(new DateTimeOffset(2026, 8, 4, 15, 26, 20, TimeSpan.FromHours(8)), dto);  // 3:26:20 PM = 15:26:20 +08:00
+    }
+
+    [Fact]
+    public void DecodeImage_tolerates_line_wrapped_base64()
+    {
+        var raw = Convert.ToBase64String(Encoding.UTF8.GetBytes("HELLO-WORLD-PAYLOAD"));
+        var wrapped = raw[..4] + "\r\n" + raw[4..];   // 人为折行,模拟 76 列换行
+        Assert.Equal("HELLO-WORLD-PAYLOAD", Encoding.UTF8.GetString(XmlPhotoReader.DecodeImage(wrapped)));
+    }
+
+    private static void TryDeleteParent(string file)
+    {
+        try { Directory.Delete(Path.GetDirectoryName(file)!, recursive: true); } catch { /* best effort */ }
     }
 }
