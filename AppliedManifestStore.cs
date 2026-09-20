@@ -1,104 +1,99 @@
-using System.Text.Json;
-using System.Text.Json.Serialization;
-using MorganStanley.COD.FirmwideDirectory.API.Common;   // Utility.RetryIo(SMB 抖动重试,与照片落盘同一套)
+using Xunit;
 
-namespace COD.FirmwideDirectory.PhotoImportTool;
+namespace COD.FirmwideDirectory.PhotoImportTool.IntegrationTests;
 
 /// <summary>
-/// 人级"已应用"清单(§5):msid → {source, version, size}。与 <see cref="WatermarkStore"/> 是两种数据:
-/// 水位是**源文件级 mtime**(photoZip/usersZip/xmlPhoto),这份是**每个 msid 上次落盘的版本**,故独立一份文件、不混进水位。
-///
-/// 定位:这是 XML 侧的**增量/版本缓存**,不是覆盖集的真相来源——**每轮的 XML 覆盖集(xmlMsids)由 reader 重新扫出**,
-/// 不能拿本清单的 key 当"当前覆盖集"或 zip 的 skip 集(否则离开 XML 的人删不掉 key 会永远错误挡住 zip)。
-/// 增量判定:以 <see cref="Entry.Version"/>(=LastModifiedTime)前进为准;size-only 不足以判"同尺寸换图"。
-///
-/// 落盘用 tmp + 原子 File.Move + SMB 有限重试(区别于 WatermarkStore 的直接覆盖写):清单损坏 = 下轮 XML 全量重解码重写,
-/// 代价远大于水位损坏,故值得原子写 + 重试。
+/// AppliedManifestStore 属 PhotoImportTool 自身;其 <c>Save()</c> 走真 <c>Utility.RetryIo</c>(原子 tmp+Move)。
+/// 全部自包含(临时文件),验证往返 / 增量清理 / 退役清空 / 不留孤儿 tmp。无需外部样本。
 /// </summary>
-public sealed class AppliedManifestStore
+public class AppliedManifestStoreTests
 {
-    private const string TempSuffix = ".manifest-tmp";
-
-    public sealed class Entry
+    private static string NewManifestPath()
     {
-        [JsonPropertyName("source")] public string Source { get; set; } = "xml";
-        [JsonPropertyName("version")] public DateTimeOffset Version { get; set; }
-        [JsonPropertyName("size")] public long Size { get; set; }
+        var dir = Path.Combine(Path.GetTempPath(), "pit-mf-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        return Path.Combine(dir, "manifest.json");
     }
 
-    private static readonly JsonSerializerOptions JsonOpts = new()
+    [Fact]
+    public void Save_then_Load_round_trips_entries_case_insensitively()
     {
-        WriteIndented = true,
-        // DateTimeOffset 默认即 ISO-8601 round-trip("o"),两源版本直接可比。
-    };
-
-    private readonly string _path;
-    private readonly Dictionary<string, Entry> _map;
-
-    private AppliedManifestStore(string path, Dictionary<string, Entry> map)
-    {
-        _path = path;
-        _map = map;
-    }
-
-    public static AppliedManifestStore Load(string path)
-    {
+        var path = NewManifestPath();
         try
         {
-            if (File.Exists(path))
-            {
-                var json = File.ReadAllText(path);
-                var map = JsonSerializer.Deserialize<Dictionary<string, Entry>>(json, JsonOpts);
-                if (map is not null)
-                    return new AppliedManifestStore(path, new(map, StringComparer.OrdinalIgnoreCase));
-            }
+            var m = AppliedManifestStore.Load(path);
+            var v = new DateTimeOffset(2026, 8, 4, 7, 26, 20, TimeSpan.Zero);
+            m.Set("58MVN", new AppliedManifestStore.Entry { Source = "xml", Version = v, Size = 123 });
+            m.Save();
+
+            var reloaded = AppliedManifestStore.Load(path);
+            Assert.Equal(1, reloaded.Count);
+            var e = reloaded.Get("58mvn");   // key 大小写不敏感
+            Assert.NotNull(e);
+            Assert.Equal("xml", e!.Source);
+            Assert.Equal(v, e.Version);
+            Assert.Equal(123, e.Size);
         }
-        catch { /* 损坏 → 视为空清单(下轮全量重写);原子写让这种情况本就罕见 */ }
-        return new AppliedManifestStore(path, new(StringComparer.OrdinalIgnoreCase));
+        finally { TryDeleteParent(path); }
     }
 
-    /// <summary>取某 msid 上次应用的记录;从未应用过返回 null。</summary>
-    public Entry? Get(string msid) => _map.TryGetValue(msid, out var e) ? e : null;
-
-    public void Set(string msid, Entry entry) => _map[msid] = entry;
-
-    /// <summary>删除已经不在当前 XML 覆盖集中的历史条目，返回删除数量。</summary>
-    public int RemoveMissing(IReadOnlySet<string> currentXmlMsids)
+    [Fact]
+    public void RemoveMissing_drops_keys_not_in_current_set()
     {
-        var removed = 0;
-        foreach (var msid in _map.Keys.Where(msid => !currentXmlMsids.Contains(msid)).ToArray())
-        {
-            if (_map.Remove(msid)) removed++;
-        }
-        return removed;
-    }
-
-    public void Clear() => _map.Clear();
-
-    /// <summary>当前已成功应用的 XML MSID 快照；解析失败时用于继续保护盘上 XML 照片不被 zip 覆盖。</summary>
-    public IReadOnlySet<string> Msids => new HashSet<string>(_map.Keys, StringComparer.OrdinalIgnoreCase);
-
-    /// <summary>当前清单里的 msid 数(= 当前由 XML 覆盖的照片数)。</summary>
-    public int Count => _map.Count;
-
-    /// <summary>
-    /// 原子写:先落 tmp,再同目录 File.Move 覆盖,避免崩溃留半截 JSON。
-    /// Move 对瞬时 SMB 抖动做有限重试(review#6,与照片落盘同一套);任何失败都清掉半截 tmp 再上抛,不留孤儿。
-    /// </summary>
-    public void Save()
-    {
-        var dir = Path.GetDirectoryName(_path);
-        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-        var tmp = _path + TempSuffix + Guid.NewGuid().ToString("N");
+        var path = NewManifestPath();
         try
         {
-            File.WriteAllText(tmp, JsonSerializer.Serialize(_map, JsonOpts));
-            Utility.RetryIo(() => File.Move(tmp, _path, overwrite: true));
+            var m = AppliedManifestStore.Load(path);
+            m.Set("A1", new AppliedManifestStore.Entry());
+            m.Set("B2", new AppliedManifestStore.Entry());
+            m.Set("C3", new AppliedManifestStore.Entry());
+
+            var keep = new HashSet<string>(new[] { "A1", "C3" }, StringComparer.OrdinalIgnoreCase);
+            var removed = m.RemoveMissing(keep);
+
+            Assert.Equal(1, removed);      // B2 不在 current 集 → 删
+            Assert.Equal(2, m.Count);
+            Assert.NotNull(m.Get("A1"));
+            Assert.Null(m.Get("B2"));
         }
-        catch
+        finally { TryDeleteParent(path); }
+    }
+
+    [Fact]
+    public void Load_of_missing_file_is_empty_and_Clear_empties()
+    {
+        var path = NewManifestPath();
+        try
         {
-            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* ignore */ }
-            throw;
+            var m = AppliedManifestStore.Load(path);   // 文件不存在 → 空清单
+            Assert.Equal(0, m.Count);
+            m.Set("X", new AppliedManifestStore.Entry());
+            Assert.Equal(1, m.Count);
+            m.Clear();
+            Assert.Equal(0, m.Count);
         }
+        finally { TryDeleteParent(path); }
+    }
+
+    [Fact]
+    public void Save_writes_file_and_leaves_no_orphan_tmp()
+    {
+        var path = NewManifestPath();
+        try
+        {
+            var m = AppliedManifestStore.Load(path);
+            m.Set("A1", new AppliedManifestStore.Entry());
+            m.Save();
+
+            var dir = Path.GetDirectoryName(path)!;
+            Assert.True(File.Exists(path));
+            Assert.Empty(Directory.GetFiles(dir, "*.manifest-tmp*"));   // 原子写:不留半截 tmp
+        }
+        finally { TryDeleteParent(path); }
+    }
+
+    private static void TryDeleteParent(string file)
+    {
+        try { Directory.Delete(Path.GetDirectoryName(file)!, recursive: true); } catch { /* best effort */ }
     }
 }
