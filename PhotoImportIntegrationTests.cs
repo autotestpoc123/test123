@@ -1,4 +1,3 @@
-using System.IO.Compression;
 using COD.FirmwideDirectory.PhotoImportTool;
 using FirmwideDirectory.API.Common;
 using FirmwideDirectory.API.Models;
@@ -8,9 +7,7 @@ using Xunit;
 using PhotoOptions = COD.FirwideDirectory.API.Models.Options.PhotoOptions;
 
 // L3 真集成:用真 Core + 真样本数据(小号 users.zip / photo.zip),断言"不变量"而非精确计数。
-// 前置:R1–R4 完成、exe 能 build;放好 TestData(见 README)后移除各 [Fact] 的 Skip。
-// 断言路径若要用真 Core 的 GetUserPhotoFullPath,R1 命名空间统一后再打开对应 using(见下方 TODO)。
-//   例:using MorganStanley.COD.FirmwideDirectory.API.Common;  // Utility
+// 前置:真实 Core 与 exe 能 build,并备好 TestData(见 README)。所有输出均写在独立临时目录。
 
 namespace COD.FirmwideDirectory.PhotoImportTool.IntegrationTests;
 
@@ -22,8 +19,6 @@ public class PhotoImportIntegrationTests
         ?? Path.Combine(TestDataDir, "photo.zip");
     private static string UsersZip => Environment.GetEnvironmentVariable("FWD_TEST_USERS_ZIP")
         ?? Path.Combine(TestDataDir, "pds-cod-fwd-user-dump.dsml.zip");
-    private static string SeedDir => Environment.GetEnvironmentVariable("FWD_TEST_PHOTOFOLDER_SEED")
-        ?? Path.Combine(TestDataDir, "seed");
 
     [Fact]
     public void DryRun_over_real_sample_has_no_errors_and_no_side_effects()
@@ -45,9 +40,9 @@ public class PhotoImportIntegrationTests
     }
 
     [Fact]
-    public void RealRun_over_real_sample_places_active_and_quarantines_inactive()
+    public void RealRun_over_real_sample_places_active_and_quarantines_orphan()
     {
-        var (opt, work) = SetupWorkdir(dryRun: false, requireSeed: true);
+        var (opt, work) = SetupWorkdir(dryRun: false);
         try
         {
             var users = XmlHelper<GlobalUserAccount>.ParseXml(opt.UsersZipPath, opt.UsersDsmlName);
@@ -55,42 +50,48 @@ public class PhotoImportIntegrationTests
                 .Where(u => u.EmployeeStatus == EmployeeStatus.Active && !string.IsNullOrWhiteSpace(u.MSID))
                 .Select(u => u.MSID!)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var inactiveMsids = users.UsersDict.Values
-                .Where(u => u.EmployeeStatus == EmployeeStatus.Inactive && !string.IsNullOrWhiteSpace(u.MSID))
+            var allDsmlMsids = users.UsersDict.Values
+                .Where(u => !string.IsNullOrWhiteSpace(u.MSID))
                 .Select(u => u.MSID!)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-            using var zip = ZipFile.OpenRead(opt.PhotoZipPath);
+            using var zip = global::System.IO.Compression.ZipFile.OpenRead(opt.PhotoZipPath);
             var activeEntry = zip.Entries.FirstOrDefault(e =>
                 e.Name.EndsWith(opt.PhotoType, StringComparison.OrdinalIgnoreCase) &&
                 activeMsids.Contains(Path.GetFileNameWithoutExtension(e.Name)));
-            Assert.NotNull(activeEntry);
+            Assert.True(activeEntry is not null,
+                $"photo.zip 中找不到与 DSML Active MSID 匹配的 {opt.PhotoType}；" +
+                $"PhotoZipPath={opt.PhotoZipPath}, ActiveCount={activeMsids.Count}");
             var knownActiveMsid = Path.GetFileNameWithoutExtension(activeEntry!.Name);
 
-            var seededInactive = Directory.EnumerateFiles(opt.PhotoFolder, "*", SearchOption.AllDirectories)
-                .FirstOrDefault(path =>
-                    Path.GetExtension(path).Equals(opt.PhotoType, StringComparison.OrdinalIgnoreCase) &&
-                    inactiveMsids.Contains(Path.GetFileNameWithoutExtension(path)));
-            Assert.NotNull(seededInactive);
-            var knownInactiveMsid = Path.GetFileNameWithoutExtension(seededInactive!);
+            // 此场景的隔离对象是 DSML 中不存在的 MSID,而不是 DSML 中状态为 Inactive 的记录。
+            var orphanMsid = "ZZTESTORPHAN";
+            for (var suffix = 1; allDsmlMsids.Contains(orphanMsid); suffix++)
+                orphanMsid = "ZZTESTORPHAN" + suffix;
 
             var po = new PhotoOptions { PhotoFolder = opt.PhotoFolder, PhotoType = opt.PhotoType };
             var activePath = Utility.GetUserPhotoFullPath(knownActiveMsid, po);
-            var inactivePath = Utility.GetUserPhotoFullPath(knownInactiveMsid, po);
-            Assert.False(File.Exists(activePath), "seed 不应预置选中的 Active 照片，否则无法证明本轮从 ZIP 导入");
-            Assert.True(File.Exists(inactivePath), "seed 中的 Inactive 照片必须位于真实 Core 计算的标准路径");
+            var orphanPath = Utility.GetUserPhotoFullPath(orphanMsid, po);
+            Assert.False(File.Exists(activePath), "测试目录不应预置选中的 Active 照片");
+
+            // 使用样本 ZIP 的照片字节,只在隔离测试目录中预置 DSML 不包含的孤儿照片。
+            Directory.CreateDirectory(Path.GetDirectoryName(orphanPath)!);
+            using (var source = activeEntry.Open())
+            using (var target = File.Create(orphanPath))
+                source.CopyTo(target);
+            Assert.True(File.Exists(orphanPath));
 
             var s = new PhotoImportJob(opt, NullLogger.Instance).Run(CancellationToken.None);
             Assert.Equal(0, s.Errors);
             Assert.True(s.Added > 0, "本轮应从 photo.zip 新增至少一张 Active 照片");
-            Assert.True(s.Deleted > 0, "本轮应隔离至少一张 Inactive 照片");
+            Assert.True(s.Deleted > 0, "本轮应隔离至少一张不在 Active 集中的孤儿照片");
             Assert.True(File.Exists(activePath), $"Active 用户照片未落盘: {knownActiveMsid}");
-            Assert.False(File.Exists(inactivePath), $"Inactive 用户照片仍在 PhotoFolder: {knownInactiveMsid}");
+            Assert.False(File.Exists(orphanPath), $"孤儿照片仍在 PhotoFolder: {orphanMsid}");
 
-            var relativePath = Path.GetRelativePath(opt.PhotoFolder, inactivePath);
+            var relativePath = Path.GetRelativePath(opt.PhotoFolder, orphanPath);
             var quarantined = Directory.EnumerateFiles(opt.QuarantineDir, "*", SearchOption.AllDirectories)
                 .Any(path => path.EndsWith(relativePath, StringComparison.OrdinalIgnoreCase));
-            Assert.True(quarantined, $"Inactive 用户照片未进入 quarantine: {knownInactiveMsid}");
+            Assert.True(quarantined, $"孤儿照片未进入 quarantine: {orphanMsid}");
         }
         finally { TryCleanup(work); }
     }
@@ -101,7 +102,7 @@ public class PhotoImportIntegrationTests
     {
         try
         {
-            using var zip = ZipFile.OpenRead(opt.UsersZipPath);
+            using var zip = global::System.IO.Compression.ZipFile.OpenRead(opt.UsersZipPath);
             var entries = zip.Entries.Where(e => !string.IsNullOrEmpty(e.Name))
                 .Select(e => e.FullName).ToArray();
             var matching = entries.Where(e => e.EndsWith(opt.UsersDsmlName, StringComparison.OrdinalIgnoreCase))
@@ -120,12 +121,10 @@ public class PhotoImportIntegrationTests
         }
     }
 
-    private static (PhotoImportOptions opt, string work) SetupWorkdir(bool dryRun, bool requireSeed = false)
+    private static (PhotoImportOptions opt, string work) SetupWorkdir(bool dryRun)
     {
         Assert.True(File.Exists(PhotoZip), $"缺少样本 photo.zip:{PhotoZip}");
         Assert.True(File.Exists(UsersZip), $"缺少样本 users zip:{UsersZip}");
-        if (requireSeed)
-            Assert.True(Directory.Exists(SeedDir), $"缺少测试 seed 目录:{SeedDir}");
 
         var work = Path.Combine(Path.GetTempPath(), "pit-l3-" + Guid.NewGuid().ToString("N"));
         var photos = Path.Combine(work, "photos");
@@ -135,9 +134,6 @@ public class PhotoImportIntegrationTests
         Directory.CreateDirectory(state);
 
         // 可选:提供一个"已存在照片"目录作为对账靶(含应保留/应删的照片)
-        if (Directory.Exists(SeedDir))
-            CopyDir(SeedDir, photos);
-
         var opt = new PhotoImportOptions
         {
             PhotoFolder = photos,
@@ -162,17 +158,6 @@ public class PhotoImportIntegrationTests
         => Directory.Exists(root)
             ? new(Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories), StringComparer.OrdinalIgnoreCase)
             : new(StringComparer.OrdinalIgnoreCase);
-
-    private static void CopyDir(string src, string dst)
-    {
-        foreach (var f in Directory.EnumerateFiles(src, "*", SearchOption.AllDirectories))
-        {
-            var rel = Path.GetRelativePath(src, f);
-            var target = Path.Combine(dst, rel);
-            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-            File.Copy(f, target, overwrite: true);
-        }
-    }
 
     private static void TryCleanup(string dir)
     {
