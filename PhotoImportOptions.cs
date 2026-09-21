@@ -46,6 +46,7 @@ public sealed class PhotoImportOptions
 
     // —— quarantine 生命周期(§4.1)——
     public string QuarantineDir { get; set; } = "";     // 必须在 PhotoFolder 之外
+    // 0 合法:仅保留当天及未来日期的批次;负数会导致当天批次被提前清理,必须拒绝。
     public int QuarantineRetentionDays { get; set; } = 30;
 
     // —— 运行时状态/隔离 ——
@@ -64,6 +65,9 @@ public sealed class PhotoImportOptions
         if (string.IsNullOrWhiteSpace(WatermarkFilePath)) throw new ArgumentException("WatermarkFilePath 必填");
         if (MaxDeleteRatio <= 0 || MaxDeleteRatio > 1) throw new ArgumentException("MaxDeleteRatio 应在 (0,1] 区间");
         if (MinActiveThreshold < 0) throw new ArgumentException("MinActiveThreshold 不能为负");
+        if (QuarantineRetentionDays < 0)
+            throw new ArgumentOutOfRangeException(nameof(QuarantineRetentionDays), QuarantineRetentionDays,
+                "QuarantineRetentionDays 不能为负");
         // §6:启用 XML 时,文件必须存在(与 zip 缺文件同样 fail-fast,避免门闸阶段才炸)。
         if (XmlEnabled && !File.Exists(XmlPhotoPath))
             throw new ArgumentException($"XmlPhotoPath 已配置但文件不存在:{XmlPhotoPath}");
