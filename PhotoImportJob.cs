@@ -140,6 +140,12 @@ public sealed class PhotoImportJob
             // users 变化时重新检查新 Active 用户;已有照片仍按 manifest 版本跳过。
             // manifest 丢失时需要重建完整的人级版本基线。
             bool applyXmlWrites = usersChanged || xmlChanged || manifestMissing;
+            _log.LogInformation(
+                "XML decision applyWrites={ApplyWrites} dryRun={DryRun}",
+                applyXmlWrites, _opt.DryRun);
+            _log.LogInformation(
+                "XML triggers {Details}",
+                $"photoChanged={photoChanged} usersChanged={usersChanged} xmlChanged={xmlChanged} manifestMissing={manifestMissing}");
             Time("UpsertXmlPhotos", () => xmlScanSucceeded = UpsertXmlPhotos(
 
                 xmlMsids, onDiskPaths, activeMsids, deleteEnabled, applyXmlWrites, summary, ct));
@@ -360,6 +366,9 @@ public sealed class PhotoImportJob
         using (stream)
         {
             var plan = new Dictionary<string, XmlApplyItem>(StringComparer.OrdinalIgnoreCase);
+            _log.LogInformation(
+                "XML scan complete recordsWithImage={RecordCount} manifestEntries={ManifestCount} applyWrites={ApplyWrites} activeFilterEnabled={ActiveFilterEnabled}; first pass does not decode Base64",
+                metadata.Count, manifest.Count, applyWrites, deleteEnabled);
 
             // 第一阶段只处理元数据：构建完整覆盖集和待写计划，不解码、不写照片、不修改 manifest。
             foreach (var rec in metadata)
@@ -367,12 +376,27 @@ public sealed class PhotoImportJob
                 ct.ThrowIfCancellationRequested();
 
                 var msid = rec.Msid;
-                if (msid.Length < 2 || !Utility.IsValidMSIDForPhoto(msid)) { s.XmlSkipped++; continue; }
+                if (msid.Length < 2 || !Utility.IsValidMSIDForPhoto(msid))
+                {
+                    _log.LogInformation("XML skipped reason=InvalidMsid msid={Msid}", msid);
+                    s.XmlSkipped++;
+                    continue;
+                }
 
                 xmlMsids.Add(msid);
 
-                if (!applyWrites) { s.XmlSkipped++; continue; }
-                if (deleteEnabled && !activeMsids.Contains(msid)) { s.XmlSkipped++; continue; }
+                if (!applyWrites)
+                {
+                    _log.LogInformation("XML skipped reason=CoverageOnly msid={Msid}; XML writes not requested this run", msid);
+                    s.XmlSkipped++;
+                    continue;
+                }
+                if (deleteEnabled && !activeMsids.Contains(msid))
+                {
+                    _log.LogInformation("XML skipped reason=NotActive msid={Msid}", msid);
+                    s.XmlSkipped++;
+                    continue;
+                }
 
                 if (string.IsNullOrEmpty(rec.LastModifiedRaw))
                 {
@@ -399,6 +423,9 @@ public sealed class PhotoImportJob
                 bool existsOnDisk = onDiskPaths.Contains(dest);
                 if (prev is not null && lmt <= prev.Version && existsOnDisk)
                 {
+                    _log.LogInformation(
+                        "XML skipped reason=VersionNotNewerAndTargetExists msid={Msid} xmlVersionUtc={XmlVersionUtc:o} manifestVersionUtc={ManifestVersionUtc:o} existsInSnapshot={ExistsInSnapshot} dest={Dest}",
+                        msid, lmt.ToUniversalTime(), prev.Version.ToUniversalTime(), existsOnDisk, dest);
                     s.XmlSkipped++;
                     continue;
                 }
@@ -409,8 +436,15 @@ public sealed class PhotoImportJob
 
                 // Scan 已拒绝重复 Personnel,两遍读取的 MSID 与图片一一对应。
                 plan.Add(msid, new XmlApplyItem(msid, lmt, dest, existsOnDisk));
+                var reason = prev is null ? "NoManifestEntry" : !existsOnDisk ? "TargetMissing" : "NewerVersion";
+                _log.LogInformation(
+                    "XML planned {Details}",
+                    $"msid={msid} reason={reason} xmlVersionUtc={lmt.ToUniversalTime():o} manifestVersionUtc={prev?.Version.ToUniversalTime():o} existsInSnapshot={existsOnDisk} dest={dest}");
             }
 
+            _log.LogInformation(
+                "XML plan complete coverageCount={CoverageCount} plannedCount={PlannedCount} readSelectedImages={ReadSelectedImages}",
+                xmlMsids.Count, plan.Count, applyWrites && plan.Count > 0);
             // 第二阶段：第一遍已完整验证；在同一不可替换的文件句柄上只物化计划内的 Image。
             if (applyWrites && plan.Count > 0)
             {
@@ -438,7 +472,7 @@ public sealed class PhotoImportJob
 
                         if (_opt.DryRun)
                         {
-                            _log.LogDebug("将写入(xml) {Dest} ({N} bytes, v={V:o})", item.Destination, bytes.Length, item.Version);
+                            _log.LogInformation("XML not written reason=DryRun msid={Msid} dest={Dest} bytes={Bytes} version={Version:o}", item.Msid, item.Destination, bytes.Length, item.Version);
                             if (item.ExistsOnDisk) s.XmlUpdated++; else s.XmlAdded++;
                             continue;
                         }
@@ -457,6 +491,9 @@ public sealed class PhotoImportJob
                                 Size = bytes.Length
                             });
                             anyApplied = true;
+                            _log.LogInformation(
+                                "XML photo written msid={Msid} action={Action} dest={Dest} bytes={Bytes} versionUtc={VersionUtc:o}",
+                                item.Msid, item.ExistsOnDisk ? "Updated" : "Added", item.Destination, bytes.Length, item.Version.ToUniversalTime());
                         }
                         catch (Exception ex)
                         {
