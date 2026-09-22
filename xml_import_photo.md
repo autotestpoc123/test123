@@ -72,23 +72,47 @@ PhotoFolder\UPPER(msid[0])\UPPER(msid[1])\{msid}{PhotoType}
 
 ## 4. 执行顺序和阶段门闸
 
+以下六张图分别对应入口总流程、删除保护、XML 扫描与计划、XML 写入、ZIP 写入、退役与状态提交。节点中的计数变化对应 `RunSummary`；图中的“下一条”表示继续当前循环。
+
+### 4.0 入口与主流程
+
+代码依据：`Program.Main`、`PhotoImportJob.Run`。XML、ZIP 子阶段的触发条件见 4.3，内部细节见第 5、6 节。
+
 ```mermaid
 flowchart TD
-    A[加载配置并校验] --> B[获取单实例锁]
-    B --> C[读取水位 / 清理过期 quarantine]
-    C --> D{源变化、Force、退役或缺 Manifest?}
-    D -- 否 --> E[记录 skip 并结束]
-    D -- 是 --> F[Active 集 / 一次快照 / 删除保护]
-    F --> G[必要时预建网格]
-    G --> H[必要时两遍处理 XML]
-    H --> I[必要时处理 ZIP]
-    I --> J[符合条件时清理 XML 退役状态]
-    J --> K[保护通过时对账隔离]
-    K --> L[无累计错误才保存可推进的水位]
-    L --> M[汇总 / 释放锁 / 退出]
+    A["加载 JSON、环境变量、命令行<br/>绑定 PhotoImport 并 Validate"] --> B{"配置有效?"}
+    B -- 否 --> X2["记录启动错误<br/>退出 2"]
+    B -- 是 --> C["TryAcquire 独占锁"]
+    C -- "异常传播" --> X2
+    C -- "返回 null" --> X0["记录锁占用、跳过<br/>退出 0"]
+    C -- "取得锁" --> D["创建 summary / 读取水位"]
+    D --> E["PurgeQuarantine<br/>先处理过期批次；DryRun 只统计"]
+    E --> F["检查 photo/users/启用的 XML 源<br/>捕获各源 mtime，计算变化标志"]
+    F --> G["计算 manifestMissing 与 xmlRetired"]
+    G --> H{"任一源变化<br/>或 Manifest 缺失<br/>或 XML 退役?"}
+    H -- 否 --> I["记录三源无更新 skip<br/>直接返回已有 summary"]
+    H -- 是 --> J["解析 Active 集<br/>一次快照及删除保护：见 4.2"]
+    J --> K{"非 DryRun 且 willWrite?"}
+    K -- 是 --> L["EnsurePhotoFolderGrid"]
+    K -- 否 --> M{"XML 扫描条件成立?"}
+    L --> M
+    M -- 是 --> N["UpsertXmlPhotos<br/>建立覆盖集并返回 xmlScanSucceeded"]
+    M -- 否 --> O{"shouldUpsertZip?"}
+    N --> O
+    O -- 是 --> P["按需复制 ZIP 到 scratch<br/>UpsertPhotos"]
+    O -- 否 --> Q["退役 / 对账 / 水位<br/>见第 8 节状态提交图"]
+    P --> Q
+    Q --> R["计算照片统计并返回 summary"]
+    R --> S{"summary.Errors 大于 0?"}
+    I --> S
+    S -- 是 --> X1["输出汇总、释放锁<br/>退出 1"]
+    S -- 否 --> OK["输出汇总、释放锁<br/>退出 0"]
+    F -. "源缺失等未捕获异常" .-> FAIL["入口捕获运行异常或取消<br/>释放锁、退出 1"]
 ```
 
-整轮不是事务；某阶段失败不表示已完成的其他阶段回滚。
+图中以源检查示例标出未捕获异常出口；持锁期间其他阶段抛出的未捕获异常/取消也走该出口，可能没有完成汇总。已在阶段内部捕获的错误通常计入 Errors 后继续执行。
+
+整轮不是事务；某阶段失败不表示已完成的其他阶段回滚。快速 skip 前的清理若已累计 Errors，最终也会退出 1，并非所有 skip 都退出 0。
 
 ### 4.1 源门闸
 
@@ -111,15 +135,43 @@ Active 数量达到绝对阈值，且拟隔离比例未超限（或 Force 绕过
 
 注意当前语义：`deleteEnabled` 也控制非 Active 用户跳写。保护触发时，不只停止隔离，也不再按 Active 集拦截 ZIP/XML 写入；不是整轮停止。users 水位不推进，下轮重试。
 
+```mermaid
+flowchart TD
+    A["BuildActiveMsids<br/>真 Core 解析 DSML，筛选 Active，MSID 去重"] --> B{"ActiveCount 达到 MinActiveThreshold?"}
+    B -- 是 --> C["deleteEnabled = true"]
+    B -- 否 --> D["deleteEnabled = false<br/>记录绝对阈值告警"]
+    C --> E{"needSnapshot?"}
+    D --> E
+    E -- 否 --> F["使用空快照"]
+    E -- 是 --> G["SnapshotPhotoFolder<br/>路径、MSID、size；跳过 ~snapshot"]
+    G --> H["非 DryRun 清理孤儿临时文件<br/>同一快照供 XML、ZIP、对账复用"]
+    F --> I{"deleteEnabled 为 true<br/>且非 Force，且快照非空?"}
+    H --> I
+    I -- 否 --> M["保持当前 deleteEnabled<br/>进入来源处理阶段"]
+    I -- 是 --> J["统计快照中不在 Active 集的照片数"]
+    J --> K{"拟隔离数大于<br/>快照数乘 MaxDeleteRatio?"}
+    K -- 否 --> M
+    K -- 是 --> L["deleteEnabled = false<br/>记录比例保护告警"]
+    L --> M
+```
+
+Force 只跳过比例检查，不会把已经为 false 的绝对阈值结果变回 true。快照读取异常不会被当成空快照继续对账，而会向入口抛出。
+
 ### 4.3 来源处理条件
 
-| 阶段 | 触发条件 |
+| 阶段/标志 | 对应代码条件 |
 |---|---|
-| XML 扫描 | XML 启用，且 photo/users/xml 任一变化或 Manifest 缺失 |
-| XML 写入计划 | XML 扫描成功，且 users/xml 变化或 Manifest 缺失 |
-| 仅 photo 变化时的 XML | 建覆盖集，不解码写入 XML 图片 |
-| ZIP 扫描 | photo/users 变化；或 xml 变化/Manifest 缺失且 XML 处理返回成功；或 XML 退役 |
-| 对账隔离 | deleteEnabled 为 true |
+| 单个源 changed | `Force \|\| currentMtime > savedMtime`；停用 XML 的 xmlChanged 固定为 false |
+| manifestMissing | `XmlEnabled && !DryRun && !File.Exists(manifestPath)` |
+| xmlRetired | `!XmlEnabled && historicalManifest.Count > 0` |
+| willWrite（预建网格） | `photoChanged \|\| usersChanged \|\| (XmlEnabled && (xmlChanged \|\| manifestMissing))`，实际建网格还要求非 DryRun |
+| XML 扫描 | `XmlEnabled && (photoChanged \|\| usersChanged \|\| xmlChanged \|\| manifestMissing)` |
+| applyXmlWrites | `usersChanged \|\| xmlChanged \|\| manifestMissing`；必须先进入 XML 扫描并成功 |
+| 仅 photo 变化时的 XML | applyXmlWrites=false，仅建立覆盖集 |
+| shouldUpsertZip | `photoChanged \|\| usersChanged \|\| ((xmlChanged \|\| manifestMissing) && xmlScanSucceeded) \|\| xmlRetired` |
+| 对账隔离 | `deleteEnabled` |
+
+`xmlScanSucceeded` 初始为 true，是 XML 方法的返回状态，**不是 `Errors == 0` 的同义词**。例如单条版本/Base64 错误会增加 Errors，但方法仍可能返回 true；整轮能否保存水位单独看 Errors。
 
 只有 users 变化时，新 Active 用户可从未变的 XML/ZIP 补图；已有 XML 仍按版本跳过，ZIP 仍按尺寸跳过。先建立 XML 覆盖集，保持 XML 优先。
 
@@ -137,6 +189,36 @@ malformed XML、重复 MSID、第一遍读取失败：记录 Errors，取消本�
 
 ### 5.2 计划与第二遍
 
+下图展开第一遍及计划生成。重复 MSID 的检查发生在 Reader 扫描期间，早于计划中的非法 MSID、Active、版本过滤。
+
+```mermaid
+flowchart TD
+    A["读取历史 Manifest<br/>记录 manifestWasMissing"] --> B["打开稳定 XML 流<br/>Scan 完整扫描和检查重复 MSID"]
+    B -- "结构错误、重复、已捕获的读取异常" --> C["Errors++<br/>xmlMsids 加入历史 Manifest MSID"]
+    C --> D["不写任何 XML 照片、不修改 Manifest<br/>返回 false，回到主流程的 ZIP 判断"]
+    B -- "扫描成功" --> E{"还有元数据记录?"}
+    E -- 否 --> R["计划完成<br/>进入第二遍与 Manifest 提交图"]
+    E -- 是 --> F{"MSID 至少两位且字符合法?"}
+    F -- 否 --> SK["XmlSkipped++<br/>下一条元数据"]
+    F -- 是 --> G["加入本轮 xmlMsids<br/>此用户从现在起阻止 ZIP 覆盖"]
+    G --> H{"applyXmlWrites?"}
+    H -- 否 --> SK
+    H -- 是 --> I{"deleteEnabled 且非 Active?"}
+    I -- 是 --> SK
+    I -- 否 --> J{"LastModifiedTime 存在且可解析?"}
+    J -- 否 --> ER["记录字段错误<br/>XmlSkipped++、Errors++<br/>保留该用户旧照片及版本"]
+    ER --> E
+    J -- 是 --> K["计算标准目标路径"]
+    K -- "路径异常" --> PE["Errors++<br/>下一条元数据"]
+    PE --> E
+    K -- "成功" --> L["读取历史版本<br/>用完整目标路径查询快照是否存在"]
+    L --> M{"历史记录存在<br/>且 XML 版本不大于历史版本<br/>且标准目标存在?"}
+    M -- 是 --> SK
+    M -- 否 --> N["加入唯一 MSID 写入计划<br/>版本、目标路径、原先存在标志"]
+    N --> E
+    SK --> E
+```
+
 1. 带非空图片、合法 MSID 的记录进入本轮 `xmlMsids`。
 2. 本轮仅扫描，或删除保护开启且该用户非 Active 时跳过写入。
 3. 待应用记录缺失/错误的 LastModifiedTime：同时增加 XmlSkipped 和 Errors；保留旧版本，仍阻止该用户 ZIP 覆盖。
@@ -151,11 +233,80 @@ malformed XML、重复 MSID、第一遍读取失败：记录 Errors，取消本�
 
 结构/重复错误拒绝整轮 XML；字段/解码/逐文件写入错误属于逐条失败，其他有效记录可以成功，并保存成功部分 Manifest，但不推进整轮水位。未计划写入的旧版本照片不会重新解码校验。
 
+### 5.3 第二遍写入与 Manifest 保存
+
+```mermaid
+flowchart TD
+    A{"applyXmlWrites 且计划非空?"} -- 否 --> CLEAN["若 applyXmlWrites：RemoveMissing<br/>清理不在 xmlMsids 中的历史键"]
+    A -- 是 --> B["同一 XML 流 Seek 到开头<br/>创建 pending 计划副本"]
+    B --> C{"第二遍还有记录?"}
+    C -- 是 --> D{"pending 包含该 MSID?"}
+    D -- 否 --> C
+    D -- 是 --> E["从 pending 移除该项<br/>解码选中记录的 Image Base64"]
+    E -- "解码失败" --> ERR["XmlSkipped++、Errors++<br/>保留该用户旧照片及版本"]
+    ERR --> C
+    E -- "解码成功" --> F{"DryRun?"}
+    F -- 是 --> DRY["按目标原先是否存在<br/>统计 XmlAdded 或 XmlUpdated"]
+    DRY --> C
+    F -- 否 --> G["写目标同目录临时文件<br/>RetryIo 后 Move 覆盖目标"]
+    G -- "成功" --> H["增加 XmlAdded 或 XmlUpdated<br/>更新 Manifest：xml、UTC 版本、大小<br/>anyApplied = true"]
+    H --> C
+    G -- "失败" --> IO["清理该临时文件<br/>Errors++，继续下一条"]
+    IO --> C
+    C -- 否 --> P{"pending 仍有未找到的人员?"}
+    P -- 是 --> BAD["Errors++<br/>scanSucceeded = false"]
+    P -- 否 --> CLEAN
+    BAD --> CLEAN
+    C -. "第二遍已捕获的读取异常" .-> READERR["Errors++<br/>scanSucceeded = false<br/>已成功照片不回滚"]
+    READERR --> CLEAN
+    CLEAN --> SAVE{"非 DryRun 且<br/>成功应用过、移除过键<br/>或 Manifest 原先缺失?"}
+    SAVE -- 否 --> RETURN["返回 scanSucceeded"]
+    SAVE -- 是 --> WRITE["Manifest 临时写入后 Move"]
+    WRITE -- "成功" --> RETURN
+    WRITE -- "失败" --> SAVEERR["Errors++<br/>scanSucceeded = false"]
+    SAVEERR --> RETURN
+```
+
+取消直接向入口传播，不沿图中清理/保存分支继续。图中的 RemoveMissing 不会删除图片，只修改内存 Manifest；DryRun 不保存其变化。单条解码/写盘失败不会自动将 scanSucceeded 置为 false，但 Errors 会阻止最终水位提交。
+
 ## 6. ZIP 增量和 XML 移除/退役
 
 ZIP 顺序读取，跳过目录、非目标扩展名、非法 MSID、XML 覆盖项，以及删除保护开启时的非 Active 用户。
 
 当前快照索引为 `MSID → size`。索引显示存在且尺寸和 ZIP entry 相同则跳过，否则同目录临时写入后 Move。ZIP 无已知尺寸时不会按尺寸跳过。
+
+```mermaid
+flowchart TD
+    A["从共享快照建立 MSID 到 size 索引<br/>打开照片 ZIP"] --> B{"GetNextEntry 还有条目?"}
+    B -- 否 --> DONE["ZIP 阶段结束<br/>回到退役和状态提交"]
+    B -- 是 --> C{"文件条目?"}
+    C -- 否 --> B
+    C -- 是 --> D{"扩展名匹配 PhotoType<br/>且 MSID 合法?"}
+    D -- 否 --> SK["Skipped++<br/>读取下一条"]
+    D -- 是 --> E["ZipPhotoCount++"]
+    E --> F{"xmlMsids 包含该用户?"}
+    F -- 是 --> SK
+    F -- 否 --> G{"deleteEnabled 且非 Active?"}
+    G -- 是 --> SK
+    G -- 否 --> H["计算标准目标路径"]
+    H -- "路径异常" --> ER["Errors++<br/>读取下一条"]
+    H -- "成功" --> I{"索引存在该 MSID<br/>且 ZIP size 已知<br/>且两者 size 相同?"}
+    I -- 是 --> SK
+    I -- 否 --> J{"DryRun?"}
+    J -- 是 --> DRY["Updated++<br/>拟新增也计为 Updated"]
+    J -- 否 --> K["entry 流复制到目标旁临时文件<br/>RetryIo 后 Move 覆盖"]
+    K -- "成功" --> L["按索引原先是否存在<br/>增加 Added 或 Updated<br/>更新索引中的 size"]
+    K -- "失败" --> IO["清理临时文件<br/>Errors++"]
+    L --> B
+    IO --> B
+    DRY --> B
+    ER --> B
+    SK --> B
+```
+
+源复制、ZIP 打开、GetNextEntry 等未被局部捕获的异常直接交入口处理，不能理解为一律“Errors++ 后继续”。XML 失败保护集可来自历史 Manifest；XML 成功时来自本轮扫描。
+
+图中尺寸判断仍按 MSID 索引，不验证标准位置的实际存在性；XML 退役也没有绕过此判断。这两点正是当前保留的 P2。
 
 ### 6.1 从 XML 移除人员
 
@@ -194,6 +345,44 @@ Manifest 是 XML 成功应用记录，不是当前覆盖集，也不是照片备
 Manifest 临时文件 + Move 保存；水位直接覆盖写 JSON。两者 Load 错误按空状态处理；只有 Manifest **文件缺失**触发专门恢复门闸，存在但损坏不触发该门闸。
 
 累计 Errors 为 0 时才推进本轮变化的 photo/xml 水位；users 水位还要求 deleteEnabled=true。DryRun 不保存水位。失败后原水位保持，下一轮重试；成功的单条 Manifest 可避免重复写入。
+
+### 8.1 XML 退役、对账和水位提交顺序
+
+```mermaid
+flowchart TD
+    A["XML / ZIP 阶段结束"] --> B{"xmlRetired 且 Errors 为 0<br/>且非 DryRun?"}
+    B -- 否 --> F{"deleteEnabled?"}
+    B -- 是 --> C["重新加载历史 Manifest<br/>清空并保存"]
+    C -- "保存成功" --> D["从内存水位移除 xmlPhoto key"]
+    D --> F
+    C -- "保存失败" --> E["Errors++<br/>不移除内存 XML 水位"]
+    E --> F
+    F -- 否 --> CHECK{"累计 Errors 为 0?"}
+    F -- 是 --> G{"启动前快照还有照片?"}
+    G -- 否 --> CHECK
+    G -- 是 --> H{"MSID 在 Active 集?"}
+    H -- 是 --> G
+    H -- 否 --> I{"DryRun?"}
+    I -- 是 --> J["Deleted++，仅预览"]
+    J --> G
+    I -- 否 --> K["Move 到当天 quarantine<br/>保留原相对路径，同名覆盖"]
+    K -- "成功" --> L["Deleted++"]
+    K -- "失败" --> M["Errors++"]
+    L --> G
+    M --> G
+    CHECK -- 否 --> KEEP["不保存水位<br/>记录下轮重试"]
+    CHECK -- 是 --> SET["photoChanged：设置 photoZip mtime<br/>xmlChanged：设置 xmlPhoto mtime<br/>usersChanged 且 deleteEnabled：设置 usersZip mtime"]
+    SET --> DRY{"DryRun?"}
+    DRY -- 是 --> ENDPOINT["计算统计并返回 summary"]
+    DRY -- 否 --> SAVE["WatermarkStore.Save<br/>直接覆盖写 JSON"]
+    SAVE -- "成功" --> ENDPOINT
+    SAVE -- "异常" --> FAIL["入口捕获异常、释放锁<br/>退出 1"]
+    KEEP --> ENDPOINT
+```
+
+需要注意三个不同的提交时点：XML 成功照片及其 Manifest 可能先保存；退役 Manifest 在对账之前清空；源水位在对账之后才保存。后续对账/水位保存失败，不会自动恢复此前的照片或 Manifest。
+
+本轮结构/重复错误导致 XML 方法返回 false 时，并不直接跳过本图的对账：是否隔离仍看 deleteEnabled 和 Active 集。XML “拒绝整轮”仅指 XML 导入部分。
 
 ## 9. 日志与退出码
 
