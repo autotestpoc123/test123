@@ -1,6 +1,13 @@
 # PhotoImportTool：当前实现流程（ZIP + XML）
 
-核对日期：2026-09-21。适用工程：`COD.FirmwideDirectory.PhotoImportTool`。本文描述当前源码，不把讨论方案当作已实现功能。手工验收见 [端到端测试用例](photo_import_e2e_user_test_cases.md)。
+核对日期：2026-09-23。适用工程：`COD.FirmwideDirectory.PhotoImportTool`。本文描述当前源码，不把讨论方案当作已实现功能。手工验收见 [端到端测试用例](photo_import_e2e_user_test_cases.md)。
+
+### 可选照片 ZIP（2026-09-23）
+
+`PhotoZipPath` 为空/空白/null 时禁用 ZIP，XML-only 模式不检查 ZIP 文件、不复制 scratch、不扫描 ZIP、不推进 ZIP 水位。至少启用 XML/照片 ZIP 中一个，UsersZipPath 始终必填。已配置但不存在的来源仍报错，不自动降级。
+成功的非 DryRun 运行会移除禁用 ZIP 的历史水位（即使其他源未变化、提前返回）；重新启用时缺少水位强制扫描，不受旧 mtime 阻挡。失败或 DryRun 不持久化此变化。仅修改配置而未成功运行，不算已完成禁用切换。
+XML 退役/清空 Manifest 只在 ZIP 启用时进行；两种照片来源均关闭会在产生业务副作用前拒绝运行。XML-only 保留原有 Active/Quarantine 规则，不因 ZIP 缺席删除 Active 现有照片。
+下文 photoChanged 在 ZIP 禁用时固定 False；shouldUpsertZip 和 xmlRetired 均须额外满足 PhotoZipEnabled。XML 核查报表（含 DryRun）见 [CSV 说明](xml_audit_csv.md)。
 
 ## 1. 当前决策
 
@@ -18,7 +25,7 @@
 | 配置 | 当前含义 |
 |---|---|
 | `PhotoFolder` / `PhotoType` | 与 API 相同；部署/测试预先创建目录，扩展名默认 `.jpg` |
-| `PhotoZipPath` | 照片 ZIP；entry 叶文件名去扩展名得到 MSID，忽略 ZIP 内目录 |
+| `PhotoZipPath` | 可选照片 ZIP；空禁用；entry 叶文件名去扩展名得到 MSID，忽略 ZIP 内目录 |
 | `UsersZipPath` / `UsersDsmlName` | 真 Core 解析 DSML ZIP；需核对 ZIP 内部文件名 |
 | `XmlPhotoPath` | 非空启用；空停用；启用但文件不可访问是错误，不是退役 |
 | `AppliedManifestPath` | 空时取水位文件同目录的 `photo-applied-manifest.json` |
@@ -87,7 +94,7 @@ flowchart TD
     C -- "返回 null" --> X0["记录锁占用、跳过<br/>退出 0"]
     C -- "取得锁" --> D["创建 summary / 读取水位"]
     D --> E["PurgeQuarantine<br/>先处理过期批次；DryRun 只统计"]
-    E --> F["检查 photo/users/启用的 XML 源<br/>捕获各源 mtime，计算变化标志"]
+    E --> F["检查 users 和启用的照片来源<br/>禁用 ZIP 不访问文件；捕获 mtime"]
     F --> G["计算 manifestMissing 与 xmlRetired"]
     G --> H{"任一源变化<br/>或 Manifest 缺失<br/>或 XML 退役?"}
     H -- 否 --> I["记录三源无更新 skip<br/>直接返回已有 summary"]

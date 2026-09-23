@@ -3,8 +3,8 @@ using System.Text.Json;
 namespace COD.FirmwideDirectory.PhotoImportTool;
 
 /// <summary>
-/// 按 zip 分别持久化 last-load 水位(设计文档 C2)。
-/// 两个 zip 各自跟踪,避免"共用一个 LastLoadTime 导致每天只跑一次"漏清理。
+/// 按 zip 分别持久化水位 = "上次成功处理的该 zip 的 mtime"(C2:两 zip 各自跟踪)。
+/// 门闸用 `当前 zip mtime > 已存` 判断是否变更;存 zip mtime(非 now)+ '>' 比较,避免并发漏更新。
 /// </summary>
 public sealed class WatermarkStore
 {
@@ -33,10 +33,13 @@ public sealed class WatermarkStore
         return new WatermarkStore(path, new(StringComparer.OrdinalIgnoreCase));
     }
 
-    /// <summary>取某个 zip 的水位;从未加载过返回 UnixEpoch(IsReadyToLoad 视其为需要加载)。</summary>
+    /// <summary>取某个 zip 的水位(=上次成功处理的 mtime);从未处理过返回 UnixEpoch(门闸视其为已变更)。</summary>
     public DateTime Get(string key) => _map.TryGetValue(key, out var t) ? t : DateTime.UnixEpoch;
 
     public void Set(string key, DateTime value) => _map[key] = value;
+    public bool Contains(string key) => _map.ContainsKey(key);
+
+    public bool Remove(string key) => _map.Remove(key);
 
     public void Save()
     {

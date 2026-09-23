@@ -41,6 +41,7 @@ public static class XmlPhotoReader
     /// includeImage=false 时 ImageBase64 为空串(调用方不得解码)。</summary>
     public readonly record struct Record(string Msid, string? LastModifiedRaw, string ImageBase64);
     public readonly record struct Metadata(string Msid, string? LastModifiedRaw);
+    public readonly record struct PersonnelInfo(string Msid, bool HasImage);
 
     /// <summary>
     /// 流式读取;仅产出"有 msid 且有非空 Image"的记录,无照片者(缺 Images 块)自然略过。
@@ -64,8 +65,9 @@ public static class XmlPhotoReader
     public static IReadOnlyList<Metadata> Scan(
         Stream xmlStream,
         Action<string>? onExtraImages = null,
-        CancellationToken cancellationToken = default)
-        => ReadCore(xmlStream, _ => false, readLastModified: true, onExtraImages, cancellationToken)
+        CancellationToken cancellationToken = default,
+        Action<PersonnelInfo>? onPersonnel = null)
+        => ReadCore(xmlStream, _ => false, readLastModified: true, onExtraImages, cancellationToken, onPersonnel)
             .Select(record => new Metadata(record.Msid, record.LastModifiedRaw))
             .ToList();
 
@@ -85,7 +87,8 @@ public static class XmlPhotoReader
         Func<string, bool> includeImageForMsid,
         bool readLastModified,
         Action<string>? onExtraImages,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<PersonnelInfo>? onPersonnel = null)
     {
         var settings = new XmlReaderSettings
         {
@@ -109,7 +112,8 @@ public static class XmlPhotoReader
                 {
                     var rec = ReadPersonnel(
                         reader, includeImageForMsid, readLastModified,
-                        out var extraImages, out var msidForWarn);
+                        out var extraImages, out var msidForWarn, out var hasImage);
+                    onPersonnel?.Invoke(new PersonnelInfo(msidForWarn, hasImage));
                     // 在版本/Active/图片是否为空等过滤之前校验人员唯一性。
                     // Scan 会完整枚举后才返回,因此重复数据无法进入 Job 的第二遍写盘阶段。
                     if (!string.IsNullOrWhiteSpace(msidForWarn) && !seenMsids.Add(msidForWarn))
@@ -134,14 +138,15 @@ public static class XmlPhotoReader
         Func<string, bool> includeImageForMsid,
         bool readLastModified,
         out bool extraImages,
-        out string msidForWarn)
+        out string msidForWarn,
+        out bool hasImage)
     {
         extraImages = false;
         msidForWarn = "";
         string? msid = null;
         string? imageBase64 = null;
         string? lmtRaw = null;
-        bool hasImage = false;
+        hasImage = false;
         int imagesBlocks = 0;
 
         if (reader.IsEmptyElement)
