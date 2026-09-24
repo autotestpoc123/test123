@@ -389,7 +389,7 @@ public sealed class PhotoImportJob
             sourceStream = new FileStream(_opt.XmlPhotoPath!, FileMode.Open, FileAccess.Read, FileShare.Read);
             metadata = XmlPhotoReader.Scan(
                 sourceStream,
-                msid => _log.LogInformation("XML multiple Images; evaluating all candidates msid={Msid}", msid),
+                msid => _log.LogDebug("XML multiple Images; evaluating all candidates msid={Msid}", msid),
                 ct,
                 person => audit.Add(new XmlPhotoAudit.Row(person.Msid,
                     person.Msid.Length >= 2 && Utility.IsValidMSIDForPhoto(person.Msid),
@@ -438,7 +438,7 @@ public sealed class PhotoImportJob
                 if (msid.Length < 2 || !Utility.IsValidMSIDForPhoto(msid))
                 {
                     audit.Set(msid, "Skipped", "InvalidMsid");
-                    _log.LogInformation("XML skipped reason=InvalidMsid msid={Msid}", msid);
+                    _log.LogDebug("XML skipped reason=InvalidMsid msid={Msid}", msid);
                     s.XmlSkipped++;
                     continue;
                 }
@@ -448,14 +448,14 @@ public sealed class PhotoImportJob
                 if (!applyWrites)
                 {
                     audit.Set(msid, "Skipped", "CoverageOnly");
-                    _log.LogInformation("XML skipped reason=CoverageOnly msid={Msid}; XML writes not requested this run", msid);
+                    _log.LogDebug("XML skipped reason=CoverageOnly msid={Msid}; XML writes not requested this run", msid);
                     s.XmlSkipped++;
                     continue;
                 }
                 if (deleteEnabled && !activeMsids.Contains(msid))
                 {
                     audit.Set(msid, "Skipped", "NotActive");
-                    _log.LogInformation("XML skipped reason=NotActive msid={Msid}", msid);
+                    _log.LogDebug("XML skipped reason=NotActive msid={Msid}", msid);
                     s.XmlSkipped++;
                     continue;
                 }
@@ -500,14 +500,14 @@ public sealed class PhotoImportJob
                 if (prev is not null && lmt <= prev.Version && existsOnDisk)
                 {
                     audit.Set(msid, "Skipped", "VersionNotNewerAndTargetExists");
-                    _log.LogInformation(
+                    _log.LogDebug(
                         "XML skipped reason=VersionNotNewerAndTargetExists msid={Msid} xmlVersionUtc={XmlVersionUtc:o} manifestVersionUtc={ManifestVersionUtc:o} existsInSnapshot={ExistsInSnapshot} dest={Dest}",
                         msid, lmt.ToUniversalTime(), prev.Version.ToUniversalTime(), existsOnDisk, dest);
                     s.XmlSkipped++;
                     continue;
                 }
                 if (prev is not null && lmt <= prev.Version)
-                    _log.LogInformation(
+                    _log.LogDebug(
                         "XML 照片在 manifest 中已有记录但磁盘文件缺失，重新写入 msid={Msid} version={Version:o}",
                         msid, lmt);
 
@@ -517,7 +517,7 @@ public sealed class PhotoImportJob
                 remaining.Add(msid, latest.Length);
                 var reason = prev is null ? "NoManifestEntry" : !existsOnDisk ? "TargetMissing" : "NewerVersion";
                 audit.Set(msid, "Planned", reason);
-                _log.LogInformation(
+                _log.LogDebug(
                     "XML planned {Details}",
                     $"msid={msid} reason={reason} xmlVersionUtc={lmt.ToUniversalTime():o} manifestVersionUtc={prev?.Version.ToUniversalTime():o} existsInSnapshot={existsOnDisk} dest={dest}");
             }
@@ -582,7 +582,7 @@ public sealed class PhotoImportJob
                         if (_opt.DryRun)
                         {
                             audit.Set(item.Msid, "WouldWrite", "DryRun");
-                            _log.LogInformation("XML not written reason=DryRun msid={Msid} dest={Dest} bytes={Bytes} version={Version:o}", item.Msid, item.Destination, bytes.Length, item.Version);
+                            _log.LogDebug("XML not written reason=DryRun msid={Msid} dest={Dest} bytes={Bytes} version={Version:o}", item.Msid, item.Destination, bytes.Length, item.Version);
                             if (item.ExistsOnDisk) s.XmlUpdated++; else s.XmlAdded++;
                             continue;
                         }
@@ -602,7 +602,7 @@ public sealed class PhotoImportJob
                             });
                             anyApplied = true;
                             audit.Set(item.Msid, "Written", item.ExistsOnDisk ? "Updated" : "Added");
-                            _log.LogInformation(
+                            _log.LogDebug(
                                 "XML photo written msid={Msid} action={Action} dest={Dest} bytes={Bytes} versionUtc={VersionUtc:o}",
                                 item.Msid, item.ExistsOnDisk ? "Updated" : "Added", item.Destination, bytes.Length, item.Version.ToUniversalTime());
                         }
