@@ -1,8 +1,8 @@
 namespace COD.FirmwideDirectory.PhotoImportTool;
 
 /// <summary>
-/// 防与上一轮重叠(设计文档 §2 LK / §6 坑1)。用独占创建的 lock 文件实现:
-/// 拿不到 → 说明上一轮仍在跑,直接退出。
+/// Prevents overlapping runs (design section 2, LK / section 6, pitfall 1) using an exclusive lock file.
+/// If the lock cannot be acquired, the caller skips the run.
 /// </summary>
 public sealed class SingleInstanceLock : IDisposable
 {
@@ -11,7 +11,7 @@ public sealed class SingleInstanceLock : IDisposable
 
     private SingleInstanceLock(string path) => _path = path;
 
-    /// <summary>尝试获取锁;失败返回 null。</summary>
+    /// <summary>Try to acquire the lock; return null on an IOException.</summary>
     public static SingleInstanceLock? TryAcquire(string lockFilePath)
     {
         var dir = Path.GetDirectoryName(lockFilePath);
@@ -19,7 +19,7 @@ public sealed class SingleInstanceLock : IDisposable
 
         try
         {
-            // 独占打开 + DeleteOnClose:进程崩溃后句柄释放,文件也随之可再获取
+            // Exclusive open with DeleteOnClose: releasing the handle after a crash makes the lock available again.
             var stream = new FileStream(
                 lockFilePath, FileMode.OpenOrCreate, FileAccess.ReadWrite,
                 FileShare.None, bufferSize: 1, FileOptions.DeleteOnClose);
@@ -27,7 +27,7 @@ public sealed class SingleInstanceLock : IDisposable
         }
         catch (IOException)
         {
-            return null; // 已被占用
+            return null; // Lock unavailable
         }
     }
 

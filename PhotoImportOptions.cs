@@ -1,13 +1,13 @@
 namespace COD.FirmwideDirectory.PhotoImportTool;
 
 /// <summary>
-/// 从 appsettings.json 的 "PhotoImport" 节绑定。对应设计文档 §9 配置项。
+/// Binds the "PhotoImport" section in appsettings.json; see the configuration section of the design document.
 /// </summary>
 public sealed class PhotoImportOptions
 {
     public const string SectionName = "PhotoImport";
 
-    // —— 与 API 共享的两项:必须与后端 PhotoOptions 同值 ——
+    // Shared with the API: these settings must match backend PhotoOptions.
     public string PhotoFolder { get; set; } = "";
     public string PhotoType { get; set; } = ".jpg";
     // Default is server-local application data, independent of NAS manifest/photo paths.
@@ -23,78 +23,78 @@ public sealed class PhotoImportOptions
             "PhotoImportTool", "xml-audit")
         : XmlAuditDirectory;
 
-    // —— 输入 ——
+    // Input sources
     // Empty disables the optional photo ZIP source; UsersZipPath remains required.
     public string PhotoZipPath { get; set; } = "";
     public bool PhotoZipEnabled => !string.IsNullOrWhiteSpace(PhotoZipPath);
     public string UsersZipPath { get; set; } = "";
     public string UsersDsmlName { get; set; } = "users.dsml";
 
-    // —— XML 照片来源(§6)——
-    // 空 = 不启用 XML,完全退化为纯 zip(可灰度 / 退役)。非空则为单个 CrossFire 大文件(多 Personnel)。
+    // XML photo source
+    // Empty disables XML (ZIP-only mode); otherwise use a single CrossFire file containing multiple Personnel elements.
     public string? XmlPhotoPath { get; set; }
-    // 人级 applied-manifest 路径;为空则默认取 WatermarkFilePath 同目录下的 photo-applied-manifest.json。
+    // Per-user applied-manifest path; defaults to photo-applied-manifest.json beside WatermarkFilePath.
     public string? AppliedManifestPath { get; set; }
 
-    /// <summary>XML 是否启用(路径非空)。</summary>
+    /// <summary>Whether XML is enabled (nonempty path).</summary>
     public bool XmlEnabled => !string.IsNullOrWhiteSpace(XmlPhotoPath);
 
-    /// <summary>解析出的 manifest 落盘路径(应用 §6 默认推导)。</summary>
+    /// <summary>Resolve the manifest path, applying the default when not configured.</summary>
     public string ResolveManifestPath()
         => string.IsNullOrWhiteSpace(AppliedManifestPath)
             ? Path.Combine(Path.GetDirectoryName(WatermarkFilePath) ?? ".", "photo-applied-manifest.json")
             : AppliedManifestPath!;
 
-    // —— 变更门闸 ——
-    // 计划任务管"何时跑";门闸只比较 zip mtime 与上次处理的 mtime。Force=强制处理(手动调试用)。
+    // Change detection
+    // Scheduling controls when to run; source mtimes control whether to process. Force requests processing for manual runs.
     public bool Force { get; set; }
 
-    // —— 删除保护 / 演练 ——
+    // Deletion protection / dry run
     public bool DryRun { get; set; } = true;
-    // 绝对地板:活跃数低于它整轮不删(防 DSML 解析成空/极少)。按机构规模由运维设定,勿留 1。
+    // Skip deletion below this Active count to protect against incomplete DSML. Set an operational threshold; do not leave at 1.
     public int MinActiveThreshold { get; set; } = 1;
-    // 相对地板(自校准):单轮拟隔离数 > 盘上照片数 × 此比例即判异常并跳过删除。0.10 = 单轮最多隔离盘上 10%。
+    // Skip deletion when planned quarantine exceeds this fraction of existing photos; 0.10 allows at most 10% per run.
     public double MaxDeleteRatio { get; set; } = 0.10;
 
-    // 注:NAS 只读快照目录名("~snapshot")是平台不变量,钉死在 PhotoImportJob.SnapshotDirName 常量里,不做配置项。
+    // The NAS read-only snapshot directory "~snapshot" is a platform constant in PhotoImportJob, not a configurable name.
 
-    // —— quarantine 生命周期(§4.1)——
-    public string QuarantineDir { get; set; } = "";     // 必须在 PhotoFolder 之外
-    // 0 合法:仅保留当天及未来日期的批次;负数会导致当天批次被提前清理,必须拒绝。
+    // Quarantine lifecycle
+    public string QuarantineDir { get; set; } = "";     // Must be outside PhotoFolder.
+    // Zero retains today's and future batches. Reject negatives to avoid premature deletion of today's batch.
     public int QuarantineRetentionDays { get; set; } = 30;
 
-    // —— 运行时状态/隔离 ——
+    // Runtime state / isolation
     public string LockFilePath { get; set; } = "";
     public string WatermarkFilePath { get; set; } = "";
-    public string? LocalScratchDir { get; set; }        // 可选:大 zip 先拷本地再解压
+    public string? LocalScratchDir { get; set; }        // Optional: copy large ZIP files locally before extraction.
 
     public void Validate()
     {
-        if (string.IsNullOrWhiteSpace(PhotoFolder)) throw new ArgumentException("PhotoFolder 必填");
-        if (string.IsNullOrWhiteSpace(PhotoType) || !PhotoType.StartsWith('.')) throw new ArgumentException("PhotoType 应形如 \".jpg\"");
+        if (string.IsNullOrWhiteSpace(PhotoFolder)) throw new ArgumentException("PhotoFolder is required");
+        if (string.IsNullOrWhiteSpace(PhotoType) || !PhotoType.StartsWith('.')) throw new ArgumentException("PhotoType must have a format such as \".jpg\"");
         ValidatePhotoSources();
-        if (string.IsNullOrWhiteSpace(UsersZipPath)) throw new ArgumentException("UsersZipPath 必填");
-        if (string.IsNullOrWhiteSpace(QuarantineDir)) throw new ArgumentException("QuarantineDir 必填");
-        if (string.IsNullOrWhiteSpace(LockFilePath)) throw new ArgumentException("LockFilePath 必填");
-        if (string.IsNullOrWhiteSpace(WatermarkFilePath)) throw new ArgumentException("WatermarkFilePath 必填");
-        if (MaxDeleteRatio <= 0 || MaxDeleteRatio > 1) throw new ArgumentException("MaxDeleteRatio 应在 (0,1] 区间");
-        if (MinActiveThreshold < 0) throw new ArgumentException("MinActiveThreshold 不能为负");
+        if (string.IsNullOrWhiteSpace(UsersZipPath)) throw new ArgumentException("UsersZipPath is required");
+        if (string.IsNullOrWhiteSpace(QuarantineDir)) throw new ArgumentException("QuarantineDir is required");
+        if (string.IsNullOrWhiteSpace(LockFilePath)) throw new ArgumentException("LockFilePath is required");
+        if (string.IsNullOrWhiteSpace(WatermarkFilePath)) throw new ArgumentException("WatermarkFilePath is required");
+        if (MaxDeleteRatio <= 0 || MaxDeleteRatio > 1) throw new ArgumentException("MaxDeleteRatio must be in (0,1]");
+        if (MinActiveThreshold < 0) throw new ArgumentException("MinActiveThreshold cannot be negative");
         if (QuarantineRetentionDays < 0)
             throw new ArgumentOutOfRangeException(nameof(QuarantineRetentionDays), QuarantineRetentionDays,
-                "QuarantineRetentionDays 不能为负");
-        // §6:启用 XML 时,文件必须存在(与 zip 缺文件同样 fail-fast,避免门闸阶段才炸)。
+                "QuarantineRetentionDays cannot be negative");
+        // Fail fast when an enabled XML source is missing, before the change gate.
         if (XmlEnabled && !File.Exists(XmlPhotoPath))
-            throw new ArgumentException($"XmlPhotoPath 已配置但文件不存在:{XmlPhotoPath}");
-        // C3:quarantine 必须在 PhotoFolder 之外
+            throw new ArgumentException($"XmlPhotoPath is configured but the file does not exist: {XmlPhotoPath}");
+        // C3: quarantine must be outside PhotoFolder.
         var root = Path.GetFullPath(PhotoFolder);
         var quar = Path.GetFullPath(QuarantineDir);
         if (quar.StartsWith(root, StringComparison.OrdinalIgnoreCase))
-            throw new ArgumentException("QuarantineDir 必须位于 PhotoFolder 之外(否则对账会重复搬运隔离照片)");
+            throw new ArgumentException("QuarantineDir must be outside PhotoFolder to prevent repeated reconciliation of quarantined photos");
     }
 
     public void ValidatePhotoSources()
     {
         if (!PhotoZipEnabled && !XmlEnabled)
-            throw new ArgumentException("PhotoZipPath 和 XmlPhotoPath 至少配置一个照片来源");
+            throw new ArgumentException("At least one photo source must be configured: PhotoZipPath or XmlPhotoPath");
     }
 }

@@ -3,8 +3,8 @@ using System.Text.Json;
 namespace COD.FirmwideDirectory.PhotoImportTool;
 
 /// <summary>
-/// 按 zip 分别持久化水位 = "上次成功处理的该 zip 的 mtime"(C2:两 zip 各自跟踪)。
-/// 门闸用 `当前 zip mtime > 已存` 判断是否变更;存 zip mtime(非 now)+ '>' 比较,避免并发漏更新。
+/// Persist separate source watermarks: the mtime of each last successfully processed source.
+/// The gate compares current source mtime against the stored value; storing source mtime, not now, keeps later updates detectable.
 /// </summary>
 public sealed class WatermarkStore
 {
@@ -29,11 +29,11 @@ public sealed class WatermarkStore
                 return new WatermarkStore(path, new(map, StringComparer.OrdinalIgnoreCase));
             }
         }
-        catch { /* 损坏则视为无水位,全部当作需要加载 */ }
+        catch { /* On load failure, treat watermarks as absent so sources can be reconsidered. */ }
         return new WatermarkStore(path, new(StringComparer.OrdinalIgnoreCase));
     }
 
-    /// <summary>取某个 zip 的水位(=上次成功处理的 mtime);从未处理过返回 UnixEpoch(门闸视其为已变更)。</summary>
+    /// <summary>Return the source's last processed mtime, or UnixEpoch when absent.</summary>
     public DateTime Get(string key) => _map.TryGetValue(key, out var t) ? t : DateTime.UnixEpoch;
 
     public void Set(string key, DateTime value) => _map[key] = value;
