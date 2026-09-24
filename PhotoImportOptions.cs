@@ -10,8 +10,12 @@ public sealed class PhotoImportOptions
     // —— 与 API 共享的两项:必须与后端 PhotoOptions 同值 ——
     public string PhotoFolder { get; set; } = "";
     public string PhotoType { get; set; } = ".jpg";
-    // Null: xml-audit directory beside the applied manifest. CSV is also produced in DryRun.
+    // Default is server-local application data, independent of NAS manifest/photo paths.
     public string? XmlAuditDirectory { get; set; }
+    public string ResolveXmlAuditDirectory() => string.IsNullOrWhiteSpace(XmlAuditDirectory)
+        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "PhotoImportTool", "xml-audit")
+        : XmlAuditDirectory;
 
     // —— 输入 ——
     // Empty disables the optional photo ZIP source; UsersZipPath remains required.

@@ -302,15 +302,17 @@ $newDest = Join-Path $photoDir 'A\B\AB123.jpg'
 
 预期：退出 1、XML 完整性扫描失败；xmlAdded/xmlUpdated 为 0，旧 XML 照片及 Manifest 不变，水位不变；不会先写第一条 NEW 再报错。ZIP 可处理其他人员，但历史 Manifest 中的 58MVN 仍受保护。
 
-### TC-11：重复 MSID 拒绝整轮 XML
+### TC-11：重复 MSID / 多 Images 合并、最新版本选择与冲突保护
 
 前置：独立 TC-02 基线。
 
 步骤：构造顺序为“58MVN 的旧 v1、7G754 的有效新 XML 图片、58MVN 的新 v2”，推进 XML/ZIP mtime后运行。重复执行第二条 MSID 为 `58mvn` 或前后带空白的子场景；再验证重复记录无 Images 或为空 Image 的情况。
 
-预期：退出 1，日志含“重复 Personnel MSID”及具体 ID；xmlAdded/xmlUpdated 为 0；58MVN 旧照片不变，7G754 也不会部分应用新 XML 图；Manifest 和水位不变。检查发生在 Active/图片/版本过滤之前。
+预期：正常重复退出 0，58MVN 写入 v2 对应图片（而不是旧图配新版本），7G754 正常更新。交换记录顺序结果相同；大小写/空白 MSID 合并。有图+无图选择有图，全无图不导入，非 Active 沿用 Active 过滤。CSV Personnel 为原始条数，UserSummary 为去重有效人数。
 
-修复：去掉重复人员，保留有效新版本，重新运行应自动成功。另在 DryRun 执行重复数据，预期仍报错且不写业务文件。
+附加子场景：把两个最新候选设为同一 UTC 时刻（可使用不同偏移时区）。同图正常导入；异图退出 1，该用户目标及旧 Manifest 版本不变，其他有效用户仍可成功，水位不推进。最新 Base64 无效不得回落旧图；任一有图候选时间无效阻止该用户更新。修正输入后应自动重试成功。DryRun 不改业务文件，但生成本地 CSV；同时间比较临时目录应在结束后清理。
+
+多 Images 子场景：同一 Personnel 依次放 v1、v3 两个 Images，再增加同 MSID 的另一 Personnel（v2）。预期写入 v3 对应字节、Manifest=v3，不受块/人员顺序影响。首块改为空图时仍能选择后块；第二块缺时间不能继承第一块时间，必须按该用户错误处理。CSV 保留两行 Personnel、三行 ImageCandidate、一行 UserSummary，用 RecordIndex + ImagesIndex 定位所选块。
 
 ### TC-12：单次字段错误不回滚其他成功记录
 
