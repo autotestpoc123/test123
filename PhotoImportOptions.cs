@@ -14,7 +14,7 @@ public sealed class PhotoImportOptions
     public string? XmlAuditDirectory { get; set; }
     public string? LogDirectory { get; set; }
     public int LogRetentionDays { get; set; } = 30;
-    public long LogMaxFileBytes { get; set; } = 20 * 1024 * 1024;
+    public long LogMaxFileBytes { get; set; } = 2 * 1024 * 1024;
     public string ResolveLogDirectory() => string.IsNullOrWhiteSpace(LogDirectory)
         ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PhotoImportTool", "logs")
         : LogDirectory;
