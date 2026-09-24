@@ -12,6 +12,12 @@ public sealed class PhotoImportOptions
     public string PhotoType { get; set; } = ".jpg";
     // Default is server-local application data, independent of NAS manifest/photo paths.
     public string? XmlAuditDirectory { get; set; }
+    public string? LogDirectory { get; set; }
+    public int LogRetentionDays { get; set; } = 30;
+    public long LogMaxFileBytes { get; set; } = 20 * 1024 * 1024;
+    public string ResolveLogDirectory() => string.IsNullOrWhiteSpace(LogDirectory)
+        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PhotoImportTool", "logs")
+        : LogDirectory;
     public string ResolveXmlAuditDirectory() => string.IsNullOrWhiteSpace(XmlAuditDirectory)
         ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "PhotoImportTool", "xml-audit")
