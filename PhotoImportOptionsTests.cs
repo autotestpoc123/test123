@@ -5,6 +5,35 @@ namespace COD.FirmwideDirectory.PhotoImportTool.Verify;
 
 public class PhotoImportOptionsTests
 {
+    [Fact]
+    public void Committed_configuration_has_safe_defaults_and_requires_deployment_values()
+    {
+        using var json = System.Text.Json.JsonDocument.Parse(File.ReadAllText(
+            Path.Combine(AppContext.BaseDirectory, "TestData", "safe-appsettings.json")));
+        var section = json.RootElement.GetProperty("PhotoImport");
+        foreach (var key in new[] { "PhotoFolder", "PhotoZipPath", "UsersZipPath", "UsersDsmlName", "XmlPhotoPath", "QuarantineDir", "AppliedManifestPath" })
+            Assert.Equal("", section.GetProperty(key).GetString());
+        foreach (var property in section.EnumerateObject())
+            if (property.Value.ValueKind == System.Text.Json.JsonValueKind.String)
+                Assert.DoesNotContain(@"\\", property.Value.GetString()!);
+        var opt = System.Text.Json.JsonSerializer.Deserialize<PhotoImportOptions>(section.GetRawText())!;
+        Assert.True(opt.DryRun);
+        Assert.False(opt.Force);
+        Assert.Contains("PhotoFolder", Assert.Throws<ArgumentException>(opt.Validate).Message);
+        Assert.Throws<ArgumentException>(opt.ValidatePhotoSources);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("  ")]
+    public void Users_dsml_entry_name_is_required(string? name)
+    {
+        var opt = Options(Path.Combine(Path.GetTempPath(), "pit-options-" + Guid.NewGuid().ToString("N")), 30);
+        opt.UsersDsmlName = name!;
+        Assert.Contains("UsersDsmlName", Assert.Throws<ArgumentException>(opt.Validate).Message);
+    }
+
     [Theory]
     [InlineData(null)]
     [InlineData("")]
