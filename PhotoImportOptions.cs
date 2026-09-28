@@ -74,6 +74,7 @@ public sealed class PhotoImportOptions
         if (string.IsNullOrWhiteSpace(PhotoType) || !PhotoType.StartsWith('.')) throw new ArgumentException("PhotoType must have a format such as \".jpg\"");
         ValidatePhotoSources();
         if (string.IsNullOrWhiteSpace(UsersZipPath)) throw new ArgumentException("UsersZipPath is required");
+        if (string.IsNullOrWhiteSpace(UsersDsmlName)) throw new ArgumentException("UsersDsmlName is required and must match the DSML entry inside UsersZipPath");
         if (string.IsNullOrWhiteSpace(QuarantineDir)) throw new ArgumentException("QuarantineDir is required");
         if (string.IsNullOrWhiteSpace(LockFilePath)) throw new ArgumentException("LockFilePath is required");
         if (string.IsNullOrWhiteSpace(WatermarkFilePath)) throw new ArgumentException("WatermarkFilePath is required");
@@ -86,9 +87,13 @@ public sealed class PhotoImportOptions
         if (XmlEnabled && !File.Exists(XmlPhotoPath))
             throw new ArgumentException($"XmlPhotoPath is configured but the file does not exist: {XmlPhotoPath}");
         // C3: quarantine must be outside PhotoFolder.
-        var root = Path.GetFullPath(PhotoFolder);
-        var quar = Path.GetFullPath(QuarantineDir);
-        if (quar.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(PhotoFolder));
+        var quar = Path.TrimEndingDirectorySeparator(Path.GetFullPath(QuarantineDir));
+        // Compare directory boundaries, not bare prefixes: photos2 is not inside photos.
+        // Keep root separators intact (e.g. C:\) and reject equality explicitly.
+        var rootPrefix = Path.EndsInDirectorySeparator(root) ? root : root + Path.DirectorySeparatorChar;
+        if (quar.Equals(root, StringComparison.OrdinalIgnoreCase) ||
+            quar.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase))
             throw new ArgumentException("QuarantineDir must be outside PhotoFolder to prevent repeated reconciliation of quarantined photos");
     }
 

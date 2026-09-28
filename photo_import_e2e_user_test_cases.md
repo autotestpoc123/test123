@@ -65,24 +65,27 @@ $watermark = Join-Path $stateDir 'watermarks.json'
 $lockPath = Join-Path $stateDir 'photo-import.lock'
 Copy-Item -LiteralPath (Join-Path $assets 'users-base.zip') -Destination $usersZip
 
-# 参数逐项覆盖所有输入/输出路径，避免继承发布目录中的生产路径。
-$commonArgs = @(
-    "--PhotoImport:PhotoFolder=$photoDir"
-    '--PhotoImport:PhotoType=.jpg'
-    "--PhotoImport:PhotoZipPath=$photoZip"
-    "--PhotoImport:UsersZipPath=$usersZip"
-    '--PhotoImport:UsersDsmlName=pds-cod-fwd-user-dump.dsml'
-    "--PhotoImport:XmlPhotoPath=$xmlPath"
-    "--PhotoImport:AppliedManifestPath=$manifest"
-    "--PhotoImport:WatermarkFilePath=$watermark"
-    "--PhotoImport:LockFilePath=$lockPath"
-    "--PhotoImport:QuarantineDir=$quarantineDir"
-    '--PhotoImport:QuarantineRetentionDays=30'
-    "--PhotoImport:LocalScratchDir=$scratchDir"
-    '--PhotoImport:MinActiveThreshold=1'
-    '--PhotoImport:MaxDeleteRatio=1.0'
-    '--PhotoImport:Force=false'
-)
+# 每个用例使用独立 JSON，避免继承生产路径。
+$commonSettings = @{
+    PhotoFolder = $photoDir
+    PhotoType = '.jpg'
+    PhotoZipPath = $photoZip
+    UsersZipPath = $usersZip
+    UsersDsmlName = 'pds-cod-fwd-user-dump.dsml'
+    XmlPhotoPath = $xmlPath
+    AppliedManifestPath = $manifest
+    WatermarkFilePath = $watermark
+    LockFilePath = $lockPath
+    QuarantineDir = $quarantineDir
+    QuarantineRetentionDays = 30
+    LocalScratchDir = $scratchDir
+    LogDirectory = $logDir
+    XmlAuditDirectory = (Join-Path $caseRoot 'xml-audit')
+    MinActiveThreshold = 1
+    MaxDeleteRatio = 1.0
+    Force = $false
+    DryRun = $true
+}
 ```
 
 这里阈值 1、比例 1.0 仅用于小夹具，不能照搬到生产。后面的比例保护用例会专门覆盖这个值。
@@ -180,18 +183,27 @@ function Advance-InputTime {
 }
 
 function Invoke-Import {
-    param([string]$Label, [string[]]$Overrides = @())
-    $runArgs = $commonArgs + $Overrides
-    & $exe @runArgs 2>&1 | Tee-Object -FilePath (Join-Path $logDir ($Label + '.log'))
-    $exitCode = $LASTEXITCODE
-    "ExitCode=$exitCode"
+    param([string]$Label, [hashtable]$Overrides = @{})
+    $settings = $commonSettings.Clone()
+    foreach ($key in $Overrides.Keys) { $settings[$key] = $Overrides[$key] }
+    $configPath = Join-Path $caseRoot ($Label + '.json')
+    @{ PhotoImport = $settings } | ConvertTo-Json -Depth 5 |
+        Set-Content -LiteralPath $configPath -Encoding UTF8
+    $previousConfig = $env:FWD_PHOTO_CONFIG_FILE
+    try {
+        $env:FWD_PHOTO_CONFIG_FILE = $configPath
+        & $exe 2>&1 | Tee-Object -FilePath (Join-Path $logDir ($Label + '.console.log'))
+        $exitCode = $LASTEXITCODE
+        "ExitCode=$exitCode"
+    }
+    finally { $env:FWD_PHOTO_CONFIG_FILE = $previousConfig }
 }
 
 # 首次演练
-Invoke-Import 'dryrun' @('--PhotoImport:DryRun=true')
+Invoke-Import 'dryrun' @{ DryRun = $true }
 
 # 正式测试写入；只指向本用例的隔离目录
-# Invoke-Import 'realrun' @('--PhotoImport:DryRun=false')
+# Invoke-Import 'realrun' @{ DryRun = $false }
 
 $xmlDest = Join-Path $photoDir '5\8\58MVN.jpg'
 $zipDest = Join-Path $photoDir '7\G\7G754.jpg'
@@ -202,9 +214,9 @@ $newDest = Join-Path $photoDir 'A\B\AB123.jpg'
 # Get-Content -LiteralPath $watermark -Raw
 ```
 
-覆盖参数放在最后，例如 `@('--PhotoImport:DryRun=false', '--PhotoImport:XmlPhotoPath=')` 停用 XML。目录路径含空格时仍使用上述参数数组。
+测试辅助函数将覆盖值写入本轮独立 JSON，例如 `@{ DryRun = $false; XmlPhotoPath = '' }` 停用 XML。路径含空格也由 JSON 正确保存；EXE 不接收业务命令行参数。
 
-程序只输出控制台日志，逐文件 Debug 默认不可见。退出 0 包含“跳过”，必须结合日志、目标哈希和状态文件判断。`FWD_TEST_*` 不控制这里的 EXE。
+详细运行汇总保存在 LogDirectory，控制台仅输出 Warning 及以上；逐文件 Debug 默认不可见。退出 0 包含“跳过”，必须结合日志、目标哈希和状态文件判断。`FWD_TEST_*` 不控制这里的 EXE。
 
 ## 4. 正常路径用例
 
@@ -220,7 +232,7 @@ $newDest = Join-Path $photoDir 'A\B\AB123.jpg'
 
 前置：全新夹具，或沿用 TC-01 的未改变数据。
 
-步骤：`Invoke-Import 'tc02' @('--PhotoImport:DryRun=false')`。
+步骤：`Invoke-Import 'tc02' @{ DryRun = $false }`。
 
 预期：退出 0，errors=0；标准目标 58MVN 哈希等于 xml-v1、不同于 ZIP 和 Thumbnail；7G754 等于 zip-7；AB123 不落盘；ZZ999 原位置消失，位于当天 quarantine 的 `Z\Z\ZZ999.jpg`。小夹具下 added=1、xmlAdded=1、deleted=1，Manifest 只有 58MVN，版本对应 v1 的 UTC 时间，size 等于 xml-v1 长度。水位包含三个源的 mtime，photos 出现网格标记。
 
@@ -336,7 +348,7 @@ $newDest = Join-Path $photoDir 'A\B\AB123.jpg'
 
 前置：TC-02 基线。先保存 58MVN 文件作为证据到 PhotoFolder 外，再删除其标准目标文件。
 
-步骤：保持所有输入不变运行，预期整体 skip、缺图仍在；然后运行 `Invoke-Import 'tc14-force' @('--PhotoImport:DryRun=false','--PhotoImport:Force=true')`。
+步骤：保持所有输入不变运行，预期整体 skip、缺图仍在；然后运行 `Invoke-Import 'tc14-force' @{ DryRun = $false; Force = $true }`。
 
 预期：第二轮 XML 恢复该文件，xmlAdded=1，哈希等于 xml-v1，版本未前进也可恢复。可在 PhotoFolder 的 wrong 子目录放同名照片重复验证，XML 标准目标仍应恢复。
 
@@ -344,7 +356,7 @@ $newDest = Join-Path $photoDir 'A\B\AB123.jpg'
 
 前置：新夹具，先禁用 XML，预置一个 Active 照片和一个 ZZ999 孤儿，使拟隔离比例为 50%。
 
-步骤 A：运行时覆盖 `--PhotoImport:MaxDeleteRatio=0.1`，Force=false。预期 deleteEnabled=False，日志提示比例超限，孤儿不移动、users 水位不推进。没有其他错误时退出仍可为 0。
+步骤 A：通过测试函数传入 `@{ DryRun = $false; MaxDeleteRatio = 0.1 }` 写入本轮 JSON，Force=false。预期 deleteEnabled=False，日志提示比例超限，孤儿不移动、users 水位不推进。没有其他错误时退出仍可为 0。
 
 步骤 B：同样数据设 MinActiveThreshold=3（实际 Active=2），即使 Force=true 也不启用删除。
 
@@ -364,7 +376,7 @@ $newDest = Join-Path $photoDir 'A\B\AB123.jpg'
 
 前置：新夹具，在 quarantine 放当天及历史测试文件。
 
-步骤：分别传入 `--PhotoImport:QuarantineRetentionDays=-1` 和 `-2147483648`，DryRun=false。
+步骤：分别在本轮 JSON 中设置 `QuarantineRetentionDays=-1` 和 `-2147483648`，DryRun=false。
 
 预期：退出 2，日志为配置加载失败并指出 QuarantineRetentionDays；任何批次文件都未删除，不进入 Job 清理。0/30 不因该参数被拒绝。
 
@@ -374,7 +386,7 @@ $newDest = Join-Path $photoDir 'A\B\AB123.jpg'
 
 步骤 A：XML 去掉 58MVN，推进 XML mtime，运行。预期目标变为 zip-58，Manifest 去掉 58MVN。
 
-步骤 B：另一个独立 TC-02 基线，不修改输入 ZIP，传 `--PhotoImport:XmlPhotoPath=` 停用 XML。预期目标变为 zip-58，Manifest 清空，最终水位没有 xmlPhoto key。
+步骤 B：另一个独立 TC-02 基线，不修改输入 ZIP，在本轮 JSON 中设置 `XmlPhotoPath` 为空字符串以停用 XML。预期目标变为 zip-58，Manifest 清空，最终水位没有 xmlPhoto key。
 
 步骤 C：在 B 成功后重新指定原 XML 路径，即使 XML 文件 mtime 未改也应重新应用 XML。
 

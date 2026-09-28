@@ -1,7 +1,5 @@
 # PhotoImportTool：当前实现流程（XML-only / ZIP-only / XML 优先双来源）
 
-核对日期：2026-09-24。适用工程：`COD.FirmwideDirectory.PhotoImportTool`。本文描述当前源码，不把讨论方案当作已实现功能。手工验收见 [端到端测试用例](photo_import_e2e_user_test_cases.md)。
-
 ## 1. 当前决策
 
 - 一个 Job 处理必需的 users DSML ZIP，以及可选照片 ZIP / CrossFire XML；至少启用一个照片来源，共用目标路径、照片快照、隔离区和水位。
@@ -14,16 +12,20 @@
 
 ## 2. 配置、输入与标准路径
 
-程序从 EXE 所在目录读取 `appsettings.json` 的 `PhotoImport` 节。优先级从低到高：JSON、`FWD_PHOTO_` 前缀环境变量、命令行。示例：`FWD_PHOTO_PhotoImport__DryRun=true` 或 `--PhotoImport:DryRun=true`。不会自动加载 `appsettings.Production.json`，也不读取测试专用的 `FWD_TEST_*` 变量。
+程序从 EXE 所在目录读取必需的 `appsettings.json`。优先级仅为：基础 JSON、`FWD_PHOTO_CONFIG_FILE` 指定的外部 JSON。不再加载逐项环境变量或命令行参数；FWD_PHOTO_CONFIG_FILE 只负责选择文件。外部文件必须使用绝对路径且存在、可读取、JSON 格式正确，否则启动失败；未设置或空白时跳过外部文件。两份 JSON 都使用 `PhotoImport` 节，外部未提供的字段保留基础值，启动后不热更新。修改业务配置须编辑 JSON 后重启。不会按环境名自动加载 `appsettings.Production.json`，也不读取测试专用的 `FWD_TEST_*` 变量。
+
+仓库仅保存安全默认配置：照片和 users 来源路径、PhotoFolder、QuarantineDir 及 UsersDsmlName 留空，不携带真实内网地址或环境专用文件名。QA/PROD 使用同一发布包，通过外部 JSON 提供真实值；未配置时拒绝启动导入。服务器通用本地日志/状态路径仍保留默认值。具体步骤见 [部署配置与内网路径保护](deployment_configuration.md)。
 
 | 配置 | 当前含义 |
 |---|---|
 | `PhotoFolder` / `PhotoType` | 与 API 相同；部署/测试预先创建目录，扩展名默认 `.jpg` |
 | `PhotoZipPath` | 可选照片 ZIP；空禁用；entry 叶文件名去扩展名得到 MSID，忽略 ZIP 内目录 |
-| `UsersZipPath` / `UsersDsmlName` | users ZIP 路径始终必填；真 Core 解析 DSML ZIP，需核对 ZIP 内部文件名 |
+| `UsersZipPath` / `UsersDsmlName` | 两项均不得为空；真 Core 解析 DSML ZIP，UsersDsmlName 必须匹配 ZIP 内部文件名 |
 | `XmlPhotoPath` | 非空启用；空停用；启用但文件不可访问是错误，不是退役 |
 | `AppliedManifestPath` | 空时取水位文件同目录的 `photo-applied-manifest.json` |
 | `XmlAuditDirectory` | 仓库配置为服务器本地 `C:\ProgramData\FwdPhotoImport\xml-audit`；空时取运行账号 LocalApplicationData 下 `PhotoImportTool/xml-audit`，不再跟随 NAS Manifest。DryRun 也输出 |
+| `LogDirectory` | 仓库配置为服务器本地 `C:\ProgramData\FwdPhotoImport\logs`；空时取运行账号 LocalApplicationData 下 `PhotoImportTool/logs` |
+| `LogRetentionDays` / `LogMaxFileBytes` | 默认 30 天 / 2097152 字节（2 MiB），均须大于 0；文件日志在启动时校验 |
 | `WatermarkFilePath` | 输入源文件级 mtime 状态 |
 | `LockFilePath` | 独占锁文件；处理同一输出的实例必须协调使用同一个锁位置 |
 | `LocalScratchDir` | 可选；需要扫描照片 ZIP 时先拷本地，DryRun 不拷贝 |
@@ -31,7 +33,7 @@
 | `Force` | 强制源变化判定，并绕过删除比例保护；不绕过绝对 Active 阈值，也不强制重写同尺寸/同版本照片 |
 | `MinActiveThreshold` | Active 数量不足则关闭对账删除；代码默认 1，仓库 JSON 为 1000，生产按实际规模设置 |
 | `MaxDeleteRatio` | `(0,1]`，默认 0.10；拟隔离比例严格超限时关闭删除，Force 可绕过 |
-| `QuarantineDir` | 独立隔离目录；部署确保和 PhotoFolder 互不包含 |
+| `QuarantineDir` | 独立隔离目录；校验按标准化路径和目录分隔符边界拒绝与 PhotoFolder 相同或位于其内部，允许 photos/photos2 同级目录。部署仍须确保反向不包含，并避免链接或共享别名导致实际重叠 |
 | `QuarantineRetentionDays` | 默认 30，负数在 Validate 和永久清理入口拒绝；0 清理今天之前的批次 |
 
 ### 2.1 来源模式与配置校验
@@ -91,48 +93,43 @@ PhotoFolder\UPPER(msid[0])\UPPER(msid[1])\{msid}{PhotoType}
 
 ## 4. 执行顺序和阶段门闸
 
-以下六张图分别对应入口总流程、删除保护、XML 扫描与计划、XML 写入、ZIP 写入、退役与状态提交。节点中的计数变化对应 `RunSummary`；图中的“下一条”表示继续当前循环。
+以下六张图按“总览 → 阶段细节”组织。先看 4.0 理解执行顺序，再看 4.2（快照与保护）、第 5 节（XML）、第 6 节（ZIP）、8.1（状态提交）。精确布尔表达式统一保留在 4.3，不在总览图中展开。
+
+读图约定：矩形表示处理阶段，菱形才表示判断；标有“按条件”的矩形是可选阶段，条件不成立只跳过该阶段、继续下一阶段，不表示整轮结束。箭头汇合表示继续执行，不表示无条件写入。详细图中的“下一条”回到当前循环；计数对应 RunSummary。
 
 ### 4.0 入口与主流程
 
-代码依据：`Program.Main`、`PhotoImportJob.Run`。XML、ZIP 子阶段的触发条件见 4.3，内部细节见第 5、6 节。
+代码依据：`Program.Main`、`PhotoImportJob.Run`。本图只表达阶段顺序，不把每个 if 都画成分叉；启动失败/锁占用的退出码见第 9 节。
 
 ```mermaid
 flowchart TD
-    A["加载 JSON、环境变量、命令行<br/>绑定 PhotoImport 并 Validate"] --> B{"配置有效?"}
-    B -- 否 --> X2["记录启动错误<br/>退出 2"]
-    B -- 是 --> C["TryAcquire 独占锁"]
-    C -- "异常传播" --> X2
-    C -- "返回 null" --> X0["记录锁占用、跳过<br/>退出 0"]
-    C -- "取得锁" --> D["Job 再检查至少一个照片来源<br/>创建 summary / 读取水位 / 输出模式<br/>ZIP 停用则从内存移除 photoZip 水位"]
-    D --> E["PurgeQuarantine<br/>先处理过期批次；DryRun 只统计"]
-    E --> F["检查 users 和启用的照片来源<br/>禁用 ZIP 不访问文件；捕获 mtime"]
-    F --> G["计算 manifestMissing 与 xmlRetired"]
-    G --> H{"任一源变化<br/>或 Manifest 缺失<br/>或 XML 退役?"}
-    H -- 否 --> I["记录源无更新 skip<br/>XML 启用则生成 NotScanned CSV"]
-    I --> IC{"本轮移除了旧 ZIP 水位<br/>且 Errors 为 0 且非 DryRun?"}
-    IC -- 是 --> IS["保存移除后的水位"]
-    IC -- 否 --> S
-    IS --> S
-    H -- 是 --> J["解析 Active 集<br/>一次快照及删除保护：见 4.2"]
-    J --> K{"非 DryRun 且 willWrite?"}
-    K -- 是 --> L["EnsurePhotoFolderGrid"]
-    K -- 否 --> M{"XML 扫描条件成立?"}
-    L --> M
-    M -- 是 --> N["UpsertXmlPhotos：两遍处理<br/>finally 保存 XML 核查 CSV<br/>返回 xmlScanSucceeded"]
-    M -- 否 --> O{"shouldUpsertZip?"}
-    N --> O
-    O -- 是 --> P["按需复制 ZIP 到 scratch<br/>UpsertPhotos"]
-    O -- 否 --> Q["退役 / 对账 / 水位<br/>见第 8 节状态提交图"]
-    P --> Q
-    Q --> R["计算照片统计并返回 summary"]
-    R --> S{"summary.Errors 大于 0?"}
-    S -- 是 --> X1["输出汇总、释放锁<br/>退出 1"]
-    S -- 否 --> OK["输出汇总、释放锁<br/>退出 0"]
-    F -. "源缺失等未捕获异常" .-> FAIL["入口捕获运行异常或取消<br/>释放锁、退出 1"]
+    A["启动：加载配置、校验、取得独占锁"] --> B["准备：读取水位、记录来源模式<br/>禁用 ZIP 的旧水位先从内存移除"]
+    B --> C["清理到期 Quarantine<br/>DryRun 只预览"]
+    C --> D["检查启用的来源和恢复状态"]
+    D --> E{"本轮需要处理?<br/>来源变化 / Manifest 缺失 / XML 退役"}
+    E -- "否：快速结束，不扫描照片" --> SKIP["记录 skip；XML 启用则输出 NotScanned CSV<br/>按条件保存禁用 ZIP 的水位移除，见 4.1"]
+    E -- "是：进入处理主线" --> F["解析 Active 集、建立一次共享快照<br/>确定删除保护，见 4.2"]
+    F --> G["按条件：预建目标网格目录<br/>仅非 DryRun 且 willWrite"]
+    G --> H["按条件：XML 阶段<br/>两遍选图 / 应用 / CSV，见第 5 节"]
+    H --> I["按条件：ZIP 阶段<br/>必须启用 ZIP 且需要扫描，见第 6 节"]
+    I --> J["退役处理 → 对账 → 水位提交<br/>各自按条件执行，见 8.1"]
+    J --> K["计算照片统计"]
+    K --> END["输出汇总、释放锁<br/>Errors 为 0 退出 0；否则退出 1"]
+    SKIP --> END
+    D -. "未捕获运行异常或取消" .-> FAIL["记录失败、释放锁、退出 1"]
 ```
 
 图中以源检查示例标出未捕获异常出口；持锁期间其他阶段抛出的未捕获异常/取消也走该出口，可能没有完成汇总。已在阶段内部捕获的错误通常计入 Errors 后继续执行。
+
+主线中的三个可选阶段不是互斥分支：
+
+| 阶段 | 条件不成立时 | 条件成立时 |
+|---|---|---|
+| 预建网格目录 | 不建目录，继续判断 XML | 建目录后继续判断 XML |
+| XML | 不扫描 XML，继续判断 ZIP | 完成 XML 阶段后继续判断 ZIP；未捕获异常/取消除外 |
+| ZIP | 不扫描 ZIP，进入退役/对账/水位阶段 | 完成 ZIP 后进入退役/对账/水位阶段 |
+
+因此，DryRun 不建业务目录但仍可扫描/校验 XML；ZIP-only 跳过 XML 后仍可处理 ZIP；XML-only 完成 XML 后跳过 ZIP。这些都不是提前终止。
 
 整轮不是事务；某阶段失败不表示已完成的其他阶段回滚。快速 skip 前的清理若已累计 Errors，最终也会退出 1，并非所有 skip 都退出 0。
 
@@ -150,9 +147,12 @@ flowchart TD
 所有源无变化且无上述例外时快速返回，但此前仍执行 quarantine 到期清理；XML 启用时输出 NotScanned CSV。若本轮从内存移除了禁用 ZIP 的历史水位，且无错误、非 DryRun，则快速返回前也保存这一移除。
 已存在水位时，同 mtime 内容替换或更早 mtime 不自动判为更新。ZIP 禁用/重新启用的规则详见 8.2。
 
+快速结束分支只做两件收尾工作：先尝试输出 NotScanned CSV（不是零人数报表），再按 `removedPhotoWatermark && Errors == 0 && !DryRun` 保存水位移除。否则不保存，直接返回。这里删除的只是 watermarks 中的 photoZip key，不是照片、Manifest 或整个水位文件；若保存抛异常，则走运行失败出口。
+
 ### 4.2 Active 集、快照与删除保护
 
-快照条件：`photoChanged || usersChanged || xmlChanged || xmlRetired || manifestMissing || deleteEnabled`。每轮最多枚举一次照片树，保存完整路径、MSID 和长度，不读取图片内容。
+只有 `photoChanged / usersChanged / xmlChanged / xmlRetired / manifestMissing` 至少一项为 true 才会越过入口门闸。代码已移除恒真的 `needSnapshot` 判断及不可达的空快照分支，到达本阶段后直接建立一次共享快照，与下面的流程图一致。所有条件为 false 时仍在入口快速返回，不扫描照片树。
+每轮最多枚举一次照片树，保存完整路径、MSID 和长度，不读取图片内容。删除被禁止也仍需快照，因为 XML 恢复判断和 ZIP 尺寸比较同样依赖它。
 
 枚举包含隐藏/系统文件，遇不可访问目录抛异常，在目录级跳过 `~snapshot`。非 DryRun 清理找到的 `.photoimport-tmp` 孤儿文件。
 
@@ -165,17 +165,14 @@ flowchart TD
     A["BuildActiveMsids<br/>真 Core 解析 DSML，筛选 Active，MSID 去重"] --> B{"ActiveCount 达到 MinActiveThreshold?"}
     B -- 是 --> C["deleteEnabled = true"]
     B -- 否 --> D["deleteEnabled = false<br/>记录绝对阈值告警"]
-    C --> E{"needSnapshot?"}
-    D --> E
-    E -- 否 --> F["使用空快照"]
-    E -- 是 --> G["SnapshotPhotoFolder<br/>路径、MSID、size；跳过 ~snapshot"]
+    C --> G["统一建立一次照片快照<br/>SnapshotPhotoFolder：路径、MSID、size<br/>跳过 ~snapshot"]
+    D -- "只禁用删除，不停止导入" --> G
     G --> H["非 DryRun 清理孤儿临时文件<br/>同一快照供 XML、ZIP、对账复用"]
-    F --> I{"deleteEnabled 为 true<br/>且非 Force，且快照非空?"}
-    H --> I
-    I -- 否 --> M["保持当前 deleteEnabled<br/>进入来源处理阶段"]
+    H --> I{"需要检查删除比例?<br/>deleteEnabled 且非 Force 且快照非空"}
+    I -- "否：不检查比例" --> M["携带最终 deleteEnabled<br/>进入来源处理阶段"]
     I -- 是 --> J["统计快照中不在 Active 集的照片数"]
     J --> K{"拟隔离数大于<br/>快照数乘 MaxDeleteRatio?"}
-    K -- 否 --> M
+    K -- "否：保留当前删除开关" --> M
     K -- 是 --> L["deleteEnabled = false<br/>记录比例保护告警"]
     L --> M
 ```
@@ -191,7 +188,7 @@ Force 只跳过比例检查，不会把已经为 false 的绝对阈值结果变�
 | xmlChanged | `XmlEnabled && (Force \|\| currentMtime > savedMtime)` |
 | manifestMissing | `XmlEnabled && !DryRun && !File.Exists(manifestPath)` |
 | xmlRetired | `PhotoZipEnabled && !XmlEnabled && historicalManifest.Count > 0` |
-| willWrite（预建网格） | `photoChanged \|\| usersChanged \|\| (XmlEnabled && (xmlChanged \|\| manifestMissing))`，实际建网格还要求非 DryRun |
+| willWrite（预建网格） | `photoChanged \|\| usersChanged \|\| xmlRetired \|\| (XmlEnabled && (xmlChanged \|\| manifestMissing))`，实际建网格还要求非 DryRun |
 | XML 扫描 | `XmlEnabled && (photoChanged \|\| usersChanged \|\| xmlChanged \|\| manifestMissing)` |
 | applyXmlWrites | `usersChanged \|\| xmlChanged \|\| manifestMissing`；必须先进入 XML 扫描并成功 |
 | 仅 photo 变化时的 XML | applyXmlWrites=false，仅建立覆盖集 |
@@ -202,7 +199,7 @@ Force 只跳过比例检查，不会把已经为 false 的绝对阈值结果变�
 
 只有 users 变化时，新 Active 用户可从未变且启用的 XML/ZIP 补图；已有 XML 仍按版本跳过，ZIP 仍按尺寸跳过。先建立 XML 覆盖集，保持 XML 优先。XML-only 不会因 users 或 XML 变化而访问 ZIP。
 
-非 DryRun、有写入可能时调用 `EnsurePhotoFolderGrid`：首次预建 36×36 网格和 `.photogrid-ready`，以后通常走标记快速路径。照片子目录缺失时写入函数可以补建。
+非 DryRun、有写入可能时调用 `EnsurePhotoFolderGrid`，包括只有 XML 退役触发 ZIP 回落的轮次：首次预建 36×36 网格和 `.photogrid-ready`，以后通常走标记快速路径。照片子目录缺失时写入函数仍可兜底补建。DryRun 不预建网格。
 
 ## 5. XML 两遍处理与错误边界
 
@@ -219,8 +216,10 @@ malformed XML、第一遍读取失败：记录 Errors，取消本轮全部 XML �
 ### 5.2 计划与第二遍
 
 下图展开第一遍及计划生成；元数据按忽略大小写 MSID 分组，过滤后选择最新候选。同时间候选须全部通过内容比较后才能写入该用户照片。
+为避免长回线把分支标签挤在一起，“继续下一组”使用文字连接点，含义是回到“还有带图 MSID 分组？”；时间和路径分支的结果直接写在目标框内，不叠放在箭头上。
 
 ```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 55, "rankSpacing": 65, "curve": "linear"}}}%%
 flowchart TD
     A["读取历史 Manifest<br/>记录 manifestWasMissing"] --> B["打开稳定 XML 流<br/>Scan 完整扫描，分配记录序号"]
     B -- "结构错误、已捕获的读取异常" --> C["Errors++<br/>xmlMsids 加入历史 Manifest MSID"]
@@ -228,24 +227,24 @@ flowchart TD
     B -- "扫描成功" --> E{"还有带图 MSID 分组?"}
     E -- 否 --> R["计划完成<br/>进入第二遍与 Manifest 提交图"]
     E -- 是 --> F{"MSID 至少两位且字符合法?"}
-    F -- 否 --> SK["XmlSkipped++<br/>下一条元数据"]
+    F -- 否 --> SK["跳过该用户<br/>XmlSkipped++"]
     F -- 是 --> G["加入本轮 xmlMsids<br/>此用户从现在起阻止 ZIP 覆盖"]
     G --> H{"applyXmlWrites?"}
     H -- 否 --> SK
     H -- 是 --> I{"deleteEnabled 且非 Active?"}
     I -- 是 --> SK
     I -- 否 --> J{"所有有图候选的时间<br/>存在且可解析?"}
-    J -- 否 --> ER["记录字段错误<br/>XmlSkipped++、Errors++<br/>保留该用户旧照片及版本"]
-    ER --> E
-    J -- 是 --> K["选 UTC 最新候选及同时间记录序号<br/>计算标准目标路径"]
-    K -- "路径异常" --> PE["Errors++<br/>下一条元数据"]
-    PE --> E
-    K -- "成功" --> L["读取历史版本<br/>用完整目标路径查询快照是否存在"]
+    J --> ER["时间无效：不应用该用户<br/>记录字段错误，XmlSkipped++、Errors++<br/>保留旧照片及版本"]
+    ER --> NEXT["继续下一组 MSID<br/>回到上方分组判断"]
+    J --> K["时间有效：选 UTC 最新候选<br/>保存 Personnel / Images 双序号<br/>计算标准目标路径"]
+    K --> PE["路径计算失败<br/>记录错误，Errors++"]
+    PE --> NEXT
+    K --> L["路径计算成功<br/>读取历史版本<br/>查询标准目标是否在快照中"]
     L --> M{"历史记录存在<br/>且 XML 版本不大于历史版本<br/>且标准目标存在?"}
     M -- 是 --> SK
     M -- 否 --> N["加入唯一 MSID 写入计划<br/>版本、目标路径、最新候选序号集合"]
-    N --> E
-    SK --> E
+    N --> NEXT
+    SK --> NEXT
 ```
 
 1. 带非空图片、合法 MSID 的记录进入本轮 `xmlMsids`。
@@ -262,48 +261,67 @@ flowchart TD
 
 结构错误拒绝整轮 XML；字段/同时间冲突/解码/逐文件写入错误属于逐用户失败，其他有效用户可以成功，并保存成功部分 Manifest，但不推进整轮水位。仅覆盖集轮次、被 Active 过滤的用户不作候选时间裁决；已按 Manifest 跳过的旧版本不重新解码，也不验证同时间图片内容。
 
-### 5.3 第二遍写入与 Manifest 保存
+### 5.3 第二遍：读取选中图片 → 应用照片 → 保存 Manifest
+
+第一遍已完成“选哪个用户、哪个版本、哪些 Images 候选”的判断。本阶段不重新选最新，只读取计划指定的图片、确认可用后应用，再保存状态。
+
+#### 正常处理主线
+
+下面按职责展示六个步骤。第 2～4 步实际上在一次顺序遍历中逐用户完成，并非先把所有照片读入内存再统一写入。为保持可读性，不绘制逐条循环回线；异常处理见后表。
 
 ```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 50, "rankSpacing": 60, "curve": "linear"}}}%%
 flowchart TD
-    A{"applyXmlWrites 且计划非空?"} -- 否 --> CLEAN["若 applyXmlWrites：RemoveMissing<br/>清理不在 xmlMsids 中的历史键"]
-    A -- 是 --> B["同一 XML 流 Seek 到开头<br/>创建 pending 计划副本"]
-    B --> C{"第二遍还有记录?"}
-    C -- 是 --> D{"pending 包含该 MSID?"}
-    D -- 否 --> C
-    D -- 是 --> E["确认是选中 Personnel / Images 双序号<br/>解码该块的 Image Base64"]
-    E -- "解码失败" --> ERR["XmlSkipped++、Errors++<br/>保留该用户旧照片及版本"]
-    ERR --> C
-    E -- "解码成功" --> T{"与已暂存的同时间候选内容相同?<br/>首条候选视为相同"}
-    T -- 否 --> CONFLICT["移除 pending 和临时候选<br/>Errors++、XmlSkipped++，保留旧图"]
-    CONFLICT --> C
-    T -- 是 --> LEFT{"该用户还有选中候选未读取?"}
-    LEFT -- 是 --> STAGE["首条图片暂存本地<br/>等待剩余同时间候选"]
-    STAGE --> C
-    LEFT -- 否 --> READY["移除 pending，清理暂存文件"]
-    READY --> F{"DryRun?"}
-    F -- 是 --> DRY["按目标原先是否存在<br/>统计 XmlAdded 或 XmlUpdated"]
-    DRY --> C
-    F -- 否 --> G["写目标同目录临时文件<br/>RetryIo 后 Move 覆盖目标"]
-    G -- "成功" --> H["增加 XmlAdded 或 XmlUpdated<br/>更新 Manifest：xml、UTC 版本、大小<br/>anyApplied = true"]
-    H --> C
-    G -- "失败" --> IO["清理该临时文件<br/>Errors++，继续下一条"]
-    IO --> C
-    C -- 否 --> P{"pending 仍有未找到的人员?"}
-    P -- 是 --> BAD["Errors++<br/>scanSucceeded = false"]
-    P -- 否 --> CLEAN
-    BAD --> CLEAN
-    C -. "第二遍已捕获的读取异常" .-> READERR["Errors++<br/>scanSucceeded = false<br/>已成功照片不回滚"]
-    READERR --> CLEAN
-    CLEAN --> SAVE{"非 DryRun 且<br/>成功应用过、移除过键<br/>或 Manifest 原先缺失?"}
-    SAVE -- 否 --> RETURN["Core 返回 scanSucceeded<br/>外层计算 XML 阶段状态并保存 CSV"]
-    SAVE -- 是 --> WRITE["Manifest 临时写入后 Move"]
-    WRITE -- "成功" --> RETURN
-    WRITE -- "失败" --> SAVEERR["Errors++<br/>scanSucceeded = false"]
-    SAVEERR --> RETURN
+    A{"1. 允许应用且计划非空?<br/>applyXmlWrites 且 plan.Count 大于 0"}
+    A -- "是：执行第二遍" --> B["2. 从同一 XML 流开头顺序读取<br/>建立待处理用户清单 pending<br/>仅读取计划指定的 Image 完整 Base64<br/>定位方式：Personnel 序号 + Images 序号"]
+    A -- "否：不读取图片全文" --> F["6. Manifest 收尾<br/>按条件移除历史键、保存 Manifest"]
+    B --> C["3. 完成每个用户的候选校验<br/>Base64 可解码<br/>最新同时间候选必须全部内容一致"]
+    C --> D["4. 对校验通过的用户应用一次<br/>DryRun：只统计拟新增或更新<br/>正式运行：写照片成功后更新内存 Manifest"]
+    D --> E["5. 遍历结束检查遗漏<br/>pending 非空则记错，阻止水位推进"]
+    E --> F
+    F --> G["返回 XML 阶段结果<br/>外层 finally 尝试保存核查 CSV"]
 ```
 
-取消直接向入口传播，不沿图中 Manifest 清理/保存分支继续；外层 finally 仍尝试输出 Cancelled CSV。图中的 RemoveMissing 不会删除图片，只修改内存 Manifest；DryRun 不保存其变化。单条解码/写盘失败不会自动将 scanSucceeded 置为 false，但 Errors 会阻止最终水位提交。CSV 保存失败也会增加 Errors，不改变已计算的 XML 返回值，不回滚已写照片/Manifest。
+逐条读取候选，一个用户的所有选中候选到齐且校验通过后才应用一次。遇到无关双序号或已从 pending 移除的用户，Job 跳过处理。只有一张候选时无需跨记录等待；同时间多张候选的首张暂存本地，后续逐字节比较，处理完清理暂存数据（性能与清理边界见 9.2）。
+
+#### 四个集合分别负责什么
+
+| 变量 | 职责 | 第二遍如何使用 |
+|---|---|---|
+| `plan` | 第一遍生成的原始写入计划：MSID、目标版本、目标路径、快照存在标志 | 保持原始计划，不拿它跟踪逐条进度 |
+| `selected` | 选中的 `(RecordIndex, ImagesIndex) → MSID` 映射 | 精确定位候选，保证图片和版本来自正确 Images 块 |
+| `pending` | 由 plan 复制的“尚未完成候选处理判定”的用户清单 | 校验完准备应用，或解码/冲突判定失败时移除；结束后用于检查遗漏 |
+| `remaining` | 每个用户还有多少个选中候选未完成成功解码和一致性检查 | 每处理一条通过校验的候选减 1；归零才能应用该用户照片 |
+
+“复制计划”只复制元数据，不复制 XML 文件或照片。`pending` 在实际写盘前移除，因此 **pending 为空不等于照片全部写入成功**；还必须看 Errors、日志和 Manifest。对已经判定失败并移除的用户，不再依靠 remaining 判断后续进度。
+
+#### 异常处理（代替图中的长回线）
+
+| 情况 | 当前处理及后续走向 |
+|---|---|
+| Base64 无效 | 移除该用户 pending、清理同时间候选暂存；XmlSkipped++、Errors++，保留旧图和旧版本，继续其他用户 |
+| 最新同时间候选内容不同 | 同样移除 pending、清理暂存；XmlSkipped++、Errors++，不任意选图，继续其他用户 |
+| 目标照片写入失败 | 尝试清理目标旁临时文件，Errors++；不更新该用户 Manifest，继续其他用户；此时该用户已不在 pending |
+| 正常遍历结束仍有 pending | 标记 NotFoundInSecondPass，Errors++、scanSucceeded=false；可能是未找到或未读齐候选，然后继续 Manifest 收尾 |
+| 第二遍读取/比较/暂存发生已捕获异常 | 结束第二遍循环，Errors++、scanSucceeded=false；不再处理剩余用户，但仍进入 Manifest 收尾，已成功照片不回滚 |
+| Manifest 保存失败 | Errors++、scanSucceeded=false；已成功写入照片不回滚 |
+| CSV 保存失败 | Errors++，不改变已计算的 XML 返回值；不回滚照片或 Manifest，阻止最终水位提交 |
+| 取消 | 向入口抛出，不继续 Manifest 收尾；外层 finally 仍尝试输出 Cancelled CSV |
+
+上表的逐用户失败以正常完成错误记录和暂存清理为前提；清理自身若抛出 I/O 异常，会进入第二遍的外层异常分支。未被局部捕获的异常传播到入口。单条解码/冲突/写盘失败不会自动令 scanSucceeded=false，但累计 Errors 仍会阻止水位提交；XML 返回状态不等于整轮成功。
+
+#### Manifest 收尾与三个提交时点
+
+第 6 步分为两项，顺序不可颠倒：
+
+1. 仅 `applyXmlWrites=true` 时执行 `RemoveMissing(xmlMsids)`，移除不在当前 XML 覆盖集中的内存 Manifest 键。**它不删除照片，也不是移除 pending 中的用户。**
+2. 当 `!DryRun && (anyApplied || removed > 0 || manifestWasMissing)` 时，通过临时文件加 Move 保存 Manifest。否则不保存；原先缺失的 Manifest 可生成空 `{}`。
+
+三个提交时点需要分开理解：
+
+- **单张照片成功替换目标后**：增加 XmlAdded/XmlUpdated，更新该用户的内存 Manifest（Source=xml、UTC Version、Size），设置 anyApplied=true。
+- **XML 阶段收尾时**：按上述条件保存 Manifest。这里不要求累计 Errors 为 0，因此其他用户失败时，成功部分仍可能保存。DryRun 只统计 XmlAdded/XmlUpdated，不执行照片替换或 Manifest 保存；但仍有审计输出及可能的本地比较暂存。
+- **整轮对账结束后**：只有累计 Errors 为 0 且非 DryRun 才保存源水位，users 水位还受 deleteEnabled 限制，详见 8.1。照片写入、Manifest 保存、水位保存不是一个事务。
 
 ## 6. ZIP 增量和 XML 移除/退役
 
@@ -437,7 +455,17 @@ Run 加载水位后，若 ZIP 停用，立即在内存 Remove(photoZip)，但不
 
 锁打开时的所有 IOException 当前均按占用处理；本地锁仅协调使用同一锁文件的实例。
 
-日志为控制台 Information，程序没有文件日志 provider，也没有绑定配置中的 Logging 最低级别。ZIP 部分逐文件预览仍为 Debug；XML decision/triggers、扫描与计划汇总、逐用户跳过/计划/成功写入以及 DryRun 预览已为 Information。不输出照片 Base64。
+日志按输出目标分级：服务器本地文件记录 Information 及以上级别；控制台仅输出 Warning、Error、Critical。级别在 Program 中固定，没有绑定配置中的 Logging 最低级别。Information 保留运行模式、decision/triggers、阶段耗时、扫描与计划汇总、Manifest/CSV 保存信息和运行结果。XML 正常逐用户明细（多个 Images、跳过原因、计划、缺图恢复、成功写入、DryRun 预览）降为 Debug，默认不输出，以 CSV 为核查依据；ZIP 逐文件预览仍为 Debug。所有 Warning/Error 保留，包括无效时间、解码失败、候选冲突和写入失败。CSV 内容及生成逻辑不变，不输出照片 Base64。需要临时排查逐用户日志时，须调整 Program 的最低级别为 Debug；仅修改 appsettings 中的 Logging 不会生效。
+
+运行文件名为 `photo-import-yyyyMMdd-RunId-分段序号.log`，日期使用服务器本地时间，RunId 为每次进程运行的唯一 ID。UTF-8 文本，每个事件占一个物理行，包含时间、级别、RunId、分类和消息；异常保留完整文本及堆栈，但其中换行显示为可见转义文本。每天或达到大小阈值滚动；单条超大事件不截断，允许该段超出阈值。使用持续打开的缓冲写入器，每条日志刷新到操作系统（不是磁盘 fsync），不为每条消息重新打开文件。
+
+文件日志在输出边界统一转义分类、格式化消息和异常中的 CR/LF/Tab（显示为 `\r`、`\n`、`\t`）、其他控制字符、Unicode 行/段分隔符及格式控制字符（显示为 `\uXXXX`），防止输入伪造新日志行或插入终端控制指令（CWE-117）。文件日志失败时直接写 stderr 的诊断也使用相同转义。正常 Unicode、路径分隔符和标点保持不变；不修改业务 MSID、文件路径、CSV 或照片数据。滚动大小按转义后的 UTF-8 字节数计算。普通 Console 仍使用原有 SimpleConsole SingleLine formatter，本段转义规则针对本地文件与应急 stderr。
+
+保留期清理在文件日志初始化时执行，只删除 LogDirectory 顶层、符合本工具完整命名规则、文件名日期早于 Today 减 LogRetentionDays 的日志；不递归删除，不处理 CSV 或其他文件。清理为永久删除，需长期留存时由运维归档。服务账号需要 logs 目录创建、写入及过期文件删除权限。
+
+配置成功加载后、业务配置 Validate 前注册文件日志。配置文件本身无法加载/绑定、日志目录无法初始化等早期错误只有 Console；文件日志注册后的配置校验错误会同时落盘。日志初始化失败退出 2，不开始导入；运行中 I/O 写入失败只向 stderr 告警并停用文件输出，Console 继续，正常收尾时退出 1。此类日志故障不修改 Job.Errors、不回滚已写照片，也不阻止 Job 内已经完成的水位提交，需由运维排查后决定是否重跑。
+
+DryRun 也写运行日志，且会执行日志保留期清理；它只禁止业务照片/Manifest/水位变更，不是完全无文件副作用。实时读取未关闭的日志需使用允许共享写入的查看工具；进程结束后可正常读取。Console 本身仍由调度平台按需采集。
 
 重点查找 `Photo source mode`、`XML skipped reason=`、`XML planned`、`XML photo written`、`XML audit saved path=`；字段错误、Base64/写盘失败另有 Warning。reason=VersionNotNewerAndTargetExists 的存在性来自本轮完整目标路径快照，不是日志输出时再访问 NAS。
 
@@ -502,13 +530,9 @@ CSV 从 NAS 改为本地通常减少审计网络写入，但记录行数增加�
 - [Program.cs](Program.cs)、[PhotoImportOptions.cs](PhotoImportOptions.cs)：配置、校验和入口。
 - [PhotoImportJob.cs](PhotoImportJob.cs)、[XmlPhotoReader.cs](XmlPhotoReader.cs)：处理流程和读取规则。
 - [XmlPhotoAudit.cs](XmlPhotoAudit.cs)：人员 CSV 状态、转义与文件保存。
+- [LocalFileLoggerProvider.cs](LocalFileLoggerProvider.cs)：本地运行日志、按日期/大小轮转及过期日志清理。
 - [AppliedManifestStore.cs](AppliedManifestStore.cs)、[WatermarkStore.cs](WatermarkStore.cs)、[SingleInstanceLock.cs](SingleInstanceLock.cs)：状态与锁。
 - [Verify 测试](../COD.FirmwideDirectory.PhotoImportTool.Verify/PhotoImportJobTests.cs)：覆盖可选 ZIP、重复合并、冲突保护、CSV、配置及日志格式化，使用 FakeCore；不替代真实 NAS 压测与完整 Core 集成验收。
 - [真实集成测试](../COD.FirmwideDirectory.PhotoImportTool.IntegrationTests/PhotoImportIntegrationTests.cs)：需完整 Core 与正确样本；本地缺少 Core 类型/依赖，不能视为已完成真实部署验收。
 
 本次仅校正文档。正式验收按配套手工用例记录发布版本、实际账号、配置、日志及文件证据。
-
-
-
-
-
