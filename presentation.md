@@ -36,6 +36,14 @@ XML 覆盖集中的用户不会被 ZIP 覆盖。不能把“XML 优先”理解�
 
 当前支持 XML-only、ZIP-only、XML 优先并由 ZIP 补充三种来源组合。禁用 Photo ZIP 不会仅因缺少 ZIP 就删除 Active 用户已有照片。
 
+### 同一发布包，不同环境配置
+
+QA 和 PROD 使用同一份完整发布包（包括 EXE 和依赖），真实配置保存在仓库外的受控目录，不随代码提交。
+
+配置加载顺序仅为：**基础 appsettings.json → 外部环境 JSON**。通过 `FWD_PHOTO_CONFIG_FILE` 指定外部文件的绝对路径，例如 appsettings_qa.json 或 appsettings_prod.json；该变量只选择文件，不覆盖业务参数。未提供外部文件中的字段会保留基础配置值。
+
+基础 appsettings.json 仍必须存在。指定的外部文件缺失、不可读取、JSON 格式错误或路径不是绝对路径时，程序拒绝启动。未指定外部文件时只读基础配置；仓库安全默认配置因必填值为空而不能直接导入。详细操作见 [部署配置与内网路径保护](deployment_configuration.md)。
+
 ## 2. 三个核心概念
 
 | 概念 | 回答的问题 | 生命周期 |
@@ -76,10 +84,11 @@ flowchart TD
 2. **共用一次目录快照**：Upsert 和删除对账复用，减少 NAS 目录扫描。快照包含路径、MSID 和大小，不读取全部图片内容。
 3. **XML 先于 ZIP**：先确定 XML 覆盖范围，避免 ZIP 覆盖 XML 照片。
 
-补充两个容易误解的地方：
+补充三个容易误解的地方：
 
 - XML 扫描不等于 XML 写入。仅 Photo ZIP 变化且 Manifest 存在时，XML 可以只扫描覆盖集，不解码写入图片。
 - 进入正常处理路径后会建立快照；删除保护触发也不取消快照，因为写入判断仍依赖它。全部条件未触发时在入口返回，不扫描照片树。
+- 仅 XML 退役触发 ZIP 回落时，非 DryRun 也会执行目录网格准备；已有网格通常走快速路径。DryRun 不预建目录，实际写入仍保留目录缺失时的补建兜底。
 
 主流程讲解不必逐一解释 applyXmlWrites、shouldUpsertZip 等表达式。需要修改运行条件的开发者，再对照代码和详细设计文档阅读。
 
@@ -161,6 +170,15 @@ XML 顺序不代表版本顺序。先完整扫描再写入，既能选对版本�
 - ZIP 使用尺寸判断增量，不保证识别同尺寸内容变化。
 - DryRun 不是“完全不写任何文件”。
 
+### 目录与人数保护
+
+- Quarantine 校验按标准化路径和目录边界比较：允许 `D:\photos` 与 `D:\photos2` 这样的同级目录，拒绝两个目录相同或 Quarantine 位于 PhotoFolder 内部。
+- 当前校验没有自动检查反向包含，也不解析符号链接或共享别名。部署仍须确保两个目录在实际存储上互不包含。
+- MinActiveThreshold 比较的是解析后的 Active 用户数，不是 DSML 总记录数；低于阈值才触发保护。Force 不绕过这一绝对阈值，但会绕过删除比例保护。
+- 运维示例：正常 Active 数约 122,222 时，可评估以 110,000 作为初始阈值，并结合历史最低值和正常波动确认。这不是代码默认值，也不是固定生产标准。MaxDeleteRatio 的分母是盘上照片数量，与 Active 人数阈值不同。
+
+提醒团队：人数保护触发仍不是整轮停止，当前实现会同时关闭隔离删除和写入阶段的非 Active 过滤。
+
 ### 日志、CSV、Manifest 如何分工
 
 | 输出 | 核查用途 |
@@ -171,6 +189,8 @@ XML 顺序不代表版本顺序。先完整扫描再写入，既能选对版本�
 
 正常逐用户日志为 Debug，默认不输出；服务器本地日志保留 Information 及以上，Console 仅保留 Warning 及以上。
 
+本地文件日志在输出端统一转义换行和控制字符，覆盖消息、分类名称及异常文本；每个事件占一个物理行，异常堆栈的换行显示为可见的 `\r`、`\n`。文件日志失败时的应急 stderr 使用相同转义，不改变业务 MSID、路径或 CSV。普通 Console 仍使用原有 SingleLine formatter，尚未增加同等控制字符转义，不能宣称所有输出渠道都已完成相同安全防护。
+
 人数核查使用完整扫描 CSV 中的 UserSummary 行，避免重复 Personnel 或多个 Images 导致重复计数。NotScanned CSV 只说明本轮未扫描，不是“零用户”结论。
 
 ## 6. 最后打开代码：给团队一张定位地图
@@ -178,6 +198,7 @@ XML 顺序不代表版本顺序。先完整扫描再写入，既能选对版本�
 | 文件 | 主要职责 |
 |---|---|
 | [Program.cs](Program.cs) | 配置、日志、单实例锁、退出码 |
+| [PhotoImportConfiguration.cs](PhotoImportConfiguration.cs) | 加载基础 JSON 和所选外部 JSON；不提供逐项环境变量或命令行覆盖 |
 | [PhotoImportJob.cs](PhotoImportJob.cs) | 运行编排、来源优先级、写入、隔离与水位推进 |
 | [XmlPhotoReader.cs](XmlPhotoReader.cs) | 流式读取、候选定位、时间解析、Base64 解码 |
 | [AppliedManifestStore.cs](AppliedManifestStore.cs) | 每个 MSID 的 XML 已应用版本 |
@@ -199,6 +220,17 @@ XML 顺序不代表版本顺序。先完整扫描再写入，既能选对版本�
 - 预先创建测试 PhotoFolder，配置独立状态、日志、CSV 和隔离路径。
 - 根据小样本设置删除阈值，确保 Active 集可以通过；不要把演示阈值直接用于生产。
 - 先 DryRun 检查数据和路径；确认后改为真实写入。常规演示保持 Force=false。
+
+在仓库外准备独立演示 JSON，保持 `PhotoImport` 配置节，并显式设置上述测试路径。设置 `FWD_PHOTO_CONFIG_FILE` 后在同一 PowerShell 会话启动程序：
+
+```powershell
+$env:FWD_PHOTO_CONFIG_FILE = 'C:\PhotoImportConfig\appsettings_demo.json'
+& 'C:\Apps\PhotoImportTool\COD.FirmwideDirectory.PhotoImportTool.exe'
+```
+
+路径按实际安装位置调整；VS 调试也可在启动配置中设置该文件选择变量。程序目录必须保留基础 appsettings.json。**DryRun、Force、路径和阈值只在所选 JSON 中修改，重启后生效**；旧的逐项环境变量及 `--PhotoImport:...` 命令行覆盖不再生效。
+
+首次设置 DryRun=true；核查 WouldWrite 及路径后，将演示 JSON 的 DryRun 改为 false，再执行下面的真实写入演示。不要复用生产状态或生产输出目录。
 
 ### 演示一：首次导入
 
