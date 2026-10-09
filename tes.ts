@@ -1,17 +1,15 @@
-function Write-PipelineMutexDiagnostic {
-    param(
-        [ValidateSet('MutexFailure', 'MutexContention', 'MutexAbandoned')]
-        [string]$Reason,
-        [Parameter(Mandatory)][string]$Detail
-    )
-    Write-Warning $Detail
-    try {
-        # Mutex outcomes are local diagnostics only; no SRE/Ops notification.
-        # Unique files avoid concurrent append writers; use normal log retention.
-        $logPath = Get-LogFilePath -Directory $resolvedOutputRoot -BaseName (
-            'scheduler-mutex-' + $PID + '-' + [guid]::NewGuid().ToString('N'))
-        Write-Log -LogFilePath $logPath -LogString (
-            "$Reason cycle=$cycleId " + ($Detail -replace '[\r\n]+', ' '))
+   catch {
+        Write-PipelineMutexDiagnostic -Reason 'MutexFailure' -Detail (
+            "Cannot create/open/wait on pipeline mutex 'Global\WeComAudit': $($_.Exception.GetBaseException().Message). Refusing to start.")
+        exit 1
     }
-    catch { Write-Warning "Could not persist mutex diagnostic: $($_.Exception.Message)" }
-}
+    if ($lockResult.Abandoned) {
+        Write-PipelineMutexDiagnostic -Reason 'MutexAbandoned' -Detail (
+            "Pipeline mutex 'Global\WeComAudit' was abandoned. Refusing to start; inspect previous-run state before retrying.")
+        exit 1
+    }
+    if (-not $mutexAcquired) {
+        Write-PipelineMutexDiagnostic -Reason 'MutexContention' -Detail (
+            "Pipeline mutex 'Global\WeComAudit' is held. Holder identity is unknown. Refusing to start.")
+        exit 1
+    }
