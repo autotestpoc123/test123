@@ -1,0 +1,9 @@
+({
+  src: $0.src,
+  complete: $0.complete,
+  naturalWidth: $0.naturalWidth,
+  naturalHeight: $0.naturalHeight,
+  display: getComputedStyle($0).display,
+  visibility: getComputedStyle($0).visibility,
+  opacity: getComputedStyle($0).opacity
+})
