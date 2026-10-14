@@ -1,0 +1,111 @@
+<div class="container fd-content">
+    @if(userFound && user) {
+    <div class="row" [title]="(user.UserAccount.$type == 'GlobalUserAccount' && user.UserAccount.OffShoreUser) ? 'Off Shore' : 'On Shore'"
+        [ngClass]="(user.UserAccount.$type == 'GlobalUserAccount' && user.UserAccount.OffShoreUser) ? 'offShore':'onShore' ">
+        <span class="profile-photo-panel">
+            @if(isSelfProfile) {
+            <button type="button" class="edit-photo-link" (click)="onEditPhotoClick()">
+                Edit photo
+            </button>
+            }
+            <user-avatar [msid]="user.UserAccount.MSID" [fullName]="user.UserAccount.FullName"
+                size="xl" loading="eager" clickable (avatarClick)="onViewPhotoClick($event)"></user-avatar>
+        </span>
+        <span class="profile-details-panel">
+            <div class="fd-userinfo-name fd-dn-name"
+                [ngClass]="(user.UserAccount.$type == 'GlobalUserAccount' && user.UserAccount.OffShoreUser) ? 'offShore':'onShore' ">
+                {{user.UserAccount.FullName}}</div>
+            <div class="fd-userinfo-title">
+                {{user.UserAccount.Title? (user.UserAccount.Title + (user.UserAccount.BusinessTitle? (', ' +
+                user.UserAccount.BusinessTitle) : '' )) :
+                (user.UserAccount.BusinessTitle || '' ) }}
+                @if(user.UserAccount.Title || user.UserAccount.BusinessTitle){
+                <br />
+                }
+                @if(user.UserAccount.SuperDivision == 'Technology'){
+                {{user.UserAccount.SuperDivision}}
+                }@else {
+                {{user.UserAccount.Division}}
+                }
+                <br />
+            </div>
+            <div>
+                @if(user.UserAccount.City||user.UserAccount.State||user.UserAccount.Country){
+                <span><i class="fa fa-map-marker" aria-hidden="true"></i>
+                    {{user.UserAccount.City || ''}}{{user.UserAccount.State ? (user.UserAccount.City ? ', ' : '') +
+                    user.UserAccount.State : ''}}{{user.UserAccount.Country ? (user.UserAccount.City ||
+                    user.UserAccount.State ? ', ' : '') + user.UserAccount.Country : ''}}
+                </span>&nbsp;&nbsp;&nbsp;
+                }
+                <!-- <span><i class="fa fa-clock-o" aria-hidden="true"></i>12:41 - You're 5 hours ahead.</span> -->
+            </div>
+        </span>
+    </div>
+    @if(user.UserAccount.$type == 'GlobalUserAccount'){
+    <div>
+        <hr>
+    </div>
+    <profile-view [user]="user"></profile-view>
+    } @else{
+    <div>
+        <div>
+            <ul id="user-profile-tabs" class="nav nav-tabs" role="tablist" style="margin-top: 20px;">
+                <li class="nav-item" role="presentation">
+                    <a id="profile-tab" class="nav-link active" data-bs-toggle="tab" data-bs-target="#profile"
+                        role="tab" aria-controls="profile" aria-selected="true" style="padding-left: 0px;">Profile</a>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <a id="groups-tab" class="nav-link" data-bs-toggle="tab" data-bs-target="#groups" role="tab"
+                        aria-controls="MyGroups" aria-selected="false">{{isSelfProfile ? 'My Groups' : 'Groups'}}</a>
+                </li>
+            </ul>
+        </div>
+        <div></div>
+        <div class="create-email-btn">
+            <a href="https://itsm.ai.ms.com.cn/servicedesk/customer/portal/43/create/210" target="_blank"><button
+                type="button" class="btn btn-outline-primary group-action-btn "><i class="fa fa-user-plus"
+                    aria-hidden="true"></i> Create group</button></a>
+        </div>
+    </div>
+
+    <div class="tab-content" id="tabContent" style="margin-top: 15px;">
+        <div id="profile" class="tab-pane fade show active" role="tabpanel" aria-labelledby="profile-tab">
+            <profile-view [user]="user"></profile-view>
+        </div>
+        <div id="groups" class="tab-pane fade" role="tabpanel" aria-labelledby="groups-tab">
+            @if(myGroups){
+            <group-table [tableTitle]="'Groups'" [exportFileName]="'My_Groups'" [showCountNum]="true"
+                [showFilter]="true" [showDownloadIcon]="true" [showDownloadLabel]="true" [showGroupDetailInNewPage]="true"
+                [groupArray]="myGroups"></group-table>
+            } @else {
+            No Groups.
+            }
+        </div>
+
+    </div>
+    }
+
+    }
+    @else if(userFound==false){
+    <p>User {{this.userId}} not found!</p>
+    }
+    @else {
+    <div class="d-flex justify-content-center">
+        <div style="font-size: 3em;">
+            <span class="spinner-border" style="width: 3rem; height: 3rem;" role="status"></span>Loading...
+        </div>
+    </div>
+    }
+
+    @if (photoModalOpen && photoModalUrl) {
+    <div class="photo-modal-backdrop" role="dialog" aria-modal="true" aria-label="User photo"
+        (click)="closePhotoModal()">
+        <div class="photo-modal-content" (click)="$event.stopPropagation()">
+            <button type="button" class="photo-modal-close" (click)="closePhotoModal()" aria-label="Close photo">
+                <i class="fa fa-times" aria-hidden="true"></i>
+            </button>
+            <img [src]="photoModalUrl" [alt]="(user && user.UserAccount.FullName) || ''" />
+        </div>
+    </div>
+    }
+</div>
