@@ -1,0 +1,222 @@
+@if(tableTitle || showDownloadIcon || showActionmenu) {
+<div class="row">
+  <div class="col">
+    <h3>
+      {{tableTitle}}
+
+      <span style="font-size: 0.6em; color:var(--text-color-gray);">
+        @if(showCountNumWithUnit) {
+        ({{userArray ? (userArray | filterUsers:filters).length : 0}} results)
+        } @else if(showCountNum){
+        ({{userArray? (userArray | filterUsers:filters).length : 0}})
+        }
+      </span>
+
+    </h3>
+  </div>
+  <div class="col" style="text-align: right;">
+
+    @if(showDownloadIcon && canExport) { <button type="button" class="btn btn-link" [disabled]="exporting || !hasExportRows"
+      aria-label="Export to spreadsheet" (click)="exportUser()"><i class="fa fa-download" aria-hidden="true"></i>@if(showDownloadLabel){&nbsp;&nbsp;Export to spreadsheet}</button>
+    }
+    @if(showActionmenu && canExport){
+      <div class="dropdown-toggle float-end" id="userActionMenu" data-bs-toggle="dropdown" aria-expanded="false">
+        <i class="fa fa-ellipsis-v" aria-hidden="true">&nbsp;&nbsp;Action Menu</i>
+      </div>
+      <ul class="dropdown-menu" aria-labelledby="userActionMenu">
+        <li><button type="button" class="dropdown-item" [disabled]="exporting || !hasExportRows" (click)="exportUser()">{{exporting ? 'Exporting...' : 'Export to spreadsheet'}}</button></li>
+        <!-- <li><a class="dropdown-item" href="#">Print</a></li> -->
+      </ul>
+    }
+  </div>
+</div>
+}
+
+<table class="table user-table" style="overflow-x: scroll;">
+  @if(showHeaders){
+  <thead [ngClass]="showFilter ? 'gray' : ''">
+    <tr>
+      @if(!hideColumns || !hideColumns.hasOwnProperty('Name') && !hideColumns['Name']){
+      <th scope="col" style="min-width: 150px;">Name
+        <input *ngIf="showFilter" id="Name-filtering-search" class="form-control form-control-sm" type="text"
+          placeholder="Search for" [(ngModel)]="filters.FullName" (keydown)="onFilterChange()" />
+      </th>
+      }
+      @if(!hideColumns || !hideColumns.hasOwnProperty('Title') && !hideColumns['Title']){
+      <th scope="col" style="max-width: 150px;">Title
+
+        <select *ngIf="showFilter" id="Title-filtering-search" class="form-select form-select-sm"
+          aria-label="Select Title" placeholder="select" [(ngModel)]="filters.Title"
+          (change)="onFilterChange()">
+          <option value="">select</option>
+          <option [value]="BLANK_REPLACEMENT">{{BLANK_REPLACEMENT}}</option>
+          <option *ngFor="let title of TITLE_MAP" [value]="title.value">{{title.name}}</option>
+        </select>
+      </th>
+      }
+      @if(!hideColumns || !hideColumns.hasOwnProperty('Division') && !hideColumns['Division']){
+      <th scope="col">Division
+        <input *ngIf="showFilter" id="Division-filtering-search" class="form-control form-control-sm"
+          type="text" placeholder="Search for" [(ngModel)]="filters.Division" (keydown)="onFilterChange()" />
+
+      </th>
+      }
+      @if(!hideColumns || !hideColumns.hasOwnProperty('City') && !hideColumns['City']){
+      <th scope="col">City
+        <select *ngIf="showFilter" id="City-filtering-search" class="form-select form-select-sm"
+          aria-label="Select City" placeholder="select" [(ngModel)]="filters.City"
+          (change)="onFilterChange()">
+          <option value="">select</option>
+          <option [value]="BLANK_REPLACEMENT">{{BLANK_REPLACEMENT}}</option>
+          <option *ngFor="let city of cityList" [ngValue]="city">{{city}}</option>
+        </select>
+      </th>
+      }
+      @if(!hideColumns || !hideColumns.hasOwnProperty('Building') && !hideColumns['Building']){
+      <th scope="col" style="min-width: 110px;">Building Floor
+
+        <select *ngIf="showFilter" id="Building-filtering-search" class="form-select form-select-sm"
+          aria-label="Select Building" placeholder="select" [(ngModel)]="filters.Building"
+          (change)="onFilterChange()">
+          <option value="">select</option>
+          <option [value]="BLANK_REPLACEMENT">{{BLANK_REPLACEMENT}}</option>
+          <option *ngFor="let building of buildingList" [ngValue]="building">{{building}}</option>
+        </select>
+      </th>
+      }
+      @if(!hideColumns || !hideColumns.hasOwnProperty('MSID') && !hideColumns['MSID']){
+      <th scope="col" style="max-width: 80px;">MSID
+        <input *ngIf="showFilter" id="MSID-filtering-search" class="form-control form-control-sm" type="text"
+          placeholder="Search for" title="search for MSID" [(ngModel)]="filters.MSID"
+          (keydown)="onFilterChange()" />
+      </th>
+      }
+      @if(!hideColumns || !hideColumns.hasOwnProperty('CostCenter') && !hideColumns['CostCenter']){
+      <th scope="col" style="max-width: 100px;">Cost Center
+        <input *ngIf="showFilter" id="CostCenter-filtering-search" class="form-control form-control-sm"
+          type="text" placeholder="Search for" [(ngModel)]="filters.CostCenterNumber"
+          (keydown)="onFilterChange()" />
+      </th>
+      }
+      @if(!hideColumns || !hideColumns.hasOwnProperty('Contact') && !hideColumns['Contact']){
+      <th scope="col" style="min-width: 280px;">Contact</th>
+      }
+      <!-- <th scope="col" style="min-width: 70px;"></th> -->
+    </tr>
+  </thead>
+  }
+  <tbody>
+    @for(user of (userArray | filterUsers:filters:page:pageSize); track $index; let idx = $index) {
+
+    @if((displayCount && idx < displayCount) || !displayCount) {
+    <tr
+      [title]="(user.$type == 'GlobalUserAccount' && user.OffShoreUser) ? 'Off Shore' : 'On Shore'"
+      [ngClass]="idx == selectedIndex? 'table-active' : ''">
+      @if(!hideColumns || !hideColumns.hasOwnProperty('Name') && !hideColumns['Name']){
+      <td (click)="onClickUserRow(user.Mail, user.MSID)"
+        [ngClass]="(user.$type == 'GlobalUserAccount' && user.OffShoreUser) ? 'offShore' : 'onShore'">
+        <user-avatar [msid]="user.MSID" [fullName]="user.FullName" size="sm"
+          style="margin-right:8px;"></user-avatar>
+        <!-- <strong> -->
+        <!-- {{user.FullName}} -->
+        <ngb-highlight [result]="user.FullName" [term]="filters.FullName" />
+        <!-- </strong> -->
+        <!-- <br> -->
+        <!-- <span class="login-id"> -->
+        <!-- <ngb-highlight [result]="user.LoginID" [term]="filters.FullName" /> -->
+        @if(user.$type == 'GlobalUserAccount' && user.OffShoreUser){
+        <span class="bi bi-globe"></span>
+        }
+      </td>
+      }
+      @if(!hideColumns || !hideColumns.hasOwnProperty('Title') && !hideColumns['Title']){
+      <td (click)="onClickUserRow(user.Mail, user.MSID)">
+      <ngb-highlight [result]="user.Division" [term]="filters.Division" />
+      </td>
+    }
+    
+      @if(!hideColumns || !hideColumns.hasOwnProperty('Division') && !hideColumns['Division']){
+      <td (click)="onClickUserRow(user.Mail, user.MSID)">
+      <ngb-highlight [result]="user.Division" [term]="filters.Division" />
+      </td>
+    }
+      @if(!hideColumns || !hideColumns.hasOwnProperty('City') && !hideColumns['City']){
+      <td (click)="onClickUserRow(user.Mail, user.MSID)">
+      {{user.City || BLANK_REPLACEMENT}}
+      </td>
+    }
+      @if(!hideColumns || !hideColumns.hasOwnProperty('Building') && !hideColumns['Building']){
+      <td (click)="onClickUserRow(user.Mail, user.MSID)" >
+        @if(!user.Building && !user.Floor){
+          {{BLANK_REPLACEMENT}}
+        } @else {
+          {{user.Building}} {{user.Building && user.Floor? '/' : ''}} {{user.Floor}}
+        }
+      </td>
+    }
+      @if(!hideColumns || !hideColumns.hasOwnProperty('MSID') && !hideColumns['MSID']){
+      <td (click)="onClickUserRow(user.Mail, user.MSID)">
+        {{ngb-highlight [result]="user.MSID" [term]="filters.MSID" />
+      </td>
+    }
+      @if(!hideColumns || !hideColumns.hasOwnProperty('CostCenter') && !hideColumns['CostCenter']){
+      <td (click)="onClickUserRow(user.Mail, user.MSID)">
+        {{ngb-highlight [result]="user.CostCenterNumber" [term]="filters.CostCenterNumber" />
+      </td>
+    }
+      @if(!hideColumns || !hideColumns.hasOwnProperty('Contact') && !hideColumns['Contact']){
+      <td class="people-actions">
+        @if(user.$type != 'CODUserAccount' || (user.$type == 'CODUserAccount' && user['IsMailEnabled'])) {
+        <a href="mailto:{{user.Mail}}"><i class="fa fa-envelope" aria-hidden="true" ></i></a>
+        }
+      @if(user.$type == 'CODUserAccount' && user['IsTeamsEnabled']){
+        <a href="MSTeams:/l/chat/0/0?users={{user.Mail}}"><i class="fa fa-commenting" aria-hidden="true"></i></a>
+        }
+      @if(user.WorkPhone || (user['CorpMobilePhone'] && user['CorpMobilePhone'].length > 0) ||
+        user.PersonalMobilePhone) {
+        <span class="dropdown contact-num">
+          <button class="btn dropdown-toggle btn-sm" data-bs-toggle="dropdown" aria-expanded="false">
+            {{user.WorkPhone ? user.WorkPhone : (user['CorpMobilePhone']? user['CorpMobilePhone'] :
+            user.PersonalMobilePhone)}}
+          </button>
+          <ul class="dropdown-menu">
+            @if(user.WorkPhone){
+            <li class="dropdown-item">Work <a
+                [href]="'ciscotel://' + (user.WorkPhone | stringReplace : ' ' : '')">{{user.WorkPhone}}</a>
+            </li>
+            }
+
+            @if(user['CorpMobilePhone'] && user['CorpMobilePhone'].length > 0){
+            @for(CorpMobilePhone of user['CorpMobilePhone']; track $index; let idx = $index) {
+            <li class="dropdown-item">Mobile <a
+                [href]="'ciscotel://' + (CorpMobilePhone | stringReplace : ' ' : '')">{{CorpMobilePhone}}</a>
+            </li>
+            }
+            }
+            @if(user.PersonalMobilePhone){
+            <li class="dropdown-item">Personal <a
+                href="ciscotel://{{personalPhoneText(user) | stringReplace : ' ' : '' }}">{{user.PersonalMobilePhone}}</a>
+            </li>
+            }
+          </ul>
+        </span>
+        }
+      </td>
+      }
+    </tr>
+    }
+    }
+  </tbody>
+</table>
+
+@if((userArray | filterUsers:filters) && (userArray | filterUsers:filters).length > pageSize && !displayCount){
+<div class="row">
+  <div class="col">
+    <div class="d-flex justify-content-between p-2 float-end">
+      <ngb-pagination [collectionSize]="(userArray | filterUsers:filters).length" [(page)]="page"
+        [maxSize]="3" [rotate]="true" [boundaryLinks]="true"
+        [pageSize]="pageSize"></ngb-pagination>
+    </div>
+  </div>
+</div>
+}

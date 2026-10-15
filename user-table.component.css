@@ -1,0 +1,55 @@
+.user-table thead tr th {
+  color: var(--text-color-gray);
+  font-weight: 400;
+  vertical-align: top;
+}
+
+.user-table thead.gray tr th {
+  background-color: rgb(245, 245, 245);
+}
+
+a.user-profile-link {
+  text-decoration: none;
+  color: black;
+}
+
+.contact-num {
+  display: inline-block;
+}
+
+.contact-num button.btn {
+  color: var(--link-color);
+}
+
+.contact-num .dropdown-menu .dropdown-item a {
+  color: var(--link-color);
+}
+
+.user-profile-link.offShore {
+  color: var(--main-bg-color);
+}
+
+.user-table tr td {
+  cursor: pointer;
+  vertical-align: middle;
+}
+
+.offShore {
+  color: var(--main-bg-color);
+}
+
+input, select {
+  border-radius: 0;
+}
+
+.dropdown-toggle, .dropdown-item {
+  color: var(--link-color);
+}
+
+.dropdown-toggle::after {
+  border:none
+}
+
+.dropdown-menu {
+  --bs-dropdown-font-size:14px;
+}
