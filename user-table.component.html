@@ -20,13 +20,15 @@
       aria-label="Export to spreadsheet" (click)="exportUser()"><i class="fa fa-download" aria-hidden="true"></i>@if(showDownloadLabel){&nbsp;&nbsp;Export to spreadsheet}</button>
     }
     @if(showActionmenu && canExport){
-      <div class="dropdown-toggle float-end" id="userActionMenu" data-bs-toggle="dropdown" aria-expanded="false">
-        <i class="fa fa-ellipsis-v" aria-hidden="true">&nbsp;&nbsp;Action Menu</i>
+      <div class="dropdown table-export-actions">
+        <button type="button" class="dropdown-toggle table-export-toggle" [id]="actionMenuId"
+          data-bs-toggle="dropdown" aria-expanded="false">
+          <i class="fa fa-ellipsis-v" aria-hidden="true"></i> Action Menu
+        </button>
+        <ul class="dropdown-menu dropdown-menu-end" [attr.aria-labelledby]="actionMenuId">
+          <li><button type="button" class="dropdown-item" [disabled]="exporting || !hasExportRows" (click)="exportUser()">{{exporting ? 'Exporting...' : 'Export to spreadsheet'}}</button></li>
+        </ul>
       </div>
-      <ul class="dropdown-menu" aria-labelledby="userActionMenu">
-        <li><button type="button" class="dropdown-item" [disabled]="exporting || !hasExportRows" (click)="exportUser()">{{exporting ? 'Exporting...' : 'Export to spreadsheet'}}</button></li>
-        <!-- <li><a class="dropdown-item" href="#">Print</a></li> -->
-      </ul>
     }
   </div>
 </div>

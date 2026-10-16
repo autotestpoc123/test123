@@ -1,0 +1,369 @@
+@property --main-bg-color {
+  syntax: "<color>";
+  inherits: false;
+  initial-value: #002b51;
+}
+
+@property --link-color {
+  syntax: "<color>";
+  inherits: false;
+  initial-value: #0f8ec7;
+}
+
+@property --text-color-default {
+  syntax: "<color>";
+  inherits: false;
+  initial-value: #242424;
+}
+
+@property --text-color-gray {
+  syntax: "<color>";
+  inherits: false;
+  initial-value: #666666;
+}
+
+/* You can add global styles to this file, and also import other style files */
+html {
+  /* height: 100%; remove to activate back to top*/
+  width: 100%;
+  overflow-x: scroll;
+  overflow-y: scroll;
+  /* overflow: hidden; */
+  /* to avoid content moving when open modal add padding-right */
+  padding-right: 0px !important;
+  font-family: sans-serif, var(--bs-body-font-family);
+  color: var(--text-color-default);
+}
+
+body {
+  width: 100%;
+  overflow: hidden;
+  padding-right: 0px !important;
+  font-size: 14px;
+  font-family: sans-serif, var(--bs-body-font-family);
+  color: var(--text-color-default);
+}
+
+div.main-content {
+  overflow: hidden;
+  /* overflow-y: scroll; */
+}
+
+.loader-container {
+  background-color: var(--main-bg-color);
+  text-align: center;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100%;
+  width: 100%;
+  margin: 0;
+}
+
+label {
+  font-weight: normal;
+}
+
+.btn.btn-primary.active {
+  box-shadow: 2px 2px black, -2px 2px black, 2px -2px black, -2px -2px black;
+}
+
+.btn.btn-success.active {
+  box-shadow: 2px 2px black, -2px 2px black, 2px -2px black, -2px -2px black;
+}
+
+.btn.btn-warning.active {
+  box-shadow: 2px 2px black, -2px 2px black, 2px -2px black, -2px -2px black;
+}
+
+.btn.btn-danger.active {
+  box-shadow: 2px 2px black, -2px 2px black, 2px -2px black, -2px -2px black;
+}
+
+.content {
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 30px;
+}
+
+.loader {
+  width: 3em;
+  height: 3em;
+  animation: loaderAnim 1.25s infinite;
+  outline: 1px solid transparent;
+}
+
+#largeBox {
+  height: 3em;
+  width: 3em;
+  background-color: #ECECEC;
+  outline: 1px solid transparent;
+  position: fixed;
+  animation: loaderAnim 1.25s infinite;
+}
+
+#smallBox {
+  height: 3em;
+  width: 3em;
+  background-color: #34495e;
+  position: fixed;
+  z-index: 1;
+  outline: 1px solid transparent;
+  animation: smallBoxAnim 1.25s alternate infinite ease-in-out;
+}
+
+@keyframes smallBoxAnim {
+  0% {
+    transform: scale(0.2) rotate(0deg);
+  }
+
+  100% {
+    transform: scale(0.75) rotate(90deg);
+  }
+}
+
+@keyframes loaderAnim {
+  0% {
+    transform: rotate(0deg);
+  }
+
+  100% {
+    transform: rotate(90deg);
+  }
+}
+
+@media (min-width:1000px) {
+  .modal-xlg {
+    width: 80% !important;
+  }
+}
+
+.modal-dialog.modal-xlg {
+  position: relative;
+  top: 5px;
+}
+
+@media (min-width: 992px) {
+  .modal-lg {
+    width: 1080px !important;
+  }
+}
+
+.modal-dialog.modal-lg {
+  position: relative;
+  top: 30px;
+  margin-bottom: 80px;
+}
+
+.modal-dialog.modal-xmd {
+  width: 700px;
+}
+
+.modal-dialog {
+  position: relative;
+  top: 100px;
+}
+
+.fa {
+  cursor: pointer;
+  margin-right: 5px;
+}
+
+.alert {
+  padding: 5px 10px;
+  margin-bottom: 0px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+}
+
+.fd-seprator {
+  margin-left: 0.2em;
+  margin-right: 0.2em;
+}
+
+.fd-content {
+  padding-left: 20px;
+  margin-top: 15px;
+}
+
+.group-owners-tooltip {
+  --bs-tooltip-max-width:500px;
+  --bs-tooltip-font-size:13px;
+  --bs-tooltip-bg: white;
+  --bs-tooltip-padding-x:15px;
+  --bs-tooltip-padding-y:5px;
+  --bs-tooltip-color:var(--text-color-default);
+  --bs-tooltip-border-radius:5%;
+  --bs-tooltip-border-color: #E2E2E2;
+}
+
+.group-owners-tooltip .tooltip-inner {
+  border: var(--bs-tooltip-border-color) 1px solid;
+  text-align: left;
+}
+
+/* .group-owners-tooltip.bs-tooltip-end .tooltip-arrow::before {
+  border-right-color: #E2E2E2;
+}
+
+.group-owners-tooltip.bs-tooltip-start .tooltip-arrow::before {
+  border-left-color: #E2E2E2;
+} */
+
+.group-owners-tooltip.bs-tooltip-top .tooltip-arrow::before {
+  border-top-color: var(--bs-tooltip-border-color);
+}
+
+/* .group-owners-tooltip.bs-tooltip-bottom .tooltip-arrow::before {
+  border-bottom-color: #E2E2E2;
+} */
+
+a {
+  color: var(--link-color);
+  text-decoration: none;
+}
+
+.bi.bi-download, .fa.fa-download, .fa.fa-ellipsis-v {
+  color: var(--link-color);
+}
+
+.col-form-label {
+  color: var(--text-color-gray);
+}
+
+/* Keep export item interaction inside the menu's padded white surface. */
+.table-export-actions {
+  display: inline-block;
+  text-align: left;
+}
+
+.table-export-actions > .table-export-toggle {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--link-color);
+  font: inherit;
+  cursor: pointer;
+}
+
+.table-export-actions > .table-export-toggle::after {
+  display: none;
+}
+
+.table-export-actions > .dropdown-menu {
+  padding: 0.25rem;
+  background-color: #fff;
+}
+
+.table-export-actions > .dropdown-menu > li > .dropdown-item {
+  border-radius: 0.2rem;
+  color: var(--link-color);
+}
+
+.table-export-actions > .dropdown-menu > li > .dropdown-item:not(:disabled):hover,
+.table-export-actions > .dropdown-menu > li > .dropdown-item:not(:disabled):focus,
+.table-export-actions > .dropdown-menu > li > .dropdown-item:not(:disabled):active {
+  color: #fff;
+  background-color: var(--link-color);
+}
+
+.table-export-actions > .table-export-toggle:focus-visible,
+.table-export-actions > .dropdown-menu > li > .dropdown-item:focus-visible {
+  outline: 2px solid var(--link-color);
+  outline-offset: 1px;
+}
+
+.table-export-actions > .dropdown-menu > li > .dropdown-item:disabled {
+  color: var(--bs-dropdown-link-disabled-color);
+  background-color: transparent;
+}
+
+.col-form-label.profile-value {
+  color: var(--text-color-default);
+}
+
+span.ngb-highlight {
+  background-color: #ff0;
+}
+
+span.fa-globe, span.bi-globe {
+  margin-left: 5px;
+}
+
+.tooltip-text {
+  /* color:var(--text-color-gray); */
+  cursor: pointer;
+  text-decoration: underline dashed;
+  text-decoration-color: var(--link-color);
+}
+
+.no-texting-popover {
+  --bs-popover-max-width: 592px;
+  border: none;
+  border-radius: 6px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.15);
+  background: #fff;
+  max-width: calc(100vw - 32px);
+}
+
+.no-texting-popover .popover-arrow,
+.no-texting-popover::before,
+.no-texting-popover::after {
+  display: none !important;
+}
+
+.no-texting-popover .popover-body {
+  padding: 0;
+  color: inherit;
+}
+
+.fd-dn-name {
+  font-size: 26px;
+  font-weight: bolder;
+  /* margin-top: 10px; */
+  /* margin-bottom: 10px; */
+}
+
+.offShore {
+  color:var(--main-bg-color);
+}
+
+.btn.group-action-btn {
+  border-radius: 90px;
+  padding: 7px 16px;
+  font-size: 0.9em;
+  line-height: 0.95em;
+  margin-right: 25px;
+  --bs-tooltip-opacity: 0;
+}
+
+.tooltip-inner {
+  border: var(--text-color-default) solid 1px;
+  background-color: white;
+  width: 500px;
+}
+
+.bs-tooltip-end .tooltip-black::before {
+  border-right-color: white;
+}
+
+.bs-tooltip-start .tooltip-arrow::before {
+  border-left-color: var(--text-color-default);
+}
+
+.bs-tooltip-top .tooltip-arrow::before {
+  border-top-color: var(--text-color-default);
+}
+
+.bs-tooltip-bottom .tooltip-arrow::before {
+  border-bottom-color: var(--text-color-default);
+}
+
+.tooltip {
+  --bs-tooltip-max-width: fit-content;
+}
+
+.tooltip-inner {
+  color: var(--text-color-default);
+  text-align: left;
+  background-color: white;
+}

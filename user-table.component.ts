@@ -5,14 +5,14 @@ import { Router } from '@angular/router';
 import { TypeaheadMatch } from 'ngx-bootstrap/typeahead';
 import { FormControl } from '@angular/forms';
 import { NgbHighlight } from '@ng-bootstrap/ng-bootstrap';
-import { Subject, Subscription, finalize, takeUntil } from 'rxjs';
+import { Observable, Subject, Subscription, finalize, takeUntil, tap } from 'rxjs';
 import * as _ from 'underscore';
 import { BLANK_REPLACEMENT, EmployeeTypeStrMap, TITLE_MAP } from '../../../data/constants';
 import { LocalStorageService } from '../../../service/local-storage.service';
 import { FilterUsersPipe } from '../../../pipes/filter-users.pipe';
 import { FullUser } from '../../../data/user-full';
 import { DownloadExcelService } from '../../../service/download-excel.service';
-import { GroupExportContext, GroupExportScope, GroupMembersExportService, groupExportUserId } from '../../../service/group-members-export.service';
+import { GroupExportContext, GroupMembersExportService } from '../../../service/group-members-export.service';
 import { NotificationService } from '../../../service/notification.service';
 
 const pickedColumns = ['LoginID', 'FullName', 'Mail', 'Title', 'Department', 'SubDepartment', 'Division', 'City',
@@ -27,6 +27,8 @@ const exportHeaders = ['LoginID', 'FullName', 'Mail', 'Title', 'Department', 'Su
   standalone: false
 })
 export class UserTableComponent {
+  private static nextActionMenuId = 0;
+  readonly actionMenuId = `user-table-actions-${UserTableComponent.nextActionMenuId++}`;
   @Input() groupExport?: GroupExportContext;
   exporting = false;
   private readonly groupMembersExportService = inject(GroupMembersExportService);
@@ -223,19 +225,23 @@ export class UserTableComponent {
     }
     let filteredUsers = this.filterUsersPipe.transform(this.userArray, this.filters);
     if (filteredUsers && filteredUsers.length > 0) {
-      let exportUsers: any[] = []
-      for (let user of filteredUsers) {
-        let userToExport = _.pick(user, ...pickedColumns);
-        userToExport = _.extend(userToExport,
-          {
-            CorpMobilePhone: (user['CorpMobilePhone'] && user['CorpMobilePhone'].length > 0) ? user['CorpMobilePhone'].join(', ') : '',
-            EmployeeType: user.EmployeeType ? (EmployeeTypeStrMap[user.EmployeeType] ? EmployeeTypeStrMap[user.EmployeeType] : user.EmployeeType) : ''
-          })
-        exportUsers.push(userToExport);
-      }
-
-      this.downloadExcelService.exportToExcel(exportUsers, this.exportFileName ? this.exportFileName : 'usersResult', exportHeaders);
+      this.downloadExcelService.exportToExcel(this.exportRows(filteredUsers), this.exportFileName ? this.exportFileName : 'usersResult', exportHeaders);
     }
+  }
+
+  private exportRows(filteredUsers: (UserCod | UserGenpop)[]): any[] {
+    return filteredUsers.map(user => {
+      const row: Record<string, unknown> = {
+        ..._.pick(user, ...pickedColumns),
+        CorpMobilePhone: user.CorpMobilePhone?.join(', ') || '',
+        EmployeeType: user.EmployeeType ? (EmployeeTypeStrMap[user.EmployeeType] || user.EmployeeType) : ''
+      };
+      // Copy array values now, not after the asynchronous metadata request.
+      for (const key of Object.keys(row)) {
+        if (Array.isArray(row[key])) { row[key] = (row[key] as unknown[]).join(', '); }
+      }
+      return row;
+    });
   }
 
   private exportGroupUsers(): void {
@@ -243,29 +249,22 @@ export class UserTableComponent {
     const users = this.filterUsersPipe.transform(this.userArray, this.filters);
     if (!users.length) { return; }
     const hasFilters = Object.values(this.filters).some(value => !!value);
-    let selection: GroupExportScope = { scope: 'all' };
-    if (hasFilters) {
-      const ids = users.map(groupExportUserId);
-      if (ids.some(id => !id)) {
-        this.notificationService.setNotificationData('alert-danger', 'Cannot export: a filtered user has no identifier.', '');
-        return;
-      }
-      selection = { scope: 'selected', userIds: [...new Set(ids as string[])] };
-    }
+    // Snapshot rows at click time so edits during the request cannot change this export.
+    const rows = this.exportRows(users);
     const fileName = (this.exportFileName || 'group_users').replace(/[\\/:*?"<>|\x00-\x1f]/g, '_');
     this.exporting = true;
-    this.groupMembersExportService.export(context, selection).pipe(
+    const request: Observable<unknown> = hasFilters
+      ? this.groupMembersExportService.getLabelMetadata().pipe(tap(label => {
+          this.downloadExcelService.exportToExcel(rows, fileName, exportHeaders, label);
+        }))
+      : this.groupMembersExportService.export(context).pipe(tap(blob => {
+          if (!blob.size) { throw new Error('Empty export file'); }
+          this.downloadExcelService.saveAsExcelFile(blob, fileName);
+        }));
+    request.pipe(
       takeUntil(this._destroying$),
       finalize(() => this.exporting = false)
     ).subscribe({
-      next: blob => {
-        if (!blob.size) {
-          this.notificationService.setNotificationData('alert-danger', 'Export failed: empty file.', '');
-          return;
-        }
-        // Save the server bytes without parsing/rebuilding the workbook or its label.
-        this.downloadExcelService.saveAsExcelFile(blob, fileName);
-      },
       // This request opts out of global error notifications to avoid duplicate alerts.
       // Never fall back to an unlabelled file, including on authorization failures.
       error: () => this.notificationService.setNotificationData('alert-danger', 'Excel export failed. Please retry or contact support.', '')
