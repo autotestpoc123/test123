@@ -1,102 +1,38 @@
-function New-PipelineMutex {
-    param([string]$Name = 'Global\WeComAudit')
-    $security = [System.Security.AccessControl.MutexSecurity]::new()
-    $security.SetAccessRuleProtection($true, $false)
-    # Trusted host administrators retain access for elevated manual runs.
-    # This ACL is not a security boundary against a local administrator.
-    $identities = @(
-        [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-        [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
-        [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
-    )
-    $rights = [System.Security.AccessControl.MutexRights]::Synchronize -bor
-              [System.Security.AccessControl.MutexRights]::Modify
-    foreach ($sid in $identities) {
-        # Windows PowerShell 5.1/.NET Framework retries opening an existing mutex
-        # with Synchronize | Modify when the initial full-access open is denied.
-        # Apply the ACL at creation only; never rewrite an existing object's ACL.
-        $security.AddAccessRule([System.Security.AccessControl.MutexAccessRule]::new(
-            $sid, $rights,
-            [System.Security.AccessControl.AccessControlType]::Allow))
-    }
-    $created = $false
-    return [System.Threading.Mutex]::new($false, $Name, [ref]$created, $security)
-}
+1. 缓存命中仍可能依赖 NAS，需要准确界定收益
+   如果每次请求都先读取 NAS 上的 FileInfo，取得 mtime 后才查缓存，那么热缓存仍然要等待 NAS 元数据访问。
+   这个设计能减少照片内容读取和缩放，但不能保证 NAS 卡顿时缓存照常返回。第一阶段可以接受；如果实测 TTFB 仍高，再考虑短时间缓存元数据，或导入照片时维护版本号。
+2. 200MB 缓存限制不等于总内存限制
+   缩略图缓存之外，还存在原图解码、缩放及编码的临时内存。同一张图用 Lazy 合并请求是正确的，但不同人的照片仍可能同时解码。
+   建议给后端生成缩略图增加并发上限，并限制输入像素数。前端 4～6 并发可以后续再做，不能依赖浏览器连接数限制保护后端：HTTP/2 和多个客户端都可能带来更多并发。
+   另外，缩略图最好使用独立的限额缓存。共享 IMemoryCache 设置 SizeLimit 后，其他使用者也必须提供 entry size，容易影响现有功能。微软缓存说明
+3. 多尺寸失效和 Lazy 失败清理必须补齐
+   前端缓存从 msid 改成 {msid}:{size} 后，invalidate(msid) 必须清除该人的全部尺寸，否则换照片后可能出现小头像已更新、大头像还是旧图。
+   后端还需要确认：
+   - 生成失败后移除对应的 Lazy，避免后续请求一直复用失败结果。
+   - 请求合并用的字典会清理，不能绕过 200MB 缓存限制长期持有结果。
+   - 前端 LRU 淘汰后的 Blob URL 有释放机制。旧实现只删除 Map 条目，淘汰项的 URL 不再被卸载清理遍历到；把上限提高到 400 不会解决这个问题。
+4. sm/md/lg → 48 的映射需要调整
+   按当前 CSS：
+   组件	显示大小	请求 48px 的效果
+   sm	24px	合理，可覆盖常见 2× 屏幕
+   md	48px	普通屏可用，高分屏可能模糊
+   lg	96px	需要放大，容易模糊
+   
+   
+   建议至少让 lg 请求更大的档位；具体增加 96、192，还是复用现有 512，可结合实际使用频率决定。
+   大头像和弹窗共用 512 是合理取舍，减少一次请求，但它也意味着详情页一开始就下载 512，弹窗清晰度受 512 限制。需要确认弹窗展示尺寸和产品预期。
+其他设计基本可以保留，但有几个实现条件：
+设计	Review 意见
+尺寸白名单与归一化	合理；前端缓存键也应使用归一化后的尺寸，避免等价请求形成多个缓存项。
+ETag 包含归一化宽度	正确；还应体现源文件版本，编码质量或缩放规则改变时也要更新表示版本。304 判断应先于缩略图生成。
+30 分钟滑动过期	可作为起点；只设滑动过期，热点项可能一直保留，建议结合绝对过期。
+FileContentResult 返回缓存字节	合理；确认 Content-Type、ETag 和 Cache-Control 都正确设置。
+跳过照片响应 body 日志	合理；继续保留状态码、耗时和错误指标，并确保没有跳过鉴权或全局异常处理。
+坏图返回错误、UI 显示默认头像	可以接受；不必自动回退原图。NAS 超时等暂时故障应与坏图区分，且不缓存为长期“无照片”。
 
-function Enter-PipelineMutex {
-    param([Parameter(Mandatory)][System.Threading.Mutex]$Mutex)
-    try {
-        return [pscustomobject]@{ Acquired = $Mutex.WaitOne(0); Abandoned = $false }
-    }
-    catch {
-        if ($_.Exception.GetBaseException() -is [System.Threading.AbandonedMutexException]) {
-            # WaitOne throws AFTER assigning ownership to this thread.
-            return [pscustomobject]@{ Acquired = $true; Abandoned = $true }
-        }
-        throw
-    }
-}
 
-function Remove-ExpiredPipelineMutexDiagnostics {
-    param(
-        [Parameter(Mandatory)][string]$Directory,
-        [ValidateRange(1, 10000)][int]$MaxFiles = 100,
-        [ValidateRange(1, 3650)][int]$MaxAgeDays = 30
-    )
-    # Only direct-child, regular files with our generated name are eligible.
-    # Never traverse directories or remove other scheduler/business artifacts.
-    $logDirectory = Get-Item -LiteralPath $Directory -ErrorAction Stop
-    if ($logDirectory -isnot [System.IO.DirectoryInfo]) {
-        throw "Mutex diagnostic directory is not a filesystem directory: $Directory"
-    }
-    $cutoff = [DateTime]::UtcNow.AddDays(-$MaxAgeDays)
-    $logs = @(Get-ChildItem -LiteralPath $logDirectory.FullName -Filter 'scheduler-mutex-*.log' -File -ErrorAction Stop |
-        Where-Object {
-            $_.Name -cmatch '^scheduler-mutex-[0-9]+-[0-9a-f]{32}\.[0-9]{8}_[0-9]{6}\.log$' -and
-            ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0 -and
-            $_.DirectoryName -eq $logDirectory.FullName
-        } |
-        Sort-Object -Property @{ Expression = 'LastWriteTimeUtc'; Descending = $true },
-                              @{ Expression = 'Name'; Descending = $true })
-    for ($index = 0; $index -lt $logs.Count; $index++) {
-        $log = $logs[$index]
-        if ($index -ge $MaxFiles -or $log.LastWriteTimeUtc -lt $cutoff) {
-            # Concurrent sweepers may remove the same file; active writers or
-            # denied deletes may prevent cleanup. Retry on the next diagnostic.
-            # File.Delete also refuses directories if an entry changes after
-            # enumeration, and succeeds if another sweeper already deleted it.
-            try { [System.IO.File]::Delete($log.FullName) }
-            catch [System.IO.IOException] { }
-            catch [System.UnauthorizedAccessException] { }
-        }
-    }
-}
-
-function Write-PipelineMutexDiagnostic {
-    param(
-        [ValidateSet('MutexFailure', 'MutexContention', 'MutexAbandoned')]
-        [string]$Reason,
-        [Parameter(Mandatory)][string]$Detail
-    )
-    Write-Warning $Detail
-    try {
-        # Mutex outcomes are local diagnostics only; no SRE/Ops notification.
-        # Unique files avoid concurrent append writers. Bound new record size
-        # and best-effort retention independently of pipeline-lock ownership.
-        $logPath = Get-LogFilePath -Directory $resolvedOutputRoot -BaseName (
-            'scheduler-mutex-' + $PID + '-' + [guid]::NewGuid().ToString('N'))
-        $safeDetail = $Detail -replace '[\r\n]+', ' '
-        if ($safeDetail.Length -gt 4096) {
-            $suffix = ' [truncated]'
-            $safeDetail = $safeDetail.Substring(0, 4096 - $suffix.Length) + $suffix
-        }
-        Write-Log -LogFilePath $logPath -LogString (
-            "$Reason cycle=$cycleId $safeDetail")
-    }
-    catch { Write-Warning "Could not persist mutex diagnostic: $($_.Exception.Message)" }
-    try {
-        # Also try cleanup after a failed write, for example when disk is full.
-        Remove-ExpiredPipelineMutexDiagnostics -Directory $resolvedOutputRoot
-    }
-    catch { Write-Warning "Could not prune mutex diagnostics: $($_.Exception.Message)" }
-}
+最后，单元测试通过能说明功能路径可用，尚不能证明性能收益。建议补充四组有针对性的验证：
+- 同一照片同尺寸并发：只生成一次；生成失败后恢复文件，可以重试成功。
+- 照片替换：mtime、ETag 和前后端各尺寸缓存正确更新。
+- 多人冷缓存并发：观察 API 内存峰值、CPU、NAS 读取量和响应时间。
+- 相同 org-tree 优化前后对比：统计总传输字节、图片原始宽高、首屏头像加载时间，并分别测冷缓存和热缓存。
