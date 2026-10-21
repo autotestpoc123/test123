@@ -1,12 +1,7 @@
-| 问题 | 当前代码与影响 | 修复方向 |
-|---|---|---|
-| **3. Blob 生命周期** | [user-photo.service.ts:101]（user-photo.service.ts:101) 淘汰缓存后仍固定延迟 5 秒 revoke，未判断是否仍被使用。在途条目被淘汰后才创建的 URL，也不受 `releaseAll()` 管理。 | 跟踪 URL 所有权；缓存淘汰且没有消费者使用时再释放，同时处理迟到响应。 |
-| **4. 切换用户显示旧照片** | [user-view.component.ts:103](user-view.component.ts:103) 的 `populateUser()` 未清理照片订阅或关闭弹窗；照片回调也没有校验当前 MSID。 | 切换用户时取消旧订阅、关闭弹窗，并检查返回结果是否属于当前用户。 |
-| **5. 旧定时器误删新缓存** | [user-photo.service.ts:80](/user-photo.service.ts:80) 仍使用 `setTimeout(() => this.cache.delete(key), …)`，可能删除同 key 后来生成的成功条目。 | 删除前检查 `this.cache.get(key) === entry`，只删除原条目。 |
-
-第 5 项的最小修复是：
-setTimeout(() => {
-  if (this.cache.get(key) === entry) {
-    this.cache.delete(key);
-  }
-}, NEGATIVE_CACHE_MS);
+48/512 是按显示场景选择的：
+- 48px：org-tree 显示为 24×24，适配常见 2× 高分屏。
+- 512px：profile 的 126px 头像与放大弹窗共享，避免额外下载原图；是否降到 256，应结合体积和清晰度验证。
+第 3、4 项修复也已完成：
+- [图片服务](C:/Users/lxzxc/workspace/ui/src/app/service/user-photo.service.ts)：跟踪头像和弹窗的使用引用，保护仍在显示的 URL，并清理淘汰后的迟到响应。
+- [用户页面](C:/Users/lxzxc/workspace/ui/src/app/components/user-view/user-view.component.ts)：切换用户或开始导航时清理旧弹窗、取消订阅，阻止旧结果打开弹窗。
+已完成一轮自审，补齐延迟订阅及回收时序边界。46 项相关测试全部通过，生产构建通过；构建仍有包体积、CommonJS 和 CSS 选择器警告。尚未进行真实 NAS 端到端验收。
