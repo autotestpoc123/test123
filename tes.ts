@@ -61,3 +61,20 @@ CompareJpegQuality(
 3. 对照 PNG：如果 PNG 本身已经模糊，说明主要问题是缩放尺寸或原图，单纯提高 JPEG quality 帮助有限。
 4. 用多张代表性照片重复比较，选择清晰度可以接受的最低质量值，并记录实际文件大小。
 不要通过重新加载 API 的缓存图片直接比较参数；缓存可能仍返回旧结果。生产环境最终调整质量后，记得同时更新 ThumbnailVersion，让服务端缓存和 ETag 对应到新编码结果。
+
+
+最直接的是在 Windows 查看 NAS 原文件的属性：
+1. 右键照片 → 属性。
+2. 打开 详细信息。
+3. 查看“图像”下面的 宽度、高度、尺寸，例如 2000 × 3000。
+这里看的是图片像素尺寸；“500KB”是文件大小，“水平/垂直分辨率”的 DPI 也不是像素宽高。
+如果希望与后端读取结果一致，可以使用 ImageSharp：
+using SixLabors.ImageSharp;
+
+string path = @"\\nas\photos\A\B\ab123.jpg";
+ImageInfo info = Image.Identify(path);
+
+Console.WriteLine($"原始宽高：{info.Width} × {info.Height} px");
+Console.WriteLine($"文件大小：{new FileInfo(path).Length:N0} bytes");
+必须读取 NAS 上的原文件，不要读取 /photos/{msid}?size=512 的响应，否则看到的是缩略图尺寸。
+另外，手机照片可能带 EXIF 旋转信息。例如编码尺寸为 4032×3024，经过方向修正后显示为 3024×4032，这种宽高互换是正常现象。
