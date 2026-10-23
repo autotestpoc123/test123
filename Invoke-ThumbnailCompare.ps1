@@ -16,12 +16,16 @@ if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
 $project = Join-Path $PSScriptRoot 'ThumbnailCompare.csproj'
 & dotnet build $project --configuration Release --nologo
 if ($LASTEXITCODE -ne 0) { throw 'Build/restore failed. Check your NuGet source and package access.' }
-$assembly = Join-Path $PSScriptRoot 'bin/Release/net8.0/ThumbnailCompare.dll'
-& dotnet $assembly --engine $Engine --input $InputRoot --output $OutputRoot `
+# Let the SDK resolve the project's target framework, assembly name and output path.
+# --no-build also disables restore; the successful build above supplies the output.
+& dotnet run --project $project --configuration Release --no-build -- `
+    --engine $Engine --input $InputRoot --output $OutputRoot `
     --widths ($Widths -join ',') --qualities ($Qualities -join ',') `
     --max-files $MaxFiles --max-pixels $MaxPixels --max-source-mb $MaxSourceMB
 $resultCode = $LASTEXITCODE
-if ($resultCode -ne 0) {
-    Write-Warning "Comparison finished with exit code $resultCode. See the printed CSV path for individual failures."
+if ($resultCode -eq 2) {
+    Write-Warning 'Comparison found no photos or encountered individual failures. See the printed CSV path.'
+} elseif ($resultCode -ne 0) {
+    Write-Warning "Tool could not complete (exit code $resultCode). Check the error above; a CSV may not have been created."
 }
 exit $resultCode
