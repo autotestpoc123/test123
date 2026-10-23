@@ -1,9 +1,14 @@
-({
-  src: $0.src,
-  complete: $0.complete,
-  naturalWidth: $0.naturalWidth,
-  naturalHeight: $0.naturalHeight,
-  display: getComputedStyle($0).display,
-  visibility: getComputedStyle($0).visibility,
-  opacity: getComputedStyle($0).opacity
-})
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RestorePackagesPath>$(MSBuildThisFileDirectory).packages</RestorePackagesPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="PhotoSauce.MagicScaler" Version="0.15.0" />
+    <PackageReference Include="SkiaSharp" Version="4.153.1" />
+  </ItemGroup>
+</Project>
