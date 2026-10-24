@@ -1,14 +1,26 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <RestorePackagesPath>$(MSBuildThisFileDirectory).packages</RestorePackagesPath>
-  </PropertyGroup>
-  <ItemGroup>
-    <PackageReference Include="PhotoSauce.MagicScaler" Version="0.15.0" />
-    <PackageReference Include="SkiaSharp" Version="4.153.1" />
-  </ItemGroup>
-</Project>
+(() => {
+  // 改成需要比较的照片文件名
+  const target = '00MYH.jpg'.toLowerCase();
+
+  const figures = [...document.querySelectorAll('main > figure')];
+
+  const matches = figures.filter(figure => {
+    const source = figure.querySelector('figcaption')
+      ?.firstChild?.textContent?.trim()
+      .replaceAll('\\', '/')
+      .toLowerCase();
+
+    return source?.split('/').pop() === target;
+  });
+
+  if (!matches.length) {
+    console.warn('没有找到这张照片，请核对文件名。');
+    return;
+  }
+
+  figures.forEach(figure => {
+    figure.hidden = !matches.includes(figure);
+  });
+
+  console.log(`当前显示 ${matches.length} 个版本。`);
+})();
