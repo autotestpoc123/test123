@@ -37,6 +37,8 @@ internal static class CompareProgram
 
     internal static int Compare(Options options)
     {
+        if (options.ExpectedEngine != null && !string.Equals(options.Engine, options.ExpectedEngine, StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException($"Engine mismatch: entry requires {options.ExpectedEngine}, received {options.Engine}.");
         if (!OperatingSystem.IsWindows())
             throw new PlatformNotSupportedException("These comparison scripts target Windows, including NAS UNC paths.");
         if (!Directory.Exists(options.Input)) throw new DirectoryNotFoundException(options.Input);
@@ -287,13 +289,13 @@ internal static class CompareProgram
 internal sealed record ThumbnailResult(byte[] Bytes, SKCodecResult? SourceDecodeResult);
 
 internal sealed record Options(string Engine, string Input, string Output, int[] Widths, int[] Qualities,
-    int MaxFiles, long MaxPixels, long MaxSourceBytes, bool AllowIncompleteInput = false)
+    int MaxFiles, long MaxPixels, long MaxSourceBytes, bool AllowIncompleteInput = false, string? ExpectedEngine = null)
 {
     internal static Options Parse(string[] args)
     {
         if (args.Length % 2 != 0) throw new ArgumentException("Arguments must be --name value pairs.");
         var values = new Dictionary<string, string>();
-        var names = new HashSet<string> { "--engine", "--input", "--output", "--widths", "--qualities", "--max-files", "--max-pixels", "--max-source-mb", "--allow-incomplete-input" };
+        var names = new HashSet<string> { "--engine", "--expected-engine", "--input", "--output", "--widths", "--qualities", "--max-files", "--max-pixels", "--max-source-mb", "--allow-incomplete-input" };
         for (int i = 0; i < args.Length; i += 2)
         {
             if (!names.Contains(args[i]) || !values.TryAdd(args[i], args[i + 1])) throw new ArgumentException($"Unknown/duplicate argument: {args[i]}");
@@ -305,6 +307,8 @@ internal sealed record Options(string Engine, string Input, string Output, int[]
             : long.TryParse(values[name], out long n) && n >= min && n <= max ? n : throw new ArgumentException($"Invalid {name}.");
         string engine = Required("--engine").ToLowerInvariant();
         if (engine is not ("magicscaler" or "skiasharp" or "imagesharp")) throw new ArgumentException("Engine must be magicscaler, skiasharp or imagesharp.");
+        string expectedEngine = values.GetValueOrDefault("--expected-engine", engine).ToLowerInvariant();
+        if (expectedEngine != engine) throw new ArgumentException($"Engine mismatch: entry requires {expectedEngine}, received {engine}.");
         if (!bool.TryParse(values.GetValueOrDefault("--allow-incomplete-input", "false"), out bool allowIncompleteInput))
             throw new ArgumentException("Invalid --allow-incomplete-input: use true or false.");
         if (allowIncompleteInput && engine != "skiasharp")
@@ -313,6 +317,6 @@ internal sealed record Options(string Engine, string Input, string Output, int[]
             Path.TrimEndingDirectorySeparator(Path.GetFullPath(Required("--output"))),
             List("--widths", "48,512", 4096), List("--qualities", "75,85,90", 100),
             (int)Number("--max-files", 100, 0, int.MaxValue), Number("--max-pixels", 40000000, 1, int.MaxValue),
-            Number("--max-source-mb", 50, 1, 1024) * 1024 * 1024, allowIncompleteInput);
+            Number("--max-source-mb", 50, 1, 1024) * 1024 * 1024, allowIncompleteInput, expectedEngine);
     }
 }

@@ -187,6 +187,21 @@ internal static class SelfTest
             throw new Exception("Skia-only switch was accepted for ImageSharp.");
         }
         catch (ArgumentException) { }
+        string wrongOutput = Path.Combine(directory, "wrong-engine-output");
+        try
+        {
+            CompareProgram.Compare(options with { Engine = "magicscaler", ExpectedEngine = "imagesharp", Output = wrongOutput });
+            throw new Exception("Mismatched entry engine was accepted.");
+        }
+        catch (ArgumentException) { }
+        Require(!Directory.Exists(wrongOutput), "Wrong engine must be rejected before creating output directories");
+        try
+        {
+            Options.Parse(new[] { "--engine", "magicscaler", "--expected-engine", "imagesharp",
+                "--input", options.Input, "--output", wrongOutput });
+            throw new Exception("Mismatched CLI engine was accepted.");
+        }
+        catch (ArgumentException) { }
     }
 
     private static byte[] CreateJpeg(int width, int height)
