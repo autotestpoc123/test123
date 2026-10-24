@@ -47,7 +47,7 @@ internal static class SelfTest
                 .Count(p => Path.GetExtension(p).Equals(".jpg", StringComparison.OrdinalIgnoreCase)) == 18, $"{engine}: expected 18 thumbnails");
             Require(File.ReadAllLines(Path.Combine(run, "results.csv")).Length == 19, "CSV row count");
             Require(File.Exists(Path.Combine(run, "index.html")), "Preview report");
-            Require(CompareProgram.Compare(options with { MaxPixels = 1, MaxFiles = 1 }) == 2, "Pixel limit rejection");
+            Require(CompareProgram.Compare(options with { Output = Path.Combine(directory, "rejections"), MaxPixels = 1, MaxFiles = 1 }) == 2, "Pixel limit rejection");
             try
             {
                 CompareProgram.Compare(options with { Output = Path.Combine(input, "unsafe") });
@@ -57,11 +57,12 @@ internal static class SelfTest
             string corruptInput = Path.Combine(directory, "corrupt");
             Directory.CreateDirectory(corruptInput);
             File.WriteAllText(Path.Combine(corruptInput, "broken.jpg"), "not an image");
-            Require(CompareProgram.Compare(options with { Input = corruptInput, MaxFiles = 1 }) == 2, "Corrupt input handling");
+            Require(CompareProgram.Compare(options with { Input = corruptInput, Output = Path.Combine(directory, "rejections"), MaxFiles = 1 }) == 2, "Corrupt input handling");
         }
+        TestComparisonReport(directory);
         TestIncompleteInput(directory, normal);
         TestImageSharpSourceReporting(directory);
-        Console.WriteLine($"SELF-TEST PASS: {checks} orientation/quality checks plus no-upscale, batch, source protection, limits, corrupt-file and partial-input checks.");
+        Console.WriteLine($"SELF-TEST PASS: {checks} orientation/quality checks plus no-upscale, batch, source protection, limits, corrupt-file, partial-input and comparison-report checks.");
         return 0;
     }
 
@@ -108,6 +109,55 @@ internal static class SelfTest
     private static void Require(bool condition, string name)
     {
         if (!condition) throw new Exception("SELF-TEST FAILED: " + name);
+    }
+
+    private static void TestComparisonReport(string directory)
+    {
+        string root = Path.Combine(directory, "output");
+        int Matched()
+        {
+            using var json = System.Text.Json.JsonDocument.Parse(File.ReadAllText(Path.Combine(root, "comparison.json")));
+            return json.RootElement.GetProperty("MatchedCases").GetInt32();
+        }
+        Require(Matched() == 18, "Automatic report must match all three engines by relative path/hash/size/quality");
+        Require(File.Exists(Path.Combine(root, "comparison.html")) && File.ReadAllLines(Path.Combine(root, "comparison.csv")).Length == 4, "HTML and summary CSV");
+        string imageRun = Directory.GetDirectories(Path.Combine(root, "imagesharp")).Single();
+        string reportPath = Path.Combine(imageRun, "results.csv");
+        string original = File.ReadAllText(reportPath);
+        string hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(Path.Combine(directory, "source", "A", "same.jpg"))));
+        try
+        {
+            File.WriteAllText(reportPath, original.Replace(hash, new string('0', 64)));
+            ComparisonReport.Build(root);
+            Require(Matched() == 12, "Changed source hashes must exclude six variants of that photo");
+            File.WriteAllText(reportPath, original.Replace("\"ok\"", "\"warning\""));
+            ComparisonReport.Build(root);
+            Require(Matched() == 0, "Warnings must not enter size/time rankings");
+            File.WriteAllText(reportPath, original.Replace("rotated.JPG", "<script>alert(1)</script>.JPG"));
+            ComparisonReport.Build(root);
+            string html = File.ReadAllText(Path.Combine(root, "comparison.html"));
+            Require(!html.Contains("<script>alert(1)</script>") && html.Contains("&lt;script&gt;"), "CSV filenames must be HTML escaped");
+        }
+        finally { File.WriteAllText(reportPath, original); }
+        string image = Directory.EnumerateFiles(imageRun, "*.jpg", SearchOption.AllDirectories).First();
+        File.Move(image, image + ".missing");
+        try
+        {
+            ComparisonReport.Build(root);
+            Require(Matched() == 17, "Missing output must not enter rankings");
+        }
+        finally { File.Move(image + ".missing", image); }
+        string incomplete = Path.Combine(root, "imagesharp", "99999999_incomplete");
+        Directory.CreateDirectory(incomplete);
+        File.WriteAllText(Path.Combine(incomplete, "run.json"), "{}");
+        File.WriteAllText(Path.Combine(incomplete, "results.csv"), "unfinished");
+        ComparisonReport.Build(root);
+        Require(Matched() == 18, "An unfinished latest run must not replace the completed run");
+        File.WriteAllText(Path.Combine(incomplete, "index.html"), "invalid run");
+        ComparisonReport.Build(root);
+        Require(Matched() == 18, "Malformed run metadata must be skipped");
+        using var rejected = System.Text.Json.JsonDocument.Parse(File.ReadAllText(Path.Combine(directory, "rejections", "comparison.json")));
+        Require(rejected.RootElement.GetProperty("Engines").EnumerateArray().All(engine => engine.GetProperty("FailedVariants").GetInt32() == 6), "Source-level failures must count all six requested variants");
     }
 
     private static void TestImageSharpSourceReporting(string directory)
