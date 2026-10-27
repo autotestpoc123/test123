@@ -75,7 +75,7 @@ describe('UserPhotoService', () => {
       error: () => fail('should not error'),
     });
     const req = httpMock.expectOne(URL_GET_USER_PHOTO + 'abc123');
-    req.flush(new Blob(['not found']), { status: 404, statusText: 'Not Found' });
+    req.flush(new Blob(['not found'], { type: 'image/jpeg' }), { status: 404, statusText: 'Not Found' });
   });
 
   it('wraps blob into SafeUrl on success', (done) => {
@@ -94,7 +94,49 @@ describe('UserPhotoService', () => {
     service.getPhoto('ABC123').subscribe();
     const reqs = httpMock.match(URL_GET_USER_PHOTO + 'abc123');
     expect(reqs.length).toBe(1);
-    reqs[0].flush(new Blob(['x']), { status: 200, statusText: 'OK' });
+    reqs[0].flush(new Blob(['x'], { type: 'image/jpeg' }), { status: 200, statusText: 'OK' });
+  });
+
+  for (const mime of ['text/html', 'application/json', 'image/svg+xml', '']) {
+    it(`rejects 200 ${mime || 'missing MIME'} without creating a URL and retries after 30 seconds`, fakeAsync(() => {
+      const warn = spyOn(console, 'warn');
+      const received: (SafeUrl | null)[] = [];
+      service.getPhoto('invalidmime', 48).subscribe(url => received.push(url));
+      httpMock.expectOne(URL_GET_USER_PHOTO + 'invalidmime?size=48')
+        .flush(new Blob(['unexpected'], { type: mime }));
+      expect(received).toEqual([null]);
+      expect(createdUrls).toEqual([]);
+      expect(warn).toHaveBeenCalledWith('[user-photo] request failed', jasmine.objectContaining({
+        message: `Unexpected photo content type: ${mime || '(missing)'}`,
+      }));
+      tick(29_999);
+      service.getPhoto('invalidmime', 48).subscribe(url => expect(url).toBeNull());
+      httpMock.expectNone(URL_GET_USER_PHOTO + 'invalidmime?size=48');
+      tick(2);
+      service.getPhoto('invalidmime', 48).subscribe(url => expect(url).not.toBeNull());
+      httpMock.expectOne(URL_GET_USER_PHOTO + 'invalidmime?size=48')
+        .flush(new Blob(['jpeg'], { type: 'image/jpeg' }));
+      expect(createdUrls.length).toBe(1);
+    }));
+  }
+
+  it('accepts a JPEG header with case and parameters when the blob type is missing', () => {
+    service.getPhoto('jpegheader', 512).subscribe(url => expect(url).not.toBeNull());
+    httpMock.expectOne(URL_GET_USER_PHOTO + 'jpegheader?size=512')
+      .flush(new Blob(['jpeg']), { headers: { 'Content-Type': 'IMAGE/JPEG; charset=binary' } });
+    expect(createdUrls.length).toBe(1);
+  });
+
+  it('rejects an HTML response header even if the blob claims JPEG and releases the queue slot', () => {
+    spyOn(console, 'warn');
+    const busy = fillRequestSlots();
+    service.getPhoto('afterinvalid', 48).subscribe();
+    busy[0].flush(new Blob(['html'], { type: 'image/jpeg' }), {
+      headers: { 'Content-Type': 'text/html' },
+    });
+    expect(createdUrls).toEqual([]);
+    httpMock.expectOne(URL_GET_USER_PHOTO + 'afterinvalid?size=48').flush(null);
+    busy.slice(1).forEach(request => request.flush(null));
   });
 
   function fillRequestSlots() {
@@ -113,7 +155,7 @@ describe('UserPhotoService', () => {
     let batch = httpMock.match(() => true);
     expect(batch.length).toBe(6);
     while (batch.length) {
-      batch.forEach(request => request.flush(new Blob(['photo'])));
+      batch.forEach(request => request.flush(new Blob(['photo'], { type: 'image/jpeg' })));
       batch = httpMock.match(() => true);
       expect(batch.length).toBeLessThanOrEqual(6);
     }
@@ -129,9 +171,9 @@ describe('UserPhotoService', () => {
     busy[0].flush(null, { status: 204, statusText: 'No Content' });
     const visible = httpMock.expectOne(URL_GET_USER_PHOTO + 'visible1?size=48');
     expect(visible.request.method).toBe('GET');
-    visible.flush(new Blob(['visible']));
-    httpMock.expectOne(URL_GET_USER_PHOTO + 'nearby1?size=48').flush(new Blob(['nearby']));
-    httpMock.expectOne(URL_GET_USER_PHOTO + 'nearby2?size=48').flush(new Blob(['nearby']));
+    visible.flush(new Blob(['visible'], { type: 'image/jpeg' }));
+    httpMock.expectOne(URL_GET_USER_PHOTO + 'nearby1?size=48').flush(new Blob(['nearby'], { type: 'image/jpeg' }));
+    httpMock.expectOne(URL_GET_USER_PHOTO + 'nearby2?size=48').flush(new Blob(['nearby'], { type: 'image/jpeg' }));
     busy.slice(1).forEach(request => request.flush(null));
   });
 
@@ -190,7 +232,7 @@ describe('UserPhotoService', () => {
   it('replays cached photos even while every request slot is occupied', () => {
     let photo: SafeUrl | null = null;
     service.getPhoto('cached', 48).subscribe(url => photo = url);
-    httpMock.expectOne(URL_GET_USER_PHOTO + 'cached?size=48').flush(new Blob(['cached']));
+    httpMock.expectOne(URL_GET_USER_PHOTO + 'cached?size=48').flush(new Blob(['cached'], { type: 'image/jpeg' }));
     const busy = fillRequestSlots();
     service.getPhoto('cached', 48).subscribe(url => expect(url).toBe(photo));
     httpMock.expectNone(URL_GET_USER_PHOTO + 'cached?size=48');
@@ -202,7 +244,7 @@ describe('UserPhotoService', () => {
     const request = httpMock.expectOne(URL_GET_USER_PHOTO + 'started?size=48');
     sub.unsubscribe();
     expect(request.cancelled).toBeFalse();
-    request.flush(new Blob(['completed']));
+    request.flush(new Blob(['completed'], { type: 'image/jpeg' }));
     service.getPhoto('started', 48).subscribe(url => expect(url).not.toBeNull());
     httpMock.expectNone(URL_GET_USER_PHOTO + 'started?size=48');
   });
@@ -230,13 +272,13 @@ describe('UserPhotoService', () => {
   it('invalidate removes entry and schedules revoke', fakeAsync(() => {
     service.getPhoto('abc123').subscribe();
     const req = httpMock.expectOne(URL_GET_USER_PHOTO + 'abc123');
-    req.flush(new Blob(['x']), { status: 200, statusText: 'OK' });
+    req.flush(new Blob(['x'], { type: 'image/jpeg' }), { status: 200, statusText: 'OK' });
     service.invalidate('abc123');
     expect(revokedUrls.length).toBe(0);
     tick(5_001);
     expect(revokedUrls.length).toBe(1);
     service.getPhoto('abc123').subscribe();
-    httpMock.expectOne(URL_GET_USER_PHOTO + 'abc123').flush(new Blob(['y']));
+    httpMock.expectOne(URL_GET_USER_PHOTO + 'abc123').flush(new Blob(['y'], { type: 'image/jpeg' }));
   }));
 
   it('LRU: hot entry survives cache overflow', () => {
@@ -284,7 +326,7 @@ describe('UserPhotoService', () => {
     overflowCache();
     service.getPhoto('activeevicted', 48).subscribe(url => received.push(url));
     httpMock.expectNone(URL_GET_USER_PHOTO + 'activeevicted?size=48');
-    active.flush(new Blob(['shared']));
+    active.flush(new Blob(['shared'], { type: 'image/jpeg' }));
     expect(received.length).toBe(2);
     expect(received[0]).toBe(received[1]);
   });
@@ -297,8 +339,8 @@ describe('UserPhotoService', () => {
     let replacement: SafeUrl | null = null;
     service.getPhoto('activeevicted', 48).subscribe(url => replacement = url);
     const current = httpMock.expectOne(URL_GET_USER_PHOTO + 'activeevicted?size=48');
-    old.flush(new Blob(['old']));
-    current.flush(new Blob(['replacement']));
+    old.flush(new Blob(['old'], { type: 'image/jpeg' }));
+    current.flush(new Blob(['replacement'], { type: 'image/jpeg' }));
     service.getPhoto('activeevicted', 48).subscribe(url => expect(url).toBe(replacement));
     httpMock.expectNone(URL_GET_USER_PHOTO + 'activeevicted?size=48');
     tick(5_001);
@@ -325,7 +367,7 @@ describe('UserPhotoService', () => {
       service.retainPhoto(photo);
       service.retainPhoto(photo);
     });
-    httpMock.expectOne(URL_GET_USER_PHOTO + 'abc123?size=512').flush(new Blob(['x']));
+    httpMock.expectOne(URL_GET_USER_PHOTO + 'abc123?size=512').flush(new Blob(['x'], { type: 'image/jpeg' }));
     overflowCache();
     tick(5_001);
     expect(revokedUrls).toEqual([]);
@@ -345,7 +387,7 @@ describe('UserPhotoService', () => {
     });
     const pending = httpMock.expectOne(URL_GET_USER_PHOTO + 'abc123?size=48');
     overflowCache();
-    pending.flush(new Blob(['late']));
+    pending.flush(new Blob(['late'], { type: 'image/jpeg' }));
     tick(5_001);
     expect(revokedUrls).toEqual([]);
     service.releasePhoto(photo);
@@ -356,7 +398,7 @@ describe('UserPhotoService', () => {
   it('cancels scheduled revocation if a view retains the URL during the grace period', fakeAsync(() => {
     let photo!: SafeUrl;
     service.getPhoto('abc123', 48).subscribe(url => photo = url!);
-    httpMock.expectOne(URL_GET_USER_PHOTO + 'abc123?size=48').flush(new Blob(['x']));
+    httpMock.expectOne(URL_GET_USER_PHOTO + 'abc123?size=48').flush(new Blob(['x'], { type: 'image/jpeg' }));
     overflowCache();
     tick(4_000);
     service.retainPhoto(photo);
@@ -372,7 +414,7 @@ describe('UserPhotoService', () => {
     const pending = httpMock.expectOne(URL_GET_USER_PHOTO + 'abc123?size=48');
     subscription.unsubscribe();
     overflowCache();
-    pending.flush(new Blob(['late']));
+    pending.flush(new Blob(['late'], { type: 'image/jpeg' }));
     expect(revokedUrls).toEqual([]);
     tick(5_001);
     expect(revokedUrls).toEqual([createdUrls[0]]);
@@ -386,9 +428,9 @@ describe('UserPhotoService', () => {
     });
     const pending = httpMock.expectOne(URL_GET_USER_PHOTO + 'abc123?size=48');
     service.invalidate('abc123');
-    pending.flush(new Blob(['old']));
+    pending.flush(new Blob(['old'], { type: 'image/jpeg' }));
     service.getPhoto('abc123', 48).subscribe();
-    httpMock.expectOne(URL_GET_USER_PHOTO + 'abc123?size=48').flush(new Blob(['new']));
+    httpMock.expectOne(URL_GET_USER_PHOTO + 'abc123?size=48').flush(new Blob(['new'], { type: 'image/jpeg' }));
     tick(5_001);
     expect(revokedUrls).toEqual([]);
     service.releasePhoto(photo);
@@ -398,7 +440,7 @@ describe('UserPhotoService', () => {
 
   it('cleans up retired URLs and cancels pending requests on destroy', fakeAsync(() => {
     service.getPhoto('abc123', 48).subscribe();
-    httpMock.expectOne(URL_GET_USER_PHOTO + 'abc123?size=48').flush(new Blob(['x']));
+    httpMock.expectOne(URL_GET_USER_PHOTO + 'abc123?size=48').flush(new Blob(['x'], { type: 'image/jpeg' }));
     service.invalidate('abc123');
     service.getPhoto('pending1', 48).subscribe();
     const pending = httpMock.expectOne(URL_GET_USER_PHOTO + 'pending1?size=48');
@@ -417,7 +459,7 @@ describe('UserPhotoService', () => {
     service.invalidate('abc123');
     let replacement: SafeUrl | null = null;
     service.getPhoto('abc123', 48).subscribe(url => replacement = url);
-    httpMock.expectOne(URL_GET_USER_PHOTO + 'abc123?size=48').flush(new Blob(['new']));
+    httpMock.expectOne(URL_GET_USER_PHOTO + 'abc123?size=48').flush(new Blob(['new'], { type: 'image/jpeg' }));
     tick(30_001);
     service.getPhoto('abc123', 48).subscribe(url => expect(url).toBe(replacement));
     httpMock.expectNone(URL_GET_USER_PHOTO + 'abc123?size=48');
@@ -427,7 +469,7 @@ describe('UserPhotoService', () => {
     const photo$ = service.getPhoto('deferred1', 48);
     overflowCache();
     photo$.subscribe();
-    httpMock.expectOne(URL_GET_USER_PHOTO + 'deferred1?size=48').flush(new Blob(['late']));
+    httpMock.expectOne(URL_GET_USER_PHOTO + 'deferred1?size=48').flush(new Blob(['late'], { type: 'image/jpeg' }));
     service.ngOnDestroy();
     expect(revokedUrls).toEqual([createdUrls[0]]);
     tick(5_001);
@@ -450,6 +492,6 @@ describe('UserPhotoService', () => {
       done();
     });
     const req = httpMock.expectOne(URL_GET_USER_PHOTO + 'abc123');
-    req.flush(new Blob(['boom']), { status: 503, statusText: 'Service Unavailable' });
+    req.flush(new Blob(['boom'], { type: 'image/jpeg' }), { status: 503, statusText: 'Service Unavailable' });
   });
 });
