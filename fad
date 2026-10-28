@@ -56,3 +56,18 @@ invalidate() 后排队任务仍会发送	事实正确，但不一定是无用请
 3. 无照片不允许点击：当前合理。
 当前唯一绑定 avatarClick 的位置是 Profile，用于打开照片弹窗；未发现用于跳转员工详情的调用。因此无照片、加载中或加载失败时不提供按钮角色和键盘焦点，符合功能含义，也避免打开空弹窗。
 建议保留第 3 项现状；第 2 项做环境实测；第 1 项暂不采用截图中的简单删除方案。 本轮核对了代码与调用位置，未修改代码或运行测试。
+
+
+
+if (!fileInfo.Exists)
+{
+    // Only check the root when the individual photo is unavailable.
+    if (!Directory.Exists(_photoOptions.PhotoFolder))
+    {
+        throw Faults.Faults.CreatePhotoCouldNotAccess(
+            $"PhotoFolder {_photoOptions.PhotoFolder} could not be accessed");
+    }
+
+    // Root is accessible, but this employee's photo is unavailable.
+    return NoContent();
+}
