@@ -1,1 +1,1 @@
-Node24Transition 中只接受已经明确识别的“Angular 19 不支持当前 Node”兼容性警告作为已知偏差；命令非零、engine-strict 拒绝、原生模块错误和测试失败仍须停止，不使用 --force、关闭 engine-strict 或隐藏警告来伪装通过。若失败与运行时有关，优先取得与快照一致的企业 CI 基线或重新评估迁移流程，不能直接把失败标成可忽略。改用目标 CLI 20 也不能使尚未升级的 Framework/build-angular 19 自动获得 Node 24 官方支持。
+历史构建存在约 1.74 MB 初始包超过 1.50 MB warning、file-saver CommonJS、4 条 CSS 选择器 warning。使用本轮真实日志比较，不扩大预算或关闭检查掩盖回归。基线通过且快照可恢复后才进入 Phase 1。Node24Transition 的旧版基线即使通过，也必须标记 `officiallySupported=false`，不能拿它证明 Angular 19 与 Node 24 兼容；若采用匹配的 CI 基线，明确标记 CI 的源码/lock/运行时证据，不伪装成本地测试结果。前后运行时不同或旧版运行时不受支持时，不作严格的性能因果比较。
