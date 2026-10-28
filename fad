@@ -1,8 +1,14 @@
-先记录企业允许的实际 Node/npm。Node 22 被企业阻止时直接采用允许的现有 Node 24 路线，不要求安装 nvm/volta/fnm，也不自动修改系统 Node。只有未获企业允许、Node 版本不属于下列路线，或目标依赖确实不能安装时才阻断；不能仅因未安装 22 就停止所有工作。
+$upgradeNodeText = Invoke-UpgradeChecked 'node' @('-p', 'process.versions.node')
+$upgradeNodeVersion = [version]($upgradeNodeText | Select-Object -Last 1)
+if ($upgradeNodeVersion.Major -eq 22 -and $upgradeNodeVersion -ge [version]'22.12.0') {
+    $UpgradeRuntimeMode = 'SupportedBridge'
+} elseif ($upgradeNodeVersion.Major -eq 24) {
+    $UpgradeRuntimeMode = 'Node24Transition'
+    Write-Warning 'Angular 19 baseline on Node 24 is outside its official compatibility matrix. Preserve this deviation and all failures.'
+} else {
+    throw 'No documented runtime route: use an enterprise-approved Node 22 >=22.12 or Node 24, or a verified build environment.'
+}
+Write-Host "Runtime route: $UpgradeRuntimeMode; Node: $upgradeNodeVersion"
+```
 
-| 路线 | 适用条件 | 基线与验收规则 |
-| --- | --- | --- |
-| SupportedBridge | 已有允许使用的 Node 22.x，至少 22.12.0 | 19/20 共同兼容；升级前后基线按常规验证 |
-| Node24Transition | 仅有允许使用的 Node 24.x；本次选择以该运行时完成 19→20 迁移 | 旧版 19 的安装/CLI/构建运行处于已知兼容偏差，仅作诊断性基线；完整保留警告。20 的安装、测试和构建必须在支持的 Node 24 下通过 |
-
-本次文档更新不等于已经执行或授权执行应用升级；之后用户要求按 Node24Transition 路线实施时，记录该选择和兼容偏差即可，不为同一偏差在每个阶段重复索取确认。若任务要求全程都处于官方支持环境且没有匹配的 CI/构建环境，则该要求无法靠修改 Markdown 达成，应明确报告受阻。
+将 runtimeMode、Node/npm 精确版本、项目根目录、基线源码/lock 哈希、限制原因和基线结果写入本批次升级记录（建议 `.tmp/upgrade/<run-id>/runtime.json`），跨进程调用必须重新加载，不能只依赖内存变量。每次关键安装前与记录对照，不静默切换 Node。
