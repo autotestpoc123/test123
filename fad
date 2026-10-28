@@ -1,14 +1,1 @@
-$upgradeNodeText = Invoke-UpgradeChecked 'node' @('-p', 'process.versions.node')
-$upgradeNodeVersion = [version]($upgradeNodeText | Select-Object -Last 1)
-if ($upgradeNodeVersion.Major -eq 22 -and $upgradeNodeVersion -ge [version]'22.12.0') {
-    $UpgradeRuntimeMode = 'SupportedBridge'
-} elseif ($upgradeNodeVersion.Major -eq 24) {
-    $UpgradeRuntimeMode = 'Node24Transition'
-    Write-Warning 'Angular 19 baseline on Node 24 is outside its official compatibility matrix. Preserve this deviation and all failures.'
-} else {
-    throw 'No documented runtime route: use an enterprise-approved Node 22 >=22.12 or Node 24, or a verified build environment.'
-}
-Write-Host "Runtime route: $UpgradeRuntimeMode; Node: $upgradeNodeVersion"
-```
-
-将 runtimeMode、Node/npm 精确版本、项目根目录、基线源码/lock 哈希、限制原因和基线结果写入本批次升级记录（建议 `.tmp/upgrade/<run-id>/runtime.json`），跨进程调用必须重新加载，不能只依赖内存变量。每次关键安装前与记录对照，不静默切换 Node。
+Node24Transition 中只接受已经明确识别的“Angular 19 不支持当前 Node”兼容性警告作为已知偏差；命令非零、engine-strict 拒绝、原生模块错误和测试失败仍须停止，不使用 --force、关闭 engine-strict 或隐藏警告来伪装通过。若失败与运行时有关，优先取得与快照一致的企业 CI 基线或重新评估迁移流程，不能直接把失败标成可忽略。改用目标 CLI 20 也不能使尚未升级的 Framework/build-angular 19 自动获得 Node 24 官方支持。
