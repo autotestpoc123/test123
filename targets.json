@@ -1,0 +1,36 @@
+{
+  "framework": {
+    "version": "21.2.25",
+    "packages": [
+      "@angular/animations",
+      "@angular/common",
+      "@angular/compiler",
+      "@angular/core",
+      "@angular/forms",
+      "@angular/localize",
+      "@angular/platform-browser",
+      "@angular/platform-browser-dynamic",
+      "@angular/router",
+      "@angular/compiler-cli"
+    ]
+  },
+  "tooling": {
+    "version": "21.2.29",
+    "packages": ["@angular/cli", "@angular-devkit/build-angular"]
+  },
+  "components": {
+    "version": "21.2.14",
+    "packages": ["@angular/material", "@angular/cdk"]
+  },
+  "otherPackages": {
+    "typescript": "5.9.3",
+    "@ng-bootstrap/ng-bootstrap": "20.0.0",
+    "ngx-bootstrap": "21.2.2"
+  },
+  "migrationPackages": [
+    "@angular/cli",
+    "@angular/core",
+    "@angular/cdk",
+    "@angular/material"
+  ]
+}
