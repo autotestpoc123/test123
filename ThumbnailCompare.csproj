@@ -1,229 +1,148 @@
-# Angular 20 → 21 执行手册
+---
+name: angular21-minimal-upgrade
+description: 为 cod-fd-ui 评估或执行 Angular 20 到 21 的最小改动升级，协调依赖、运行官方迁移，保留 NgModule 和 Zone，并验证 OIDC、Typeahead、Popover、Org-tree 与照片缓存。仅要求方案或创建 skill 时不安装依赖、不执行应用升级。
+---
 
-仅在主 skill 的 Execute 模式使用。所有命令从项目根目录运行；逐段检查结果，不把整个 Markdown 当作无人值守脚本。默认日志目录 `.tmp/upgrade/angular21` 代表**一个批次**，已有其他批次时统一替换该路径。跨工具调用从 JSON/日志恢复阶段，不保留 PowerShell 会话假设。
+# cod-fd-ui：Angular 20 → 21 最小改动升级
 
-`scripts/run.cjs` 通过 Node 直接启动 npm/本地 CLI，记录原始输出、命令参数、起止时间和退出码。脚本失败会返回非零；PowerShell 代码块显式检查 `$LASTEXITCODE`。已运行命令只有 started 而无最终记录时视为中断/unknown，不视为成功。npm/ng 不包含 shell 包装、管道判断或 cmd /c 转义。
+## 范围与模式
 
-## Phase 0：基线
+基于本项目的 [Angular 20 skill](../angular20-minimal-upgrade/SKILL.md) 延续基线、失败停止、回归和回滚规则；本 skill 自包含，不要求先执行旧 skill。目标是升级后保持既有行为，不通过忽略 peers、关闭类型检查或删除测试减少改动。
 
-先完成主 skill 要求的快照及两份业务基线。保存实际文件内容，包含已暂存/未暂存/必要未跟踪内容，不只备份关键配置的哈希。记录 git status、HEAD、两类 diff 与文件清单。确保日志/快照目录由本项目使用，不跟随外部链接或写入凭据。
+- **Assess**：用户要求分析、审查、方案或生成 skill 时，只读取项目和版本元数据、更新升级文档并给出差距清单；不安装、不改应用源码、不运行 migration。基线测试只有用户要求或评估范围明确包含时才运行。
+- **Execute**：用户明确要求实施升级时执行 Phase 0–6。已有实施授权无需在每次安装前重新确认；若范围变化、必要信息缺失或确有权限阻断，说明具体原因。生产部署、发布、推送和发送外部消息不在本 skill 授权范围。
+- 创建新分支可隔离提交历史，但不能替代文件快照或包含未提交内容的工作副本。无需新建固定名字的 ui-upgrade 目录；不为工具禁止的外部路径反复重试或绕过限制。
 
-独立运行 Node/npm 记录及基线安装，每条失败都停止：
+## 冻结目标与环境
 
-```powershell
-node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 baseline-node node --version
-if ($LASTEXITCODE -ne 0) { throw 'Node check failed' }
-node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 baseline-npm npm --version
-if ($LASTEXITCODE -ne 0) { throw 'npm check failed' }
-node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 baseline-ci npm ci
-if ($LASTEXITCODE -ne 0) { throw 'Baseline npm ci failed' }
-node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 baseline-version ng version
-if ($LASTEXITCODE -ne 0) { throw 'Baseline version failed' }
-node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 baseline-tree npm ls --depth=0
-if ($LASTEXITCODE -ne 0) { throw 'Baseline dependency tree failed' }
-foreach ($config in @('tsconfig.app.json', 'tsconfig.spec.json')) {
-    $label = 'baseline-angular-' + ($config -replace '\.', '-')
-    node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 $label node skills/angular21-minimal-upgrade/scripts/read-config.cjs $config
-    if ($LASTEXITCODE -ne 0) { throw "Baseline Angular config failed: $config" }
-}
-```
+版本核实日期为 **2026-10-30**。唯一机器可读版本表是 [targets.json](targets.json)，命令必须从该文件生成，不自行使用 latest、next 或其他主版本。执行前核实这些精确版本在企业镜像中的 peers、engines、安全准入和可用性；不可用或需要新补丁时，先更新版本表并重新审查组合，不静默降级或越级。
 
-基线和最终重点测试使用相同 include 清单；如果源码已增加相关 spec，先纳入清单并记录。本项目原有测试必须继续包含在全量测试中。
+| 发布组 | 冻结组合及决策 |
+| --- | --- |
+| Framework / compiler-cli | 21.2.25；实际声明的 Framework 包保持相同精确版本 |
+| CLI / build-angular | 21.2.29；保留 application / karma builder |
+| Material / CDK | 21.2.14；默认同步迁移，两者版本相同 |
+| TypeScript | 5.9.3；Angular 21 的范围是 >=5.9、<6 |
+| ng-bootstrap | 20.0.0；该库 20 对应 Angular 21，不按主版本号与框架对齐 |
+| ngx-bootstrap | 21.2.2；其 peers 要求 Angular ^21.2.0，不能配 Angular 21.0 |
 
-```powershell
-$browser = $env:CHROME_BIN
-if (-not $browser -or -not (Test-Path -LiteralPath $browser)) {
-    $browser = @(
-        'C:\Program Files\Google\Chrome\Application\chrome.exe',
-        'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
-        'C:\Program Files\Microsoft\Edge\Application\msedge.exe'
-    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-}
-if (-not $browser) { throw 'Configure CHROME_BIN to an approved installed Chrome/Edge executable' }
-# This block sets CHROME_BIN anew; future tool calls must repeat browser discovery.
-$env:CHROME_BIN = $browser
-$focused = @('test', '--watch=false', '--browsers=ChromeHeadless', '--progress=false',
-    '--include=src/app/service/user-photo.service.spec.ts',
-    '--include=src/app/components/common/user-avatar/user-avatar.component.spec.ts',
-    '--include=src/app/components/user-view/user-view.component.spec.ts',
-    '--include=src/app/components/profile-view/profile-view.component.spec.ts')
-node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 baseline-focused ng @focused
-if ($LASTEXITCODE -ne 0) { throw 'Baseline focused tests failed' }
-node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 baseline-full ng test --watch=false --browsers=ChromeHeadless --progress=false
-if ($LASTEXITCODE -ne 0) { throw 'Baseline full tests failed' }
-node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 baseline-production ng build --configuration=production --progress=false
-if ($LASTEXITCODE -ne 0) { throw 'Baseline production build failed' }
-```
+当前 Material/CDK 20.2.14 的 peers 也允许 Angular 21，因此升级它们是本方案的配套选择，并非安装必然阻塞。若用户选择暂留，须先调整唯一版本表及 migration 清单，记录为兼容过渡并验证 Clipboard；不可命令用 20、验收却要求 21。
 
-真实通过后创建 `baseline.json`（不是先写 passed 再运行命令）。至少保存：root、branch/HEAD、snapshotPath、Node/npm 精确版本、manifest/lock SHA-256、源码清单/哈希、所有目标直接包的实际 `sourceVersions`、测试数量及对应日志、构建大小/警告、缺失配置。manifest/lock 的哈希使用 `Get-FileHash -Algorithm SHA256`；sourceVersions 从每个 `node_modules/<包名>/package.json` 读取，不能从声明范围推断。
+当前 Node 24.14.1 同时满足 Angular 20/21；不再沿用 19→20 的 Node24Transition 例外，也不要求安装被公司阻止的 Node 22。优先复用企业允许且仍维护的 Node 24.x 精确补丁和 npm，开发与 CI 对齐。官方兼容范围是 ^20.19.0、^22.12.0 或 ^24.0.0，但不为升级新装已 EOL 的 Node。运行时不受支持或企业拒绝时停止相关阶段，不使用 engine 绕过。
 
-初始 `migration-state.json` 至少包含阶段、源/目标版本、包级状态和逐迁移状态。先从 `run.cjs --targets` 读取清单，给每个 migration package 填入 baseline 的实际 from，状态设 pending；不得把文档中的示例版本当作已安装源版本。状态示意（字段内容由本次实际证据生成）：
+RxJS 7.8.2、zone.js 0.15.1、Bootstrap 5.3.8、Popper 2.11.8、OIDC 库 19.0.2 作为当前保留候选；执行前以实际 lock/树和目标 peers 再确认。OIDC 的宽 peers 不等于运行兼容已验收。Karma/Jasmine、concurrently、XLSX alias、现有 overrides 及其他依赖不顺手升级/卸载；不重新添加全局 esbuild 降级 override。若出现非目标直接依赖的锁定版本漂移，必须解释并尽量保留原锁定值。
 
-```text
-phase: baseline-passed
-packages:
-  @angular/cli: from=<actual baseline CLI>, to=<targets>, status=pending, migrations=[]
-  @angular/core: from=<actual baseline core>, to=<targets>, status=pending, migrations=[]
-  @angular/cdk: from=<actual baseline CDK>, to=<targets>, status=pending, migrations=[]
-  @angular/material: from=<actual baseline Material>, to=<targets>, status=pending, migrations=[]
-```
+Angular 21 当前处于 LTS，官方列明支持至 **2027-06**；未公布具体日时不编造截止日，实施时重新查询。IIS 继续静态托管，不要求在 IIS 节点安装 Node，不升级 .NET API、F5 或 NAS。
 
-文件使用 UTF-8；PowerShell 5.1 写 JSON 时使用 `[IO.File]::WriteAllText(..., ..., (New-Object Text.UTF8Encoding($false)))`，不要用默认 UTF-16 的重定向生成 package.json 或 JSON 状态。
+## 必须保持的项目行为
 
-## Phase 1：目标核实
+执行前重新读取适用 AGENTS.md、manifest/lock、angular.json、全部 tsconfig、main.ts、app.module.ts、相关业务源码和测试。下列约束来自当前项目，不代替读取：
 
-从唯一版本表生成精确查询，不改变企业 registry。执行结果由 Agent 分析 peers/optional peers 后，才把状态改为 targets-verified。
+1. 保留 NgModule、standalone:false、platformBrowserDynamic().bootstrapModule(AppModule)、装饰器 Input/Output 和 RxJS 用法。不进行 standalone、signals、Signal Forms、zoneless、OnPush 或 inject 全量改造。
+2. Angular 21 默认 zoneless；为保留 Zone 行为，根 AppModule.providers 必须有 `provideZoneChangeDetection()`，优先由官方 bootstrap-options-migration 添加。保留 zone.js 与 test 的 zone.js/testing；仅保留 polyfill 不等于配置了 Zone 变更检测。不要顺便打开事件合并或改变调度选项。
+3. 目标 ngx-bootstrap 的 TypeaheadModule 不再有 forRoot；根模块的 `TypeaheadModule.forRoot()` 改为 `TypeaheadModule`。TypeaheadConfig 已是 root provider，不凭空增加第二套配置或替换搜索组件。
+4. 保留 BrowserAnimationsModule、NgbModule/Nav/Highlight/Popover/Modal、ClipboardModule；弃用不等于 21 已移除。ng-bootstrap 新的组件入口是可选能力，不批量更换 imports。
+5. 保留 `provideHttpClient(withInterceptorsFromDi())` 及 AuthInterceptor → OidcAuthorizationInterceptor → CustomInterceptor 顺序，不改 Fetch backend、存储策略或鉴权配置。
+6. 不改照片 URL/尺寸、请求队列、并发、优先级、LRU、负缓存、MIME 校验、invalidate、retain/release、Object URL 释放时机；不混入后端 ETag/NAS 优化。以本次结构化业务基线为唯一验收值。
+7. 保留 strict、strictTemplates、预算、环境替换、IIS web.config、资源路径及全局脚本顺序。moduleResolution 已为 bundler、lib/target 已为 ES2022 时接受迁移无修改。
+8. 保留现有菜单 ID 与 aria-labelledby 关联、导出条件、group.MailGroup.Mail 跟踪选择和 Popover 上下文/关闭行为；不混入其他 code review 修复或格式化。
 
-```powershell
-$planText = node skills/angular21-minimal-upgrade/scripts/run.cjs --targets
-if ($LASTEXITCODE -ne 0) { throw 'Target plan failed' }
-$plan = $planText | ConvertFrom-Json
-foreach ($package in $plan.packages.PSObject.Properties) {
-    $spec = $package.Name + '@' + $package.Value
-    $label = 'target-' + ($package.Name -replace '[@/]', '-' -replace '^-', '')
-    node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 $label npm view $spec version peerDependencies peerDependenciesMeta engines deprecated ng-update --json
-    if ($LASTEXITCODE -ne 0) { throw "Target unavailable: $spec" }
-}
-```
+## Phase 0：完整基线与可恢复快照
 
-当前精确包的 migration 位置：CLI 由 @schematics/angular 的 migrations/migration-collection.json 提供；core 位于 schematics/migrations.json；CDK、Material 位于各自 schematics/migration.json。安装前可查询官方精确包/源文件，安装后必须读取对应发布包本地文件，筛选 from/to 范围并补齐逐 migration 状态。只有明确不适用或 optional 且不选择执行的项可以跳过，理由持久化。
+只在 Execute 模式进行。具体命令见 [执行手册 Phase 0](references/execution.md#phase-0基线)。每段命令均在项目根目录执行，重新读取磁盘状态；不依赖上一工具调用中的 PowerShell 函数、变量或环境变量。
 
-## Phase 2–3：协调安装与迁移
+- 核对当前分支/HEAD、staged/unstaged diff、必要 untracked 文件和变更归属。本仓库可能还有大量未提交业务修改，不能用仅含 HEAD 的 worktree 丢失真实基线，也不能 reset/clean 或全部代为提交。
+- 为本次执行选择独立日志目录。手册默认 `.tmp/upgrade/angular21`；若该目录已有不同批次记录，改用新目录并统一更新本次命令，不覆盖历史快照或凭目录存在推断阶段已完成。
+- 保存源码和配置的**实际副本**、manifest/lock、必要 untracked 源码、tracked/index diff、哈希、运行时与现有可部署产物。排除 node_modules/.git/无关凭据。验证可恢复；只有哈希和 diff 不能恢复未跟踪文件。原地操作时也要完成同样快照，避免并发编辑。
+- 生成 `baseline-photo.json`：每项含实际值、来源路径和证据，至少覆盖 Org-tree/Profile/弹窗尺寸与调用、PhotoWidth/URL、并发、LRU、负缓存/释放延迟、rootMargin、MIME、取消排队、优先级、inflight、retain/release、invalidate。不要照抄历史数值。
+- 记录 `baseline-ui.json`：启动/变更检测、HTTP providers 顺序、OIDC 配置路径、Popover 上下文与时序、Typeahead 用法、表格菜单 ID、列表 track 策略和所有构建配置/缺失文件。
+- 保存 lock 后先执行 npm ci，随后实际版本/树检查、重点测试、全量测试和 Production 构建。基线失败先定位，不用升级掩盖；若另行修复旧问题，记录差异并重新建立可恢复基线。
+- 基线通过后生成 `baseline.json` 与 `migration-state.json`，保存**安装前实际 sourceVersions**、源码/lock 哈希、Node/npm、测试/构建日志和阶段状态。历史通过数字不是本轮基线。
 
-主流程**不使用多包 ng update**。先确认 baseline.json、migration-state.json、快照和实际文件一致，所有目标 Framework/CLI/Material/CDK 源版本为 20.x；两个 Bootstrap 库及 TypeScript 的源版本按实际记录，不按框架版本猜测。
+已知 UAT 配置引用 environment.uat.ts 而文件缺失：执行时重新核实。用户此前接受记录缺失、稍后补验；不虚构环境文件或从 QA 复制业务地址。记录为 UAT pending，可继续其他验证，最终不能报告全部环境通过。
 
-准备脚本默认 dry-run，仅打印直接依赖变更；缺少直接声明、重复声明或额外 Angular 包会报错，先调整方案，不自行安装未知依赖。
+## Phase 1：核实精确依赖与迁移清单
 
-```powershell
-node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 prepare-preview node skills/angular21-minimal-upgrade/scripts/prepare-targets.cjs
-if ($LASTEXITCODE -ne 0) { throw 'Target preparation preview failed' }
-```
+按 [执行手册 Phase 1](references/execution.md#phase-1目标核实) 查询版本表内所有精确包的 version、peerDependencies、peerDependenciesMeta、engines、deprecated 和 ng-update。npm 继承企业已有 registry；不为缺包切换非批准镜像、关闭 TLS、修改安全策略、使用 --force/--legacy-peer-deps。
 
-审查 preview 和快照一致后，写入目标版本并安装。这里的“审查”是 Agent 工作步骤，不是重复向已授权用户索取安装确认。prepare 不改 lock；install 由 npm 生成 lock。安装前也应保存其日志和 sourceVersions，失败不允许继续。
+检查所有目标 peers 和可选 peers 的区别；不能因为 build-angular 声明可选 Jest/SSR peers 就把它们装入 SPA。新增直接 Angular 包未列入冻结表时先补充协调方案，不让脚本遗漏。
 
-```powershell
-node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 prepare-write node skills/angular21-minimal-upgrade/scripts/prepare-targets.cjs --write
-if ($LASTEXITCODE -ne 0) { throw 'Manifest preparation failed' }
-node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 target-install npm install
-if ($LASTEXITCODE -ne 0) { throw 'Target installation failed; inspect the partial state before continuing' }
-node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 target-version ng version
-if ($LASTEXITCODE -ne 0) { throw 'Target CLI version check failed' }
-node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 target-tree npm ls --depth=0
-if ($LASTEXITCODE -ne 0) { throw 'Target dependency tree failed' }
-```
+保存目标包发布版本内的迁移 collection，按 sourceVersions → targets 的范围建立 migration-state。已安装目标版本的 migration 文件优先于 main 分支网页。Material/CDK 的 collection 可能同时列出 22 迁移，**只执行此次 20→21 范围**。
 
-执行下一块前，按 Phase 5 的精确版本检查核对 targets。Agent 保存 `dependencies-installed` 状态，并读取本地 collection 把范围内每项列入 migration-state。core 的可选 router-current-navigation 不默认执行；control-flow 及 bootstrap-options 属于本次默认迁移。CLI 可选 application-builder 不必执行，因为应用已使用 application builder。
+## Phase 2–3：协调安装，再逐包运行官方迁移
 
-**每次只执行一个包。** 以下块从磁盘恢复 actual from/to；将 `$packageName` 依次设为 @angular/cli、@angular/core、@angular/cdk、@angular/material，执行后立即审查输出并持久化该包状态，才进行下一个。package 状态 completed 必须表示范围内所有必选迁移均已执行或明确不适用。
+本方案采用一次协调依赖解析，再执行官方 `migrate-only`，避免先升级 core 后被仍要求 Angular 20 的两个 Bootstrap 库阻塞。它替代“多包 ng update 失败后再猜测补救”，不是只改版本号跳过迁移。
 
-```powershell
-$packageName = '@angular/cli'
-$planText = node skills/angular21-minimal-upgrade/scripts/run.cjs --targets
-if ($LASTEXITCODE -ne 0) { throw 'Cannot load targets' }
-$plan = $planText | ConvertFrom-Json
-$baseline = Get-Content -LiteralPath '.tmp/upgrade/angular21/baseline.json' -Raw -Encoding UTF8 | ConvertFrom-Json
-$state = Get-Content -LiteralPath '.tmp/upgrade/angular21/migration-state.json' -Raw -Encoding UTF8 | ConvertFrom-Json
-$entry = $state.packages.PSObject.Properties[$packageName].Value
-$from = $baseline.sourceVersions.PSObject.Properties[$packageName].Value
-$to = $plan.packages.PSObject.Properties[$packageName].Value
-if (-not $entry -or -not $from -or -not $to) { throw 'Migration source/target/state missing' }
-if ($entry.status -ne 'pending' -or $entry.from -ne $from -or $entry.to -ne $to) {
-    throw 'Migration is not a fresh pending package; inspect saved state before retrying'
-}
-foreach ($prior in $plan.migrations) {
-    if ($prior.name -eq $packageName) { break }
-    if ($state.packages.PSObject.Properties[$prior.name].Value.status -ne 'completed') {
-        throw "Earlier migration package is not reviewed and completed: $($prior.name)"
-    }
-}
-$label = 'migrate-' + ($packageName -replace '[@/]', '-' -replace '^-', '')
-$stateFile = Join-Path (Get-Location) '.tmp/upgrade/angular21/migration-state.json'
-$encoding = New-Object Text.UTF8Encoding($false)
-$entry.status = 'running'
-$state.phase = 'migrating'
-[IO.File]::WriteAllText($stateFile, ($state | ConvertTo-Json -Depth 30), $encoding)
-# --allow-dirty is valid only after the documented snapshot and diff review.
-node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 $label ng update $packageName --migrate-only "--from=$from" "--to=$to" --allow-dirty
-$migrationExit = $LASTEXITCODE
-$entry.status = if ($migrationExit -eq 0) { 'review-required' } else { 'failed' }
-if ($migrationExit -ne 0) {
-    $state | Add-Member -NotePropertyName failedAt -NotePropertyValue $packageName -Force
-}
-[IO.File]::WriteAllText($stateFile, ($state | ConvertTo-Json -Depth 30), $encoding)
-if ($migrationExit -ne 0) { throw 'Migration failed; record completed items and stop' }
-```
+按 [执行手册 Phase 2–3](references/execution.md#phase-23协调安装与迁移)：
 
-命令前持久化 running，结束后记为 failed 或 review-required；中断留下 running 时必须先查日志和实际变更，不能直接重跑。completed 不自动设置：Agent 必须阅读日志、检查实际 diff 并记录每项，再将包标 completed，不能让一个退出码代表全部迁移完成。“成功且没有适用修改”也应保留输出；退出 0 但日志报告跳过/未找到 collection 时查明原因，不标已执行。
+1. 对照快照及 sourceVersions，dry-run `prepare-targets.cjs`，检查仅目标直接包变化；再一次更新全部目标声明，保留其他字段、依赖分区、scripts/overrides。
+2. 运行一次 npm install，npm 生成配套 lock。失败立即停止，保存日志和中间 diff；不删 lock、不继续 migration。
+3. 核对实际安装版本精确等于 targets、npm ls 无 invalid peers。仅安装完成时状态仍是 `dependencies-installed`，不是升级完成。
+4. 通过本地目标 CLI 按 CLI → core → CDK → Material 执行单包 migrate-only；每次都提供**基线实际 from 和冻结 to**，不加包版本后缀，不调用全局/未限定的最新 CLI。
+5. 每次结束立即保存该包的迁移名称、适用范围、日志、退出码和 diff。区分 `executed-changed`、`executed-no-change`、`not-applicable`、`optional-skipped`、`failed`、`unknown`；没有文件变化不代表没有执行。
 
-## 部分迁移失败后的恢复
+`run.cjs` 仅为 ng 子进程设置 NG_DISABLE_VERSION_CHECK，固定使用已安装 CLI，防止 migrate-only 临时下载另一个主版本；**不绕过** Node 支持检查、编译检查或 peer 校验。安装后先核实目标 CLI 再运行迁移。
 
-1. 保存失败命令、日志、当前 manifest/lock/源码 diff、实际版本和逐项状态。安装失败时先修复完整 peers/镜像/lock 问题，再做迁移；不先补装某个包制造更多中间状态。
-2. migration 失败但目标依赖已安装时，不再次 npm install、不重跑已完成的包，不把当前 21 版本作为原始 from。
-3. 从日志与源码确认成功项；不能确认的标 unknown，恢复干净快照重新受控执行，或核实具体转换结果后再决定补跑。不能凭“看起来没改文件”判断未执行。
-4. 确认某个缺失项可单独补跑后，沿用上一命令块读取的基线 from/冻结 to，给同一包的 migrate-only 加 `--name=<本地 collection 中的确切名称>`；每项独立记录。例如 core 的 bootstrap-options-migration，不能把 collection 路径猜成 migration 名称。
-5. --name 的命令也通过 run.cjs、本地目标 CLI、明确 --from/--to 和受控 --allow-dirty 运行。不要盲跑所有脚本或用 --force/legacy-peer-deps。修复底层问题后只重新验证受影响阶段。
+阶段沿 `baseline-passed → targets-verified → manifest-prepared → dependencies-installed → migrating → migrations-complete → local-verified → acceptance-passed/pending` 推进。包级状态依次为 pending、running、review-required、completed，异常为 failed/unknown；逐项迁移使用上文的执行结果状态。失败记录 failedAt 并停在最近成功阶段；Agent 重启后读取状态和日志，而非把上次口头总结当作已执行证明。
 
-## Phase 5：最终验证
+部分迁移失败时按 [恢复手册](references/execution.md#部分迁移失败后的恢复) 确认实际树和已执行项，必要时使用 --name 补跑明确缺失的单项。不要重跑整个包掩盖未知状态，也不要在安装已是 21 后把 from 错写成 21。--allow-dirty 只允许经过快照和 diff 审查的当前目录，并非 peer 绕过；不允许借此混入并发业务修改。
 
-在 Phase 4 修复稳定、所有迁移状态明确后执行：
+## Phase 4：只修复本次兼容问题
 
-```powershell
-node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 final-ci npm ci
-if ($LASTEXITCODE -ne 0) { throw 'Final clean install failed' }
-node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 final-version ng version
-if ($LASTEXITCODE -ne 0) { throw 'Final ng version failed' }
-node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 final-tree npm ls --depth=0
-if ($LASTEXITCODE -ne 0) { throw 'Final tree failed' }
-$planText = node skills/angular21-minimal-upgrade/scripts/run.cjs --targets
-if ($LASTEXITCODE -ne 0) { throw 'Cannot load targets' }
-$plan = $planText | ConvertFrom-Json
-$manifest = Get-Content -LiteralPath 'package.json' -Raw -Encoding UTF8 | ConvertFrom-Json
-foreach ($package in $plan.packages.PSObject.Properties) {
-    $file = Join-Path 'node_modules' ($package.Name + '/package.json')
-    $actual = (Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json).version
-    if ($actual -ne $package.Value) { throw "Version mismatch: $($package.Name), actual=$actual, target=$($package.Value)" }
-    $declared = @(@($manifest.dependencies.PSObject.Properties[$package.Name].Value,
-        $manifest.devDependencies.PSObject.Properties[$package.Name].Value) | Where-Object { $_ })
-    if ($declared.Count -ne 1 -or $declared[0] -ne $package.Value) {
-        throw "Direct declaration must use the exact target: $($package.Name)"
-    }
-}
-node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 final-app-tsconfig node node_modules/typescript/bin/tsc -p tsconfig.app.json --showConfig
-if ($LASTEXITCODE -ne 0) { throw 'App tsconfig resolution failed' }
-node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 final-spec-tsconfig node node_modules/typescript/bin/tsc -p tsconfig.spec.json --showConfig
-if ($LASTEXITCODE -ne 0) { throw 'Spec tsconfig resolution failed' }
-foreach ($config in @('tsconfig.app.json', 'tsconfig.spec.json')) {
-    $label = 'final-angular-' + ($config -replace '\.', '-')
-    node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 $label node skills/angular21-minimal-upgrade/scripts/read-config.cjs $config
-    if ($LASTEXITCODE -ne 0) { throw "Angular config failed: $config" }
-}
-```
+### 21 迁移的预期影响
 
-上面的 read-config.cjs 用 Angular compiler-cli 的 readConfiguration 检查 extends 后的 angularCompilerOptions（strictTemplates 等），与基线比较；tsc --showConfig 不能证明 Angular 模板选项的最终生效值。未显式设置的 typeCheckHostBindings 会被 JSON 省略，不能据此推断为 false，应按目标 Angular 默认值解释。检查两个 build/test target 的 Zone polyfills、AppModule 的 provider、HTTP 顺序，以及 baseline-photo/ui 的实际业务值。
+| 检查点 | 本项目处理 |
+| --- | --- |
+| bootstrap-options-migration | 检查根模块确有 provideZoneChangeDetection()，不重复添加、不改 zoneless |
+| control-flow-migration | 默认执行官方更新集合中的该项，审查剩余 *ngIf/*ngFor 转换，允许必要模板改动 |
+| router-last-successful-navigation | 重新搜索用法；命中才核对 signal 调用转换 |
+| application-config-core | 只有从 platform-browser 导入 ApplicationConfig 才需要改到 core |
+| SSR BootstrapContext | 当前纯浏览器 SPA 不适用；不新增 SSR 文件 |
+| CLI tsconfig / Karma | 当前 bundler、ES2022、默认 Karma 配置可能无变更，仍保留执行证据 |
+| Typeahead 初始化 | 手工确认 forRoot() 已移除；核查 ngx-bootstrap 类型/行为变化 |
 
-重新执行 Phase 0 的整个浏览器发现及测试块，将三个 label 改为 final-focused、final-full、final-production。Production 构建应放在其他环境构建之后，避免被覆盖；因此可以先完成下面的环境检查，再执行该测试/Production 块。不要依赖旧会话的 CHROME_BIN。
+旧 NgIf/NgFor 在 21 尚可用，不能说“未转换就不能运行”；但冻结 core 的默认更新集合包含控制流迁移，因此正常接受它产生的差异。当前 UserTable、GroupTable、NavigationBar、Notification、Profile 仍有此类模板。核对事件、别名、条件/循环、DOM、导出门槛及 track 身份不变，不随意引入 `$index` 或重新过滤数据。
 
-```powershell
-$workspace = Get-Content -LiteralPath 'angular.json' -Raw -Encoding UTF8 | ConvertFrom-Json
-$build = $workspace.projects.'cod-fd-ui'.architect.build
-foreach ($name in @('local', 'development', 'qa', 'uat')) {
-    $configuration = $build.configurations.PSObject.Properties[$name].Value
-    if (-not $configuration) { throw "Build configuration missing: $name" }
-    $missing = @($configuration.fileReplacements | Where-Object {
-        -not (Test-Path -LiteralPath $_.with)
-    })
-    if ($missing.Count -gt 0) {
-        # Only this previously accepted UAT omission is deferred; other failures stop.
-        if ($name -eq 'uat' -and $missing.Count -eq 1 -and
-            $missing[0].with -eq 'src/environments/environment.uat.ts') {
-            Write-Warning 'UAT pending: approved environment.uat.ts is missing; record this in the report'
-            continue
-        }
-        throw "Missing replacement file for $name"
-    }
-    node skills/angular21-minimal-upgrade/scripts/run.cjs .tmp/upgrade/angular21 "final-build-$name" ng build "--configuration=$name" --progress=false
-    if ($LASTEXITCODE -ne 0) { throw "Build failed: $name" }
-}
-```
+检查 TS 5.9 的实际类型错误、模板和 host binding 类型检查、路由 microtask 时序、TestBed 错误传播与 PlatformLocation。只改命中的调用或断言；不能用 any、关 strict/typeCheckHostBindings、全局 rethrowApplicationErrors:false、随意增大 tick/setTimeout、删除用例解决。测试的 Zone 配置应反映应用选择；仅在实际需要处调整，不批量给所有 spec 注入新 provider。
 
-最后执行 git diff --check，区分历史 diff 的既有问题与本次新增问题；未跟踪新增文件另外检查，git diff 不包含它们。保存最终树、migration 状态、测试日志、Production 构建日志/产物路径/哈希和业务断言结果。QA/UAT 编译不等于访问或部署线上，环境验收按主 skill Phase 6 单独记录。
+不得把可选 Router.currentNavigation signal 改造、standalone、Signal Forms、动画替换、测试 runner 替换、Bootstrap 组件入口整理作为升级必须项。
+
+## Phase 5：最终可复现验证
+
+按 [执行手册 Phase 5](references/execution.md#phase-5最终验证) 在相同 Node/npm 下干净 npm ci，核对所有精确目标与树、最终 tsconfig 生效值，然后完成重点测试、完整测试和 local/development/qa/uat/production 配置检查。缺失配置按已记录范围标 pending，不能默默删配置或绕过构建错误。
+
+Production 最后构建，避免共享 outputPath 被其他配置覆盖；记录产物配置、目录及 SHA-256。对比同批次基线的实际用例数、警告和体积，保留预算；最终改动后必须有对应有效结果。不用历史 110/110 或旧构建日志代替本次结果，不借本次升级强塞新 lint 工具。
+
+对照 baseline-photo.json / baseline-ui.json 逐项确认，业务源码未改时也要验证行为；哈希不同的必要模板迁移不能被误判为业务参数变化。结构化断言比较实际值和语义，不只做整文件哈希相等检查。
+
+## Phase 6：授权验证环境验收
+
+| 路径 | 验收内容 |
+| --- | --- |
+| OIDC | 登录、回调、刷新 token、退出、401/403、存储及三拦截器顺序 |
+| Typeahead | 异步搜索、人/组结果、无结果、键盘高亮/选择、点击跳转、快速输入和失焦 |
+| Popover / Modal / Nav | 开关、悬停进入浮层、延时关闭、链接点击上下文、焦点/背景层及 Clipboard |
+| 表格 / 列表 | 同页多个表格菜单 ID/ARIA 唯一、导出条件、同名组与既有 track 策略 |
+| Org-tree / Profile | 展开、快速滚动、折叠重开、切换员工、首屏及异步照片刷新、弹窗复用 |
+| 照片生命周期 | 请求尺寸/次数/并发等于唯一基线；MIME、负缓存、取消、优先级、inflight、retain/release/invalidate 正确 |
+| IIS / 网络 | 深链接刷新、静态资源/分块加载及缓存；沿浏览器→前端 F5/IIS→后端 F5→API→NAS 检查请求失败与排队 |
+
+账号、环境或发布权限缺失时记录 pending 和原因，继续不依赖这些条件的验证；不能凭 build 成功声明鉴权或生产可用。框架升级不保证 Org-tree 提速，性能比较须保持数据、网络和冷热缓存条件一致。
+
+## 自审查、报告与回滚
+
+最终按文件解释 dependency/lock、官方迁移、手工兼容修复与工具链差异，核对未混入后端、照片调参、菜单重构或格式化噪声。完整报告写入本批次日志目录，不把历史执行结果粘进本 skill。
+
+只有精确依赖/peers、迁移记录、干净安装、最终完整测试/构建和所需环境验收均通过，才能报告“完成并通过回归”。UAT 或功能待验时报告“本地升级验证通过，仍有待验项”，列出缺口，不声称全部完成。
+
+回滚使用本批次快照的实际源码、manifest/lock 和对应工具链；先确认回滚目标与已保存工作内容，不在混合目录执行 reset --hard/clean。生产回滚是另行授权的动作，恢复完整同版本 index.html、hash chunks、必要资源和原缓存规则，不能只回滚 index.html，也不清理其他应用缓存。
+
+## 维护与依据
+
+修订后校验 frontmatter、相对链接、版本表、脚本/命令语法、失败退出和跨进程恢复。脚本验证不能替代企业镜像安装、migration 或应用验收；自审查记录保存在本次交付目录。
+
+- [Angular 兼容矩阵](https://angular.dev/reference/versions)；[支持期限](https://angular.dev/reference/releases)。
+- [21 分支更新建议](https://github.com/angular/angular/blob/21.2.x/adev/src/app/features/update/recommendations.ts)；[core migration 集合](https://github.com/angular/angular/blob/21.2.x/packages/core/schematics/migrations.json)；[CLI migration 集合](https://github.com/angular/angular-cli/blob/21.2.x/packages/schematics/angular/migrations/migration-collection.json)。实施以安装的精确发布包为准，不照搬 main/22 文档。
+- [CLI update 参数](https://angular.dev/cli/update)；[Zone 与 zoneless](https://angular.dev/guide/zoneless)。
+- [ng-bootstrap 兼容表](https://github.com/ng-bootstrap/ng-bootstrap#dependencies)；[ng-bootstrap 20 变更](https://github.com/ng-bootstrap/ng-bootstrap/blob/20.0.0/CHANGELOG.md)。
+- 精确注册表元数据：[core](https://registry.npmjs.org/@angular%2fcore/21.2.25)、[CLI](https://registry.npmjs.org/@angular%2fcli/21.2.29)、[Material](https://registry.npmjs.org/@angular%2fmaterial/21.2.14)、[ngx-bootstrap](https://registry.npmjs.org/ngx-bootstrap/21.2.2)、[OIDC 保留候选](https://registry.npmjs.org/angular-auth-oidc-client/19.0.2)。
