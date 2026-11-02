@@ -1,0 +1,229 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="Photo API capacity sample" enabled="true">
+      <stringProp name="TestPlan.comments">Protocol-level capacity sample. Configure properties, real photo IDs and JMETER_API_TOKEN before running. No browser cache simulation.</stringProp>
+      <boolProp name="TestPlan.functional_mode">false</boolProp>
+      <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="Variables" enabled="true">
+        <collectionProp name="Arguments.arguments"/>
+      </elementProp>
+    </TestPlan>
+    <hashTree>
+      <SetupThreadGroup guiclass="SetupThreadGroupGui" testclass="SetupThreadGroup" testname="Validate configuration before HTTP traffic" enabled="true">
+        <stringProp name="ThreadGroup.on_sample_error">stoptestnow</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="Once" enabled="true">
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+          <intProp name="LoopController.loops">1</intProp>
+        </elementProp>
+        <stringProp name="ThreadGroup.num_threads">1</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">0</stringProp>
+        <boolProp name="ThreadGroup.scheduler">false</boolProp>
+      </SetupThreadGroup>
+      <hashTree>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="CONFIG validation (not a capacity sample)" enabled="true">
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="parameters"/>
+          <stringProp name="filename"/>
+          <stringProp name="cacheKey">photo-capacity-config-v1</stringProp>
+          <stringProp name="script"><![CDATA[
+def host = props.getProperty('host', 'replace-me.invalid').trim()
+if (!host || host.contains('://') || host.contains('/') || host.endsWith('.invalid') || host.endsWith('.example')) {
+    throw new IllegalArgumentException('Set host to the approved test entry domain, without scheme or path')
+}
+if (!(props.getProperty('protocol', 'https') in ['http', 'https'])) {
+    throw new IllegalArgumentException('protocol must be http or https')
+}
+def token = System.getenv('JMETER_API_TOKEN')?.trim()
+if (!token || token.toLowerCase(java.util.Locale.ROOT).startsWith('bearer ')) {
+    throw new IllegalArgumentException('Set JMETER_API_TOKEN to the test access token only, without Bearer prefix')
+}
+def workers = props.getProperty('workers', '1').toInteger()
+def duration = props.getProperty('duration_seconds', '30').toInteger()
+def loops = props.getProperty('loops', '-1').toInteger()
+if (workers < 1 || duration < 1 || loops == 0 || loops < -1) {
+    throw new IllegalArgumentException('workers/duration must be positive; loops must be -1 or positive')
+}
+for (def key in ['ramp_seconds', 'photo_think_ms', 'api_probe_workers', 'api_probe_interval_ms']) {
+    if (props.getProperty(key, '0').toInteger() < 0) throw new IllegalArgumentException(key + ' must not be negative')
+}
+def prefix = props.getProperty('photo_path_prefix', '/api/v1.0/photos/')
+if (!prefix.startsWith('/') || !prefix.endsWith('/')) throw new IllegalArgumentException('photo_path_prefix must start and end with /')
+def filename = props.getProperty('data_file', '')
+def file = new File(filename)
+if (!file.isAbsolute() || !file.isFile()) throw new IllegalArgumentException('data_file must be an existing absolute CSV path')
+def widths = props.getProperty('allowed_widths', '48,512').split(',').collect { it.trim() }
+int lineNumber = 0
+int rows = 0
+file.withReader('UTF-8') { reader ->
+    reader.eachLine { line ->
+        lineNumber++
+        if (lineNumber == 1) {
+            if (line.replace('\uFEFF', '').trim() != 'msid,size') throw new IllegalArgumentException('CSV header must be msid,size')
+        } else {
+            def columns = line.split(',', -1)
+            if (columns.length != 2 || !(columns[0] ==~ /[A-Za-z0-9]{2,20}/) || !(columns[1] in widths)) {
+                throw new IllegalArgumentException('Invalid CSV row at line ' + lineNumber + '; use unquoted msid,size values')
+            }
+            rows++
+        }
+    }
+}
+if (rows == 0) throw new IllegalArgumentException('CSV must contain at least one known employee with a photo')
+log.info('Photo capacity configuration validated: workers={}, rows={}', workers, rows)
+// Ignore only a successful setup sample. Failed validation remains visible and stops the test.
+SampleResult.setIgnore()
+]]></stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+      </hashTree>
+      <ConfigTestElement guiclass="HttpDefaultsGui" testclass="ConfigTestElement" testname="Actual F5 entry point and timeouts" enabled="true">
+        <elementProp name="HTTPsampler.Arguments" elementType="Arguments"><collectionProp name="Arguments.arguments"/></elementProp>
+        <stringProp name="HTTPSampler.domain">${__P(host,replace-me.invalid)}</stringProp>
+        <stringProp name="HTTPSampler.port">${__P(port,443)}</stringProp>
+        <stringProp name="HTTPSampler.protocol">${__P(protocol,https)}</stringProp>
+        <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
+        <stringProp name="HTTPSampler.connect_timeout">${__P(connect_timeout_ms,5000)}</stringProp>
+        <stringProp name="HTTPSampler.response_timeout">${__P(response_timeout_ms,30000)}</stringProp>
+      </ConfigTestElement>
+      <hashTree/>
+      <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="Bearer token from process environment" enabled="true">
+        <collectionProp name="HeaderManager.headers">
+          <elementProp name="Authorization" elementType="Header">
+            <stringProp name="Header.name">Authorization</stringProp>
+            <stringProp name="Header.value">${__groovy('Bearer ' + System.getenv('JMETER_API_TOKEN'))}</stringProp>
+          </elementProp>
+        </collectionProp>
+      </HeaderManager>
+      <hashTree/>
+      <CookieManager guiclass="CookiePanel" testclass="CookieManager" testname="Per-thread cookies; observe actual F5 persistence" enabled="true">
+        <collectionProp name="CookieManager.cookies"/>
+        <boolProp name="CookieManager.clearEachIteration">false</boolProp>
+      </CookieManager>
+      <hashTree/>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Photo HTTP workers (not browser user count)" enabled="true">
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="Photo loops" enabled="true">
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+          <stringProp name="LoopController.loops">${__P(loops,-1)}</stringProp>
+        </elementProp>
+        <stringProp name="ThreadGroup.num_threads">${__P(workers,1)}</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">${__P(ramp_seconds,1)}</stringProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+        <stringProp name="ThreadGroup.duration">${__P(duration_seconds,30)}</stringProp>
+        <stringProp name="ThreadGroup.delay">0</stringProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+      </ThreadGroup>
+      <hashTree>
+        <CSVDataSet guiclass="TestBeanGUI" testclass="CSVDataSet" testname="Known photo IDs and requested sizes" enabled="true">
+          <stringProp name="filename">${__P(data_file,)}</stringProp>
+          <stringProp name="fileEncoding">UTF-8</stringProp>
+          <stringProp name="variableNames">msid,size</stringProp>
+          <boolProp name="ignoreFirstLine">true</boolProp>
+          <stringProp name="delimiter">,</stringProp>
+          <boolProp name="quotedData">false</boolProp>
+          <stringProp name="recycle">${__P(recycle,true)}</stringProp>
+          <boolProp name="stopThread">true</boolProp>
+          <stringProp name="shareMode">shareMode.all</stringProp>
+        </CSVDataSet>
+        <hashTree/>
+        <ConstantTimer guiclass="ConstantTimerGui" testclass="ConstantTimer" testname="Think time per photo iteration" enabled="true">
+          <stringProp name="ConstantTimer.delay">${__P(photo_think_ms,1000)}</stringProp>
+        </ConstantTimer>
+        <hashTree/>
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="PHOTO ${size}px" enabled="true">
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="size" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">true</boolProp>
+                <stringProp name="Argument.name">size</stringProp>
+                <stringProp name="Argument.value">${size}</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+                <boolProp name="HTTPArgument.use_equals">true</boolProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+          <stringProp name="HTTPSampler.path">${__P(photo_path_prefix,/api/v1.0/photos/)}${msid}</stringProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">false</boolProp>
+          <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.image_parser">false</boolProp>
+          <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="Photo accepts JPEG" enabled="true">
+            <collectionProp name="HeaderManager.headers"><elementProp name="Accept" elementType="Header"><stringProp name="Header.name">Accept</stringProp><stringProp name="Header.value">image/jpeg</stringProp></elementProp></collectionProp>
+          </HeaderManager>
+          <hashTree/>
+          <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="Require 200 JPEG; reject empty/auth/HTML responses" enabled="true">
+            <stringProp name="scriptLanguage">groovy</stringProp>
+            <stringProp name="parameters"/>
+            <stringProp name="filename"/>
+            <stringProp name="cacheKey">photo-capacity-jpeg-v1</stringProp>
+            <stringProp name="script"><![CDATA[
+def code = SampleResult.getResponseCode()
+if (code in ['401', '403']) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage('Authentication/authorization failed; stop and validate test token/permissions')
+    SampleResult.setStopTest(true)
+    return
+}
+def contentType = (SampleResult.getContentType() ?: '').split(';')[0].trim().toLowerCase(java.util.Locale.ROOT)
+def body = SampleResult.getResponseData()
+if (code != '200' || contentType != 'image/jpeg' || body == null || body.length < 3 ||
+    (body[0] & 0xff) != 0xff || (body[1] & 0xff) != 0xd8 || (body[2] & 0xff) != 0xff) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage('Expected existing photo: HTTP 200, image/jpeg and JPEG signature; actual code=' + code + ', type=' + contentType)
+}
+]]></stringProp>
+          </JSR223Assertion>
+          <hashTree/>
+        </hashTree>
+      </hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Optional low-rate ordinary API probe" enabled="true">
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="Probe loops" enabled="true"><boolProp name="LoopController.continue_forever">false</boolProp><intProp name="LoopController.loops">-1</intProp></elementProp>
+        <stringProp name="ThreadGroup.num_threads">${__P(api_probe_workers,0)}</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">0</stringProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+        <stringProp name="ThreadGroup.duration">${__P(duration_seconds,30)}</stringProp>
+        <stringProp name="ThreadGroup.delay">0</stringProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+      </ThreadGroup>
+      <hashTree>
+        <ConstantTimer guiclass="ConstantTimerGui" testclass="ConstantTimer" testname="Low-rate probe interval" enabled="true"><stringProp name="ConstantTimer.delay">${__P(api_probe_interval_ms,5000)}</stringProp></ConstantTimer>
+        <hashTree/>
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="API-PROBE" enabled="true">
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments"><collectionProp name="Arguments.arguments"/></elementProp>
+          <stringProp name="HTTPSampler.path">${__P(api_probe_path,/api/v1.0/version/)}</stringProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">false</boolProp>
+          <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="API accepts JSON" enabled="true"><collectionProp name="HeaderManager.headers"><elementProp name="Accept" elementType="Header"><stringProp name="Header.name">Accept</stringProp><stringProp name="Header.value">application/json</stringProp></elementProp></collectionProp></HeaderManager>
+          <hashTree/>
+          <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="API probe must be a real 200 API response" enabled="true">
+            <stringProp name="scriptLanguage">groovy</stringProp>
+            <stringProp name="parameters"/>
+            <stringProp name="filename"/>
+            <stringProp name="cacheKey">photo-capacity-probe-v1</stringProp>
+            <stringProp name="script"><![CDATA[
+def code = SampleResult.getResponseCode()
+if (code in ['401', '403']) SampleResult.setStopTest(true)
+def type = (SampleResult.getContentType() ?: '').toLowerCase(java.util.Locale.ROOT)
+if (code != '200' || type.contains('text/html') || SampleResult.getResponseData().length == 0) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage('Expected nonempty HTTP 200 API response, not authentication HTML; actual code=' + code)
+}
+]]></stringProp>
+          </JSR223Assertion>
+          <hashTree/>
+        </hashTree>
+      </hashTree>
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>
