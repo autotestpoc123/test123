@@ -101,6 +101,8 @@ foreach ($dir in $runtimeDirs) {
 
 ## 4. 构建、验证与发布包
 
+2026-11-03 新增统一发布流程：[一次 publish，组装 QA/UAT/PROD 三份交付包](deploy/RELEASE_PACKAGING.md)。多环境正式交付使用该流程，第 4 节下方命令保留用于解释单次 publish 与构建前置；不要为 QA/UAT/PROD 各自重新执行 publish。
+
 在完整源码构建环境执行，不在 UAT 服务器安装 SDK 来现场编译。当前项目通过 `ProjectReference` 引用 API；必须携带真实 API 依赖。
 
 ```powershell
@@ -214,7 +216,9 @@ catch {
 
 ## 7. 注册计划任务（使用真实 systemid）
 
-优先使用 Task Scheduler GUI，避免把密码写成命令字符串。普通域账号操作步骤：
+按用户确认，使用 [PowerShell 部署脚本与操作说明](deploy/README.md) 注册计划任务：`deploy/Deploy-PhotoImportScheduledTask.ps1` 配合 `deploy/Start-PhotoImport.ps1`。该启动脚本通过参数接收发布目录等路径，代替第 6 节的固定路径示例。默认仅按需运行，验收后用 `-EnableSchedule` 添加每日调度，密码通过凭据提示输入。
+
+以下 GUI 步骤保留供核对任务属性和故障排查；采用脚本后不需要再手工创建第二个任务：
 
 1. 管理员打开 `taskschd.msc`，创建专用任务文件夹 `FwdPhotoImport`，选择“创建任务”，名称 `PhotoImport-UAT`。
 2. “常规”：用户选择实际 `DOMAIN\systemid`；选择“无论用户是否登录都要运行”；不勾“不存储密码”；默认不勾“使用最高权限”。按 UAT OS 选择兼容版本。

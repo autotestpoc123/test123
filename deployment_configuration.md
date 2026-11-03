@@ -1,6 +1,6 @@
 # 部署配置与内网路径保护
 
-## 仓库只保存安全默认值
+## 基础配置保存安全默认值
 
 appsettings.json 保持受版本控制，并随程序复制到运行目录。文件不包含实际 NAS 地址或环境专用文件名；PhotoFolder、PhotoZipPath、UsersZipPath、UsersDsmlName、XmlPhotoPath、QuarantineDir 留空。DryRun=true、Force=false。
 
@@ -10,9 +10,11 @@ appsettings.json 保持受版本控制，并随程序复制到运行目录。文
 
 UsersZipPath 必填；UsersDsmlName 必须匹配 ZIP 内的 DSML 条目名称，不能留空。照片源至少启用一个；XML-only 模式保持 PhotoZipPath 为空。
 
-## 推荐：同一发布包搭配外部 QA / PROD 配置
+## 同一程序产物搭配 QA / UAT / PROD 配置
 
-构建一次，将 QA 验证通过的完整发布包部署到 PROD；不要只复制 EXE 而遗漏依赖。发布包始终包含安全默认 appsettings.json，真实环境配置放在仓库和发布目录之外的受控目录。
+当前采用 [一次 publish，再组装 QA/UAT/PROD 三份交付包](deploy/RELEASE_PACKAGING.md)：公共程序产物始终只包含安全默认 appsettings.json；环境组包阶段加入 config/qa、config/uat 或 config/prod 中对应的单份 JSON。程序文件保持一致，不要只复制 EXE 而遗漏依赖。
+
+仓库提供安全模板。真实环境配置可按组织权限要求保存在受限应用/配置 repo 或流水线受控目录中；不包含密码、Token 或密钥。安装后将环境配置放到程序版本目录之外，继续通过 FWD_PHOTO_CONFIG_FILE 选择它。
 
 通过 `FWD_PHOTO_CONFIG_FILE` 指定外部 JSON 的绝对路径，文件保持 `{"PhotoImport": { ... }}` 结构。文件名不作特殊约定，appsettings_qa.json 和 appsettings_prod.json 都可使用。路径未设置或只有空白时，不加载外部文件；指定后文件必需存在且可读取，格式错误、相对路径或文件缺失会导致启动失败（退出码 2），不会静默回退。配置只在启动时加载，不热更新。
 
@@ -32,7 +34,7 @@ QA 使用同一脚本结构，将配置文件路径换成 appsettings_qa.json �
 - 外部文件可以只覆盖部分字段；生产部署应显式核对所有输入、输出、状态和保护参数。文件内的路径推荐全部使用绝对路径，不会自动相对于外部文件目录解析。
 - 首次使用生产配置先设置 DryRun=true、Force=false，核查后再授权真实写入。
 - 业务配置仅从 JSON 加载，不再接受逐项环境变量或命令行覆盖。FWD_PHOTO_CONFIG_FILE 是唯一用于选择外部文件的环境变量，不是业务参数覆盖机制。
-- 不提交真实配置，也不将其加入项目复制或发布项；限制文件及启动脚本的访问权限。环境变量不是秘密存储系统。
+- 环境配置不加入公共项目 build/publish 复制项，仅由环境组包脚本选择加入交付包；真实配置的 repo 和交付物须限制访问权限，凭据不入库。环境变量不是秘密存储系统。
 - 保存发布包版本及配置版本，回滚时核对两者兼容性。QA 与 PROD 的平台及运行时需匹配发布方式。
 
 ## 配置优先级与运行方式
