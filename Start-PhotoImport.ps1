@@ -7,20 +7,21 @@ Runs one PhotoImportTool invocation and preserves its exit code for Task Schedul
 param(
     [Parameter(Mandatory)][string]$ReleaseDirectory,
     [Parameter(Mandatory)][string]$ConfigFile,
-    [Parameter(Mandatory)][string]$LauncherLogDirectory
+    [Parameter(Mandatory)][string]$LauncherLogDirectory,
+    [ValidatePattern('^[^\\/:*?"<>|\r\n]+\.exe$')][string]$ExecutableName = 'COD.FirmwideDirectory.PhotoImportTool.exe'
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $launcherLog = $null
 try {
-    $exe = Join-Path $ReleaseDirectory 'COD.FirmwideDirectory.PhotoImportTool.exe'
+    $exe = Join-Path $ReleaseDirectory $ExecutableName
     foreach ($file in @($exe, $ConfigFile, (Join-Path $ReleaseDirectory 'appsettings.json'))) {
         if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Required file missing: $file" }
     }
     New-Item -ItemType Directory -Path $LauncherLogDirectory -Force | Out-Null
     $launcherLog = Join-Path $LauncherLogDirectory ('launcher-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N') + '.log')
-    ('Started={0:o}; Identity={1}; Release={2}; ConfigFile={3}' -f (Get-Date), [Security.Principal.WindowsIdentity]::GetCurrent().Name, $ReleaseDirectory, $ConfigFile) |
+    ('Started={0:o}; Identity={1}; Release={2}; Executable={3}; ConfigFile={4}' -f (Get-Date), [Security.Principal.WindowsIdentity]::GetCurrent().Name, $ReleaseDirectory, $exe, $ConfigFile) |
         Out-File -LiteralPath $launcherLog -Encoding utf8
     $env:FWD_PHOTO_CONFIG_FILE = $ConfigFile
     # Separate streams avoid Windows PowerShell treating native stderr as a terminating error.
