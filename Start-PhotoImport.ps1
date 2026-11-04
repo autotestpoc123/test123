@@ -20,7 +20,7 @@ try {
     }
     New-Item -ItemType Directory -Path $LauncherLogDirectory -Force | Out-Null
     $launcherLog = Join-Path $LauncherLogDirectory ('launcher-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N') + '.log')
-    ('Started={0:o}; Identity={1}; Release={2}' -f (Get-Date), [Security.Principal.WindowsIdentity]::GetCurrent().Name, $ReleaseDirectory) |
+    ('Started={0:o}; Identity={1}; Release={2}; ConfigFile={3}' -f (Get-Date), [Security.Principal.WindowsIdentity]::GetCurrent().Name, $ReleaseDirectory, $ConfigFile) |
         Out-File -LiteralPath $launcherLog -Encoding utf8
     $env:FWD_PHOTO_CONFIG_FILE = $ConfigFile
     # Separate streams avoid Windows PowerShell treating native stderr as a terminating error.
