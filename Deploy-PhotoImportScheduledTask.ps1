@@ -4,8 +4,11 @@
 Registers a local QA/PROD scheduled task using a dedicated DOMAIN\systemid account.
 .DESCRIPTION
 Run with elevated Windows PowerShell 5.1 after deploying a verified release and setting ACLs.
-Default: on-demand only, no automatic execution. -EnableSchedule adds a daily trigger.
+Default: daily at 02:00 server local time. -DailyAt overrides the time.
+Use -EnableSchedule:$false to register an on-demand-only task.
 Environment selects appsettings_qa.json or appsettings_prod.json beside the published EXE.
+Only SystemId and Environment are mandatory. Fixed deployment paths have overridable defaults.
+LauncherLogDirectory defaults to the selected configuration's effective LogDirectory.
 ExecutableName can select a renamed EXE; otherwise exactly one *PhotoImportTool.exe must exist.
 Does not copy application files, change ACL/GPO, start the job, or bypass execution policy.
 Existing tasks must be disabled and idle before -ReplaceExisting can update them.
@@ -14,16 +17,16 @@ Supports -WhatIf without requesting credentials or writing files/tasks.
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
     [Parameter(Mandatory)][string]$SystemId,
-    [Parameter(Mandatory)][string]$ReleaseDirectory,
+    [string]$ReleaseDirectory = 'D:\firmwidedirectory\FwdPhotoImport',
     [Parameter(Mandatory)][ValidateSet('QA', 'PROD')][string]$Environment,
-    [Parameter(Mandatory)][string]$LauncherScriptPath,
+    [string]$LauncherScriptPath,
     [ValidatePattern('^[^\\/:*?"<>|\r\n]+\.exe$')][string]$ExecutableName,
     [string]$LauncherLogDirectory,
     [ValidatePattern('^[A-Za-z0-9_-]+$')][string]$TaskFolder = 'FwdPhotoImport',
     [ValidatePattern('^[A-Za-z0-9_-]+$')][string]$TaskName,
     [ValidatePattern('^([01][0-9]|2[0-3]):[0-5][0-9]$')][string]$DailyAt = '02:00',
     [ValidateRange(1, 1440)][int]$ExecutionTimeLimitMinutes = 120,
-    [switch]$EnableSchedule,
+    [switch]$EnableSchedule = $true,
     [switch]$AllowWriteConfig,
     [switch]$ReplaceExisting,
     [System.Management.Automation.PSCredential]$Credential
@@ -49,11 +52,10 @@ $ReleaseDirectory = Get-LocalAbsolutePath $ReleaseDirectory 'ReleaseDirectory'
 $Environment = $Environment.ToUpperInvariant()
 $ConfigFile = Join-Path $ReleaseDirectory ('appsettings_{0}.json' -f $Environment.ToLowerInvariant())
 if ([string]::IsNullOrWhiteSpace($TaskName)) { $TaskName = 'PhotoImport-' + $Environment }
-if ([string]::IsNullOrWhiteSpace($LauncherLogDirectory)) {
-    $LauncherLogDirectory = 'C:\ProgramData\FwdPhotoImport-' + $Environment + '\logs'
+if ([string]::IsNullOrWhiteSpace($LauncherScriptPath)) {
+    $LauncherScriptPath = Join-Path $PSScriptRoot 'Start-PhotoImport.ps1'
 }
 $LauncherScriptPath = Get-LocalAbsolutePath $LauncherScriptPath 'LauncherScriptPath'
-$LauncherLogDirectory = Get-LocalAbsolutePath $LauncherLogDirectory 'LauncherLogDirectory'
 if (-not (Test-Path -LiteralPath $ReleaseDirectory -PathType Container)) {
     throw "ReleaseDirectory does not exist: $ReleaseDirectory. Use the directory containing the published EXE and JSON files."
 }
@@ -75,10 +77,6 @@ foreach ($file in @($exe, $baseConfig, $ConfigFile, $LauncherScriptPath)) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Required file missing: $file" }
 }
 if ([IO.Path]::GetExtension($LauncherScriptPath) -ine '.ps1') { throw 'LauncherScriptPath must be a .ps1 file.' }
-if (-not (Test-Path -LiteralPath $LauncherLogDirectory -PathType Container)) {
-    throw 'Create LauncherLogDirectory and grant systemid Modify permission before deploying.'
-}
-
 # Match the application's top-level PhotoImport merge. Do not infer overrides from environment names.
 $settings = @{}
 foreach ($file in @($baseConfig, $ConfigFile)) {
@@ -88,6 +86,16 @@ foreach ($file in @($baseConfig, $ConfigFile)) {
         throw "Missing/invalid PhotoImport object: $file"
     }
     foreach ($property in $json.PhotoImport.PSObject.Properties) { $settings[$property.Name] = $property.Value }
+}
+if ([string]::IsNullOrWhiteSpace($LauncherLogDirectory)) {
+    $LauncherLogDirectory = [string]$settings['LogDirectory']
+    if ([string]::IsNullOrWhiteSpace($LauncherLogDirectory)) {
+        $LauncherLogDirectory = 'C:\ProgramData\FwdPhotoImport-' + $Environment + '\logs'
+    }
+}
+$LauncherLogDirectory = Get-LocalAbsolutePath $LauncherLogDirectory 'LauncherLogDirectory'
+if (-not (Test-Path -LiteralPath $LauncherLogDirectory -PathType Container)) {
+    throw "LauncherLogDirectory does not exist or is not accessible to the current account: $LauncherLogDirectory. Prepare the directory and systemid permissions before deployment."
 }
 foreach ($key in @('PhotoFolder', 'UsersZipPath', 'UsersDsmlName', 'QuarantineDir', 'LockFilePath', 'WatermarkFilePath')) {
     if ([string]::IsNullOrWhiteSpace([string]$settings[$key])) { throw "Missing configuration: $key" }
