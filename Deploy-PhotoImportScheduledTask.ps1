@@ -1,10 +1,12 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-Registers a local UAT scheduled task using a dedicated DOMAIN\systemid account.
+Registers a local QA/PROD scheduled task using a dedicated DOMAIN\systemid account.
 .DESCRIPTION
 Run with elevated Windows PowerShell 5.1 after deploying a verified release and setting ACLs.
 Default: on-demand only, no automatic execution. -EnableSchedule adds a daily trigger.
+Environment selects appsettings_qa.json or appsettings_prod.json beside the published EXE.
+ExecutableName can select a renamed EXE; otherwise exactly one *PhotoImportTool.exe must exist.
 Does not copy application files, change ACL/GPO, start the job, or bypass execution policy.
 Existing tasks must be disabled and idle before -ReplaceExisting can update them.
 Supports -WhatIf without requesting credentials or writing files/tasks.
@@ -13,11 +15,12 @@ Supports -WhatIf without requesting credentials or writing files/tasks.
 param(
     [Parameter(Mandatory)][string]$SystemId,
     [Parameter(Mandatory)][string]$ReleaseDirectory,
-    [Parameter(Mandatory)][string]$ConfigFile,
+    [Parameter(Mandatory)][ValidateSet('QA', 'PROD')][string]$Environment,
     [Parameter(Mandatory)][string]$LauncherScriptPath,
-    [string]$LauncherLogDirectory = 'C:\ProgramData\FwdPhotoImport-UAT\logs',
+    [ValidatePattern('^[^\\/:*?"<>|\r\n]+\.exe$')][string]$ExecutableName,
+    [string]$LauncherLogDirectory,
     [ValidatePattern('^[A-Za-z0-9_-]+$')][string]$TaskFolder = 'FwdPhotoImport',
-    [ValidatePattern('^[A-Za-z0-9_-]+$')][string]$TaskName = 'PhotoImport-UAT',
+    [ValidatePattern('^[A-Za-z0-9_-]+$')][string]$TaskName,
     [ValidatePattern('^([01][0-9]|2[0-3]):[0-5][0-9]$')][string]$DailyAt = '02:00',
     [ValidateRange(1, 1440)][int]$ExecutionTimeLimitMinutes = 120,
     [switch]$EnableSchedule,
@@ -43,10 +46,30 @@ if ($SystemId -notmatch '^[^\\\s]+\\[^\\\s]+$' -or $SystemId.EndsWith('$') -or
     throw 'SystemId must be a dedicated DOMAIN\account (not a local/built-in account or gMSA).'
 }
 $ReleaseDirectory = Get-LocalAbsolutePath $ReleaseDirectory 'ReleaseDirectory'
-$ConfigFile = Get-LocalAbsolutePath $ConfigFile 'ConfigFile'
+$Environment = $Environment.ToUpperInvariant()
+$ConfigFile = Join-Path $ReleaseDirectory ('appsettings_{0}.json' -f $Environment.ToLowerInvariant())
+if ([string]::IsNullOrWhiteSpace($TaskName)) { $TaskName = 'PhotoImport-' + $Environment }
+if ([string]::IsNullOrWhiteSpace($LauncherLogDirectory)) {
+    $LauncherLogDirectory = 'C:\ProgramData\FwdPhotoImport-' + $Environment + '\logs'
+}
 $LauncherScriptPath = Get-LocalAbsolutePath $LauncherScriptPath 'LauncherScriptPath'
 $LauncherLogDirectory = Get-LocalAbsolutePath $LauncherLogDirectory 'LauncherLogDirectory'
-$exe = Join-Path $ReleaseDirectory 'COD.FirmwideDirectory.PhotoImportTool.exe'
+if (-not (Test-Path -LiteralPath $ReleaseDirectory -PathType Container)) {
+    throw "ReleaseDirectory does not exist: $ReleaseDirectory. Use the directory containing the published EXE and JSON files."
+}
+if ([string]::IsNullOrWhiteSpace($ExecutableName)) {
+    $candidates = @(Get-ChildItem -LiteralPath $ReleaseDirectory -Filter '*PhotoImportTool.exe' -File)
+    if ($candidates.Count -eq 0) {
+        $available = (@(Get-ChildItem -LiteralPath $ReleaseDirectory -Filter '*.exe' -File | ForEach-Object { $_.Name }) -join ', ')
+        if ([string]::IsNullOrWhiteSpace($available)) { $available = '(none)' }
+        throw "No *PhotoImportTool.exe found directly in '$ReleaseDirectory'. Check the Visual Studio publish directory, or pass -ExecutableName for a renamed EXE. EXE files found: $available"
+    }
+    if ($candidates.Count -gt 1) {
+        throw "Multiple PhotoImportTool executables found: $($candidates.Name -join ', '). Specify -ExecutableName explicitly."
+    }
+    $ExecutableName = $candidates[0].Name
+}
+$exe = Join-Path $ReleaseDirectory $ExecutableName
 $baseConfig = Join-Path $ReleaseDirectory 'appsettings.json'
 foreach ($file in @($exe, $baseConfig, $ConfigFile, $LauncherScriptPath)) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Required file missing: $file" }
@@ -68,6 +91,12 @@ foreach ($file in @($baseConfig, $ConfigFile)) {
 }
 foreach ($key in @('PhotoFolder', 'UsersZipPath', 'UsersDsmlName', 'QuarantineDir', 'LockFilePath', 'WatermarkFilePath')) {
     if ([string]::IsNullOrWhiteSpace([string]$settings[$key])) { throw "Missing configuration: $key" }
+}
+# Check decoded values so JSON-escaped placeholders are also rejected.
+foreach ($key in $settings.Keys) {
+    if (-not $key.StartsWith('//') -and $settings[$key] -is [string] -and $settings[$key] -match '[<>]') {
+        throw "Replace configuration placeholders before registration: $key"
+    }
 }
 if ([string]::IsNullOrWhiteSpace([string]$settings['PhotoZipPath']) -and
     [string]::IsNullOrWhiteSpace([string]$settings['XmlPhotoPath'])) { throw 'At least one photo source is required.' }
@@ -98,7 +127,7 @@ if ($existing.Count -gt 0) {
 }
 $mode = 'On-demand only'
 if ($EnableSchedule) { $mode = "Daily at $DailyAt (server local time)" }
-Write-Host "Task=$taskPath$TaskName; Account=$SystemId; Mode=$mode; DryRun=$($settings['DryRun'])"
+Write-Host "Task=$taskPath$TaskName; Environment=$Environment; Executable=$exe; ConfigFile=$ConfigFile; Account=$SystemId; Mode=$mode; DryRun=$($settings['DryRun'])"
 if (-not $PSCmdlet.ShouldProcess("$taskPath$TaskName", 'Register PhotoImport scheduled task')) { return }
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -110,8 +139,8 @@ if ($null -eq $Credential) { $Credential = Get-Credential -UserName $SystemId -M
 if ($null -eq $Credential -or $Credential.UserName -ine $SystemId) { throw 'Credential account must exactly match SystemId.' }
 
 $powershellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$arguments = '-NoLogo -NoProfile -NonInteractive -File "{0}" -ReleaseDirectory "{1}" -ConfigFile "{2}" -LauncherLogDirectory "{3}"' -f `
-    $LauncherScriptPath, $ReleaseDirectory, $ConfigFile, $LauncherLogDirectory
+$arguments = '-NoLogo -NoProfile -NonInteractive -File "{0}" -ReleaseDirectory "{1}" -ConfigFile "{2}" -LauncherLogDirectory "{3}" -ExecutableName "{4}"' -f `
+    $LauncherScriptPath, $ReleaseDirectory, $ConfigFile, $LauncherLogDirectory, $ExecutableName
 $action = New-ScheduledTaskAction -Execute $powershellExe -Argument $arguments -WorkingDirectory (Split-Path -Parent $LauncherScriptPath)
 $principal = New-ScheduledTaskPrincipal -UserId $SystemId -LogonType Password -RunLevel Limited
 $taskSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
@@ -121,7 +150,7 @@ $definitionArgs = @{
     Action = $action
     Principal = $principal
     Settings = $taskSettings
-    Description = 'UAT PhotoImportTool; dedicated domain account; managed by Deploy-PhotoImportScheduledTask.ps1'
+    Description = "$Environment PhotoImportTool; dedicated domain account; managed by Deploy-PhotoImportScheduledTask.ps1"
 }
 if ($EnableSchedule) {
     $at = [datetime]::Today.Add([timespan]::ParseExact($DailyAt, 'hh\:mm', [Globalization.CultureInfo]::InvariantCulture))
