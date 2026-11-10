@@ -1,5 +1,6 @@
 import { fakeAsync, TestBed, tick } from '@angular/core/testing';
-import { SafeUrl } from '@angular/platform-browser';
+import { HttpClient } from '@angular/common/http';
+import { DomSanitizer, SafeUrl } from '@angular/platform-browser';
 import { HttpClientTestingModule, HttpTestingController } from '@angular/common/http/testing';
 import { UserPhotoService } from './user-photo.service';
 import { URL_GET_USER_PHOTO } from '../data/constants';
@@ -152,11 +153,55 @@ describe('UserPhotoService', () => {
     const photoUrl = URL_GET_USER_PHOTO + 'abc123?size=48';
     const jpeg = () => new Blob(['photo'], { type: 'image/jpeg' });
 
+    it('revalidates both sizes after a page reload before the previous hour expires', fakeAsync(() => {
+      const sizes = [48, 256] as const;
+      const previous = new Map<number, SafeUrl | null>();
+      for (const size of sizes) {
+        const url = URL_GET_USER_PHOTO + `abc123?size=${size}`;
+        service.getPhoto('abc123', size).subscribe(photo => previous.set(size, photo));
+        httpMock.expectOne(url).flush(jpeg());
+      }
+      tick(5 * 60_000);
+      for (const size of sizes) {
+        service.getPhoto('abc123', size).subscribe(photo => expect(photo).toBe(previous.get(size)!));
+      }
+      httpMock.expectNone(() => true);
+
+      // A full page reload creates a new service while the browser may still
+      // have fresh HTTP responses for the exact same URLs.
+      service.ngOnDestroy();
+      service = new UserPhotoService(TestBed.inject(HttpClient), TestBed.inject(DomSanitizer));
+      for (const size of sizes) {
+        const url = URL_GET_USER_PHOTO + `abc123?size=${size}`;
+        const refreshed: (SafeUrl | null)[] = [];
+        service.getPhoto('abc123', size).subscribe(photo => refreshed.push(photo));
+        const request = httpMock.expectOne(url);
+        expect(request.request.headers.get('Cache-Control')).toBe('no-cache');
+        request.flush(jpeg());
+        expect(refreshed.length).toBe(1);
+        expect(refreshed[0]).not.toBe(previous.get(size)!);
+        service.getPhoto('abc123', size).subscribe(photo => expect(photo).toBe(refreshed[0]));
+      }
+      httpMock.expectNone(() => true);
+    }));
+
+    it('revalidates a photo evicted by the LRU even before its memory TTL expires', () => {
+      service.getPhoto('abc123', 48).subscribe();
+      httpMock.expectOne(photoUrl).flush(jpeg());
+      overflowCache();
+      service.getPhoto('abc123', 48).subscribe();
+      const evicted = httpMock.expectOne(photoUrl);
+      expect(evicted.request.headers.get('Cache-Control')).toBe('no-cache');
+      evicted.flush(jpeg());
+      service.getPhoto('abc123', 48).subscribe();
+      httpMock.expectNone(() => true);
+    });
+
     it('revalidates at one hour on subscription, without extending freshness on cache hits', fakeAsync(() => {
       let original: SafeUrl | null = null;
       service.getPhoto('abc123', 48).subscribe(url => original = url);
       const initial = httpMock.expectOne(photoUrl);
-      expect(initial.request.headers.has('Cache-Control')).toBeFalse();
+      expect(initial.request.headers.get('Cache-Control')).toBe('no-cache');
       initial.flush(jpeg());
       const deferred = service.getPhoto('abc123', 48);
       tick(HOUR / 2);
