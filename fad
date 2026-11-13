@@ -1,47 +1,160 @@
-可以直接复制下面这段 prompt：
 
-```text
-请在以下项目中，依据实施任务书完成 MSKIC Mail / Device Usage Log 的代码扩展：
+## 1. 范围、前提与方法
 
-项目目录：
-C:\Users\lxzxc\workspace\wecom_log_v2\wecom_cleaned
+用户指定审查 Invoke-AuditLog.ps1、device worker 和 mail worker。当前目录实际文件是 wecom_devicelog_analysis.ps1, wecom_maillog_analysis.ps1
 
-实施任务书：
-MSKIC_AGENT_IMPLEMENTATION_PLAN.md
+对照 added_msimc_analysis.md 审查了三个脚本及必要的 module、scheduler 调用关系。仓库尚无提交历史；存在三个脚本的 Git 索引版本，可用于核对当前未暂存改动。因此下文“本次新增/回归”表示相对于索引快照，不代表已证明相对于正式生产发布版本。未修改业务脚本或配置。
 
-请直接完成代码修改、离线测试和相关文档更新。
+运行环境为 Windows PowerShell 5.1.26100.9711。使用原生 Parser.ParseFile、UTF-8 ParseInput、实际入口的早期失败检查、模块命令解析，以及从生产源码 AST 原样提取的分支/语句进行离线测试。业务测试启用与入口一致的 StrictMode Latest，stub LDAP 和发送边界，仅在 .review_artifacts 内写测试数据
 
-执行要求：
+没有连接真实 LDAP/Vault/SMTP，没有执行 scheduler、归档、清理、部署或任务注册。既有扫描器给出的成功退出码不等于完整验收通过。
 
-1. 开始前完整阅读实施任务书，以及适用的 AGENTS.md、CLAUDE.md。核对当前代码状态，保留已有改动。
+## 2. 确定缺陷：P1
 
-2. 以任务书中的用户确认要求、处理契约和验收标准为实现依据。按建议顺序推进，将必要的基线修复与 MSKIC 功能扩展分别记录。
+### R01：删除 -env 参数后未同步 scheduler，正常调度在参数绑定阶段失败
 
-3. 保持 Windows PowerShell 5.1 兼容性，正确处理中文文件名、编码和 CRLF。保留现有 BU 的业务策略，对共享函数修复造成的行为差异单独说明。
+- 位置：[Invoke-AuditLog.ps1:9](Invoke-AuditLog.ps1:9)；调用方 [Invoke-WeComAuditScheduler.ps1:1095](Invoke-WeComAuditScheduler.ps1:1095)。
+- 触发：现有 scheduler 仍传入 env=$environment，但入口已从 param 删除 env。
+- 实际结果：使用同样参数直接调用，得到 NamedParameterNotFound: env，在读取配置和执行任何任务之前退出。
+- 影响：正常调度无法启动全部 BU 的分析。实际环境的配置更新无法修复这个接口不匹配。
+- 建议：恢复兼容参数并明确与配置 Environment 的一致性校验，或者在同一修复中同步全部调用方；避免把两种来源静默混用。
+- 来源：相对于索引的新增回归。证据：实际入口调用及入口参数 AST。
 
-4. 完整实现 MSKIC 的输入匹配、域名及账号映射、LDAP 校验、违规分析、固定收件组汇总、摘要、发送账本、预检查与归档配置。每类日志有无违规均统一发送给同一固定组，具体行为严格遵循任务书。
+### R02：入口改为引用不存在的 mail worker，连 device-only 运行也会被阻断
 
-5. 对任务书已经明确的事项自主实施。遇到缺少真实 A/B 邮箱、权威 LDAP 实现、ImportExcel 或环境参数时：
-   - 继续完成不依赖这些信息的代码和离线验证；
-   - 不猜造实际地址、连接信息或依赖实现；
-   - 按任务书保持新任务及相关规则默认禁用；
-   - 明确记录尚未满足的集成条件。
+- 位置：[Invoke-AuditLog.ps1:23](Invoke-AuditLog.ps1:23)，后续第 31–32 行无条件检查。
+- 触发：当前实际文件名为 wecom_mail_analysis.ps1；入口改成 wecom_maillog_analysis.ps1。
+- 实际结果：不传 -env 直接运行入口，立即报 Mail analysis script not found，未进入配置读取。
+- 影响：任何 RunMode 都受影响，因为 worker 存在性检查发生在任务筛选之前。
+- 建议：统一入口与部署包实际文件名，并增加入口和部署包一致性验证。若现场另外改名部署，应提供明确的部署清单；当前目录确实无法运行。
+- 来源：相对于索引的新增回归。证据：Test-Path 和实际早期失败调用。
 
-6. 使用实际生产函数或 worker 进行离线测试，通过 mock/stub 隔离 LDAP、Vault、证书和 SMTP。执行适用的现有验证脚本，并检查 PowerShell 5.1 原生语法、配置导入和编码。
+### R05：新增调用依赖未交付的函数，更新配置后仍无法执行
 
-7. 本次范围为本地实现与离线验证。真实邮件发送、服务器部署、计划任务注册、历史周期补发及生产数据清理不属于本次执行范围。
+- 位置：[Invoke-AuditLog.ps1:65](Invoke-AuditLog.ps1:65)；[mail:59]wecom_mail_analysis.ps1:59)；[device:51](wecom_devicelog_analysis.ps1:51)。
+- 问题：Resolve-AnalysisEnvironmentConfig 和 ConvertTo-LdapFilterEscaped 在当前脚本、共享模块实现和导出中均不存在。
+- 实际结果：在全新 -NoProfile 进程中导入模块后，Get-Command 仍找不到这两个函数；执行实际 mail Build-OrFilter 得到 ConvertTo-LdapFilterEscaped 未识别错误。
+- 影响：修复文件名后入口仍会在环境解析处停止；即使绕过该处，LDAP 查询过滤器仍无法构建。正确的 PSD1 数据不能提供命令实现。
+- 建议：补齐并加载必要实现，或使用项目中已存在且接口匹配的权威实现；补充干净会话下的命令解析测试。
+- 来源：相对于索引新增的未闭合调用依赖，不是将本地旧配置算作错误。
 
-8. 持续推进直至所有可完成的实现和验证结束。遇到阻塞时继续处理独立工作，并在最终交付中准确区分已完成与待完成事项。
+### R06：LDAP 连接调用使用 -id_secret，但共享函数只接受 -Credential
 
-最终请提供：
+- 位置：[mail:338]wecom_mail_analysis.ps1:338)、[mail:439]wecom_mail_analysis.ps1:439)；[device:272]wecom_devicelog_analysis.ps1:272)。接口定义：[Analysis.ps1:195]modules/internal/Analysis.ps1:195)。
+- 触发：关闭测试模式，执行正常的连接初始化。
+- 实际结果：函数接口没有 id_secret 参数。使用从实际函数提取的 ParamBlock 做无副作用绑定，得到“找不到与参数名称 id_secret 匹配的参数”。
+- 影响：Vault 成功后仍无法进入真实 LDAP 校验。测试模式直接构造假连接并调用全局 handler，会掩盖这个错误。
+- 建议：统一到共享函数真实签名，并对非测试模式的调用绑定做离线检查。
+- 来源：device 相对于索引由正确的 -Credential 改错；mail 原有同类问题在重写后仍未修复。
 
-- 实现结果和主要行为；
-- 修改文件清单；
-- 基线修复与 MSKIC 扩展的分别说明；
-- 任务书 26 项验收场景的通过、失败或阻塞状态及证据；
-- 实际执行的测试命令和结果；
-- 尚缺的配置、依赖及启用步骤；
-- 与任务书存在的偏差及原因。
+### R07：legacy mail 使用内部收件人域筛选发件人，旧 txmail 业务回归
 
-只有实际验证通过的项目才能标记为通过；环境集成尚未执行时，明确说明其状态。
-```
+- 位置：[wecom_mail_analysis.ps1:433]wecom_mail_analysis.ps1:433)。
+- 触发：旧 BU 日志中发件人为 sender@txmail.example.com.cn，收件人包含内部和外部地址，内部域与 txmail 来源域不同。
+- 实际结果：构建 senders 时使用 internalDomain，而不是原来的 txmailFilter。离线执行实际第 425–435 行，senders 为空，报 Receivers or Senders addresses do not match expected domain pattern。
+- 影响：原本需要分析的旧 WeCom 发件人被排除；全部为 txmail 时任务直接失败，混合来源时也可能漏掉应查询的发件人。
+- 建议：恢复旧来源域筛选并统一地址标准化；内部收件人域与 WeCom 来源域保持各自用途。
+- 来源：相对于索引明确的新增回归，索引版本使用 txmailFilter。
+
+### R08：新增 device 分支的无违规路径不可达，全 iPhone 日志必然报错
+
+- 位置：[wecom_devicelog_analysis.ps1:316]wecom_devicelog_analysis.ps1:316)、[第 323 行]wecom_devicelog_analysis.ps1:323)、[第 336 行]wecom_devicelog_analysis.ps1:336)。
+- 触发：非空日志中所有记录均为 ios(iphone)，账号均可由 LDAP 识别。
+- 实际结果：iPhone 在 analyzedRecordCount 增加之前被 continue；循环后计数为零，抛出 could not identify any account。隔离测试中 SkippedIdentityCount=0，仍没有摘要和报告。
+- 进一步说明：该计数每次增加时都会同时加入一条 violation。因此计数为零就抛错，计数非零就必有 violation，后面的零违规发送分支在正常路径上无法执行。
+- 影响：直接违反“有无违规都发送给同一组”的要求；会把完全合规日志视为技术失败。
+- 建议：将身份识别/覆盖计数与平台违规计数分开；识别成功的合规设备应计入已分析覆盖范围，再据最终违规集合选择正文。
+- 来源：新增单组分支逻辑缺陷。证据：实际分支，iPhone 与 Windows 对照测试。
+
+### R09：新增 mail 分支仅按分号拆收件人，逗号/空格输入会漏报
+
+- 位置：[wecom_mail_analysis.ps1:321]wecom_mail_analysis.ps1:321)、[第 358 行]wecom_mail_analysis.ps1:358)、[第 376 行]wecom_mail_analysis.ps1:376)。
+- 触发：有效来源及发件人，收件人为 bad@corp.invalid,external@outside.invalid，LDAP 确认内部 bad 地址无效。空格分隔的同一输入也触发。
+- 实际结果：实际分支把整串当一个地址；内部候选及内部/外部集合划分错误，HasViolation=false，并进入无违规发送。替换为分号后，同一业务内容正确得到一条违规。
+- 原因：虽然定义了支持多分隔符的 Split-MailAddresses，收件人候选、聚合和最终判断都没有使用它。
+- 建议：所有收件人路径复用相同的拆分、trim、转小写和去重结果，再进行 LDAP 查询与聚合。
+- 来源：新增单组分支功能缺陷。证据：严格模式下实际代码分支的三种分隔符对照。
+
+## 3. 确定缺陷：P2
+
+### R10：相同收件人集合仅改变顺序，就会改变正文 hash 并被账本拒绝
+
+- 位置：[wecom_mail_analysis.ps1:358]wecom_mail_analysis.ps1:358)、[第 376 行]wecom_mail_analysis.ps1:376)、[第 386 行]wecom_mail_analysis.ps1:386)。
+- 触发：同一邮件的三个收件人集合不变，只改变输入顺序，或同组拆行顺序不同。
+- 实际结果：Recipients 按原顺序拼接，没有稳定排序或地址级去重。两次生成正文的 hash 分别为 0a206be2... 和 13dbb33d...；调用真实 Test-MailLedgerHit 得到 Warn/content-diff，发送包装器据此 Rejected。
+- 影响：业务内容等价的重导出/重跑被当成报告更正，阻断自动恢复流程。
+- 建议：在聚合及展示前对标准化收件人去重排序，并对所有展示列建立稳定顺序。
+- 来源：新增分支确定性契约未实现。证据：实际 HTML 构造与真实 hash/账本函数，不是另写判定公式。
+
+### R11：run-summary 记录不存在的任务根目录产物路径
+
+- 位置：[Invoke-AuditLog.ps1:479]Invoke-AuditLog.ps1:479)；worker [mail:237]wecom_mail_analysis.ps1:237)、[device:198]wecom_devicelog_analysis.ps1:198)。
+- 实际结果：入口固定记录 tasks/<task>/report.csv 和 task.log；mail 通过 Export-AnalysisReport 写到 tasks/<task>/analyzed/<yyyy_MM_dd>/。真实 helper 的离线执行证实两者不同。入口还移除了先前的存在性解析，直接写入预期路径。
+- 影响：任务可以标记成功，但审计摘要指向不存在的报告和日志；即使有违规也无法从摘要定位真实产物。device 恢复完整调用后同样需要核对。
+- 建议：让 worker 使用约定目录，或者返回真实产物位置并在入口核对。无违规可以没有 report.csv，但不应伪造一个存在的报告路径。
+- 来源：路径分歧为既有问题；本次仍未闭合，并新增了无条件记录不存在路径的行为。
+
+### R12：固定收件组仅检查非空，未保证两人及地址有效性
+
+- 位置：[mail:280]wecom_mail_analysis.ps1:280)；[device:302]wecom_devicelog_analysis.ps1:302)。
+- 触发：配置只剩一个完整邮箱，或者填入非空占位值。
+- 实际结果：只校验数量不为零；一个地址的离线分支正常进入发送，To 只有一人。未见完整邮箱语法/占位值校验；device 的该校验还发生在 LDAP 查询之后。
+- 影响：不能保证用户要求的 A、B 同时接收；错误地址延迟到 SMTP 层才失败，或悄悄少发一人。
+- 建议：在副作用前统一校验当前环境的两个不同完整邮箱，拒绝占位及回退。此项是代码输入契约缺失，不是在声称真实配置已经填错。
+- 来源：新增固定组分支校验不完整。
+
+## 4. 补充差距和待确认事项
+
+以下没有混入上面的确定 P1 缺陷：
+
+1. 入口第 475 行只检查 summary 文件存在，没有 JSON 解析、BU/日期及计数一致性校验。实际执行该 guard，会接受内容为 not valid JSON 的文件。它是任务书 S01 的验收缺口；当前没有证据表明正常 worker 一定写坏 JSON，因此不将其表述为每次运行都会发生的故障。
+2. 两个 worker 将 Subject 的 endDate 改成 endDate-1，并换成 yyyy-MM-dd；输入/summary/周期键仍是原始 endDate。例如输入 20261115，标题为 2026-11-14。该变更未在已确认要求中提出，需要核实现场日期区间定义和 MSG 命名；实际更新配置未提供，本次不直接断言所有 MSG 都匹配失败。
+3. LDAP 入参在调用处先 join(';') 成一个字符串，batchSize 则在拆分前计数，不能保证按地址数分批；未执行实际大批 LDAP 查询，需补离线连接边界或权威实现验证。
+4. Device 新增查询过滤器使用 cn，而映射及日志 Account 使用账号标识。需用现场样例确认 cn 是否确实等于 Account；本次不假定所有目录都不同而直接判定漏报。
+5. 当前项目依旧缺 modules/ImportExcel。该项已在任务书中列为既有运行依赖，不算本次新增缺陷，也不推断服务器缺失。
+6. MSIMC_TEST_MODE 会绕过真实连接及发送账本。本文没有把此模式下的单组成功发送等同于生产调用或幂等链路通过；生产侧应确认测试入口不被环境变量误启用。
+7. 缺收件人列的初始宽松模式测试会进入无违规，但入口设置了 StrictMode Latest。复核为相同严格模式后，该场景正确抛错且未发送，故没有把它列为生产链路漏报缺陷。
+
+
+
+## 6. 任务书 26 项验收状态
+
+“分支验证”仅表示在现有 MSIMC 分支中隔离验证了对应行为；
+
+| 项目 | 状态 | 证据或限制 |
+| --- | --- | --- |
+| C01 禁用不影响旧任务 | 尚未验证 | 实际部署配置未提供；入口已存在无条件启动阻塞。 |
+| C02 正确选择及传参 | 失败 | MSKIC 分支、白名单和参数配置路径不匹配，R04。 |
+| C03 配置/固定 To 校验 | 失败 | 一个收件人可进入发送；未见完整地址校验，R12。环境真实 To 未核验。 |
+| C04 任务与规则同步 | 仅静态核对 | 三个脚本未见关联规则完整性校验；实际规则集合不在本次验证范围。 |
+| F01 命名和日期 token | 部分静态核对 | 模板解析器保留；MSKIC 实际命名配置未提供，未宣称通过。 |
+| F02 缺文件/目录/多匹配 | 部分静态核对 | 入口仍调用原有 resolver；全入口因启动阻塞未做本期文件集集成。 |
+| F03 中文、单引号、xls twin | 部分失败/未验证 | device 原生语法失败；现场文件及规范化集成未运行。 |
+| M01 来源域与标准化 | 部分失败 | 使用 Escape 和锚定，但原始字段匹配前未 trim，尾部空格误判无来源。 |
+| M02 四种收件人组合 | 分支验证通过 | 标准分号输入的四种业务条件符合要求；不代表 MSKIC 链路通过。 |
+| M03 拆行/分隔符/去重 | 失败 | 逗号、空格漏报，收件人集合未稳定去重排序，R09/R10。 |
+| M04 LDAP 批次及命中 | 受阻塞/未验证 | 缺转义 helper、连接参数错误，且 join 后批次计数有疑问。未连接真实 LDAP。 |
+| M05 Division 不参与路由 | 仅静态核对 | MSIMC 分支不使用旧部门白名单；未完整覆盖空 Division，MSKIC 分支缺失。 |
+| M06 来源/身份覆盖不足 | 部分验证 | 无匹配来源会失败；全部/部分身份失配未完整执行矩阵。 |
+| M07 查询和输入失败 | 部分验证 | 严格模式下缺收件人列失败且不发；超时/认证等未端到端模拟。 |
+| D01 iPhone 跳过 | 失败 | 跳过后导致整任务错误失败，无合规报告，R08。 |
+| D02 其他设备及 Division | 分支部分通过 | 有效 Windows 账号生成一条违规和一次 mock 发送；全设备矩阵未运行。 |
+| D03 无效账号/服务失败 | 部分静态核对 | catch 改为 throw；全部 iPhone 被误当无身份，其他覆盖不足场景未全测。 |
+| R01 零/一/多违规固定组 | 失败 | device 零违规不可达，且 To 数量校验不满足两人，R08/R12。 |
+| R02 重跑及内容 hash | 失败 | 等价收件人集合导致不同 hash，真实 ledger 返回 Warn/content-diff，R10。SMTP 失败未实发验证。 |
+| R03 HTML 编码 | 仅静态核对 | 明细经过 ConvertTo-Html；未完成所有字段的恶意文本输入矩阵。 |
+| S01 完成状态及产物 | 失败 | 只检查摘要存在，损坏 JSON 被 guard 接受；产物路径不一致，R11。 |
+| A01 watcher/两个周期 | 受配置证据限制 | 未取得现场规则，不将本地未更新视为缺陷；未执行真实 watcher。 |
+| A02 固定两份 MSG | 受配置证据限制 | 未核验实际固定规则；主题身份和日期存在需要同步的差异。 |
+| A03 缺证据与清理 | 受配置证据限制 | 未运行 Validate/清理，不对现场结果作保证。 |
+| B01 旧 BU 与旧调用 | 失败 | scheduler 的 env 接口回归、legacy 发件人域回归；worker 新增必填 AnalysisEnvironment 也影响直接调用。 |
+| B02 已闭环周期 | 仅静态核对 | 原周期 guard 未修改；未触发实际 scheduler 或改动历史状态。 |
+
+## 7. 处置建议与最终判断
+
+优先恢复可执行链路：R01 调度参数、R02 文件名、R03 源码损坏、R04 正确 BU、R05 命令依赖、R06 连接接口。随后修复旧 BU 筛选、device 零违规、mail 地址解析及 hash 确定性，补齐真实产物路径和固定组校验，再独立复审。
+
+本地实现：**当前不建议合并**，有已复现的启动阻塞、旧 BU 回归和业务漏报。  
+部署条件：**当前不具备部署条件**；正确的现场配置不能消除上述代码缺陷。实际配置、权威依赖和外部环境仍需要在代码修复后的独立集成验收中核对。
+
+本报告没有执行修复、Git 提交或合并，也没有真实发送报告。
