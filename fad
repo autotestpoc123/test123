@@ -1,2 +1,26 @@
-原 R09 的分隔符问题：Trim 修复的是发件人空格，不能替代收件人解析修复。必须确认同一组地址分别使用分号、逗号、空格时，违规结论一致。
-原 R11 的产物路径问题：测试能在 analyzed/<日期>/report.csv 找到报告，只证明报告存在。还应检查 run-summary.json 中记录的 ReportPath、`TaskLogPath` 确实指向实际文件。修改测试查找路径本身没有修复入口路径。
+请在当前实际项目中移除生产代码里的 MSIMC_TEST_MODE 开关及相关 mock 分支，并完成防回归验证。
+
+要求：
+
+1. 先阅读适用的 AGENTS.md、CLAUDE.md，核对最新代码和已有改动，运行现有测试建立基线。
+2. 从生产入口、worker 和模块中移除：
+   - MSIMC_TEST_MODE 判断；
+   - offline-cert、offline-secret；
+   - MsimcLdapHandler、MsimcLdapIdHandler、MsimcSendHandler；
+   - 模块内 mock 注入及绕过真实调用的分支。
+3. 将 mock 保留在独立测试脚本中，不新增替代开关。
+4. 保持现有参数、配置、BU 映射、业务规则、收件人、报告格式和路径不变；保留真实调用、异常传播、资源释放及发送账本逻辑。
+5. 兼容 Windows PowerShell 5.1，避免无关重构。
+
+至少验证：
+- 全 iPhone 正确生成无违规结果；
+- Mail 分隔符、发件人空格、地址去重排序及 hash 稳定性；
+- 有无违规的正确收件组；
+- LDAP/Vault/SMTP 失败不会误报成功；
+- 首次发送、重复跳过、内容变化拒绝；
+- 旧 BU 无回归，摘要及产物路径正确；
+- 设置旧环境变量也不会改变生产执行路径。
+
+测试使用实际生产逻辑，由测试侧 mock 外部依赖，不连接真实服务或发送邮件。完成语法检查、现有验证脚本及生产代码残留扫描。
+
+请直接完成修改，并生成 MSIMC_TEST_MODE_REMOVAL_REPORT.md，列明改动、测试结果、已有问题和待做的真实 QA 验证。未验证事项不得标记为通过。
